@@ -1,0 +1,15 @@
+[Unit]
+Description=HL simplified copy-trading service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/hyper
+ExecStart=/usr/bin/python3 /root/hyper/main.py --config /root/hyper/config/config.yaml
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
