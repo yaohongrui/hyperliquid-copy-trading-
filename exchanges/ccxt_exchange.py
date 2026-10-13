@@ -92,7 +92,11 @@ class CcxtExchange:
             rows = balance.get('info') or []
             row = next(x for x in rows if str(x.get('currency')).upper() == 'USDT')
             return float(row['total']) + float(row.get('unrealised_pnl') or 0)
-        return float(balance['USDT']['total'])
+        account = balance.get('USDT') or {}
+        wallet_equity = float(account.get('total') or account.get('free') or 0)
+        positions = await self.client.fetch_positions()
+        unrealized = sum(float(position.get('unrealizedPnl') or 0) for position in positions)
+        return wallet_equity + unrealized
 
     async def cancel_order(self, order_id, symbol=None):
         return await self.client.cancel_order(order_id, self._symbol(symbol) if symbol else None)

@@ -26,7 +26,7 @@ async def main(path):
     if not account:
         raise RuntimeError("No execution account is configured for an enabled leader")
     dry_run = bool(account.get("dry_run", False))
-    exchange = DryRunExchange() if dry_run else CcxtExchange(account)
+    exchange = DryRunExchange(account) if dry_run else CcxtExchange(account)
     engine = Engine(exchange, leaders)
     mode = "dry-run" if dry_run else "LIVE"
     log.info("HL copytrade started in %s mode; leaders=%s account=%s", mode, ",".join(leaders) or "none", account_name)
@@ -46,6 +46,10 @@ async def main(path):
                 telegram_config.get("polling_timeout", 25),
                 fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, leaders),
                 fetch_leader_positions=partial(leader_positions, leaders),
+                fetch_equity=exchange.equity,
+                account_name=account_name,
+                account_config=account,
+                mode=mode,
             )
             engine.notifier = telegram
             telegram_task = asyncio.create_task(telegram.run(), name="telegram-bot")
@@ -56,6 +60,10 @@ async def main(path):
             engine, "", None,
             fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, leaders),
             fetch_leader_positions=partial(leader_positions, leaders),
+            fetch_equity=getattr(exchange, "equity", None),
+            account_name=account_name,
+            account_config=account,
+            mode=mode,
         )
     if not dry_run:
         await exchange.start()

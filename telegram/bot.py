@@ -13,7 +13,9 @@ class TelegramManager:
     """Small Telegram Bot API long-polling client for the control commands."""
 
     def __init__(self, engine, token, chat_id, polling_timeout=25,
-                 fetch_account_positions=None, fetch_leader_positions=None):
+                 fetch_account_positions=None, fetch_leader_positions=None,
+                 fetch_equity=None, account_name=None, account_config=None,
+                 mode=None):
         self.engine = engine
         self.token = token
         self.chat_id = str(chat_id) if chat_id is not None else None
@@ -22,6 +24,10 @@ class TelegramManager:
         self._api_url = f"https://api.telegram.org/bot{token}"
         self.fetch_account_positions = fetch_account_positions
         self.fetch_leader_positions = fetch_leader_positions
+        self.fetch_equity = fetch_equity
+        self.account_name = account_name or "-"
+        self.account_config = account_config or {}
+        self.mode = mode or "UNKNOWN"
         self.session = None
 
     def stop(self):
@@ -33,17 +39,70 @@ class TelegramManager:
         cmd = cmd.split("@", 1)[0]
         if cmd == "/pause":
             self.engine.paused = True
-            return "New entries paused."
+            return await self._status_message("⏸ NEW ENTRIES PAUSED")
         if cmd == "/resume":
             self.engine.paused = False
-            return "New entries resumed."
+            return await self._status_message("▶️ NEW ENTRIES RESUMED")
         if cmd == "/status":
-            return "PAUSED" if self.engine.paused else "RUNNING"
+            return await self._status_message()
         if cmd == "/positions":
-            return await self.fetch_account_positions() if self.fetch_account_positions else "Account query unavailable."
+            return await self._positions_message()
         if cmd == "/leader_positions":
-            return await self.fetch_leader_positions() if self.fetch_leader_positions else "Leader query unavailable."
-        return "Unknown command."
+            return await self._leader_positions_message()
+        return self._event_message("❔ UNKNOWN COMMAND", [
+            ("Available", "/status, /positions, /leader_positions"),
+            ("Controls", "/pause, /resume"),
+        ], reason="Please choose a command from the bot menu.")
+
+    def _stop_loss_text(self):
+        hard_stop = self.account_config.get("hard_stop") or {}
+        limits = []
+        if hard_stop.get("max_daily_loss_usdt") is not None:
+            limits.append(f"daily loss ≤ {self._value(float(hard_stop['max_daily_loss_usdt']))} USDT")
+        if hard_stop.get("max_daily_drawdown_pct") is not None:
+            limits.append(f"daily drawdown ≤ {self._value(float(hard_stop['max_daily_drawdown_pct']))}%")
+        return "; ".join(limits) if limits else "Not configured"
+
+    async def _equity_text(self):
+        if not self.fetch_equity:
+            return "Unavailable"
+        try:
+            return f"{self._value(await self.fetch_equity())} USDT (incl. unrealized PnL)"
+        except Exception as exc:
+            log.warning("Telegram equity query failed (%s)", type(exc).__name__)
+            return "Unavailable"
+
+    async def _status_message(self, title="📊 SYSTEM STATUS"):
+        return self._event_message(title, [
+            ("Mode", self.mode),
+            ("Account", self.account_name),
+            ("New entries", "PAUSED" if self.engine.paused else "ENABLED"),
+            ("Stop loss", self._stop_loss_text()),
+            ("Account equity", await self._equity_text()),
+        ])
+
+    async def _positions_message(self):
+        if not self.fetch_account_positions:
+            body = "Account positions unavailable."
+        else:
+            try:
+                body = await self.fetch_account_positions()
+            except Exception as exc:
+                log.warning("Telegram account positions query failed (%s)", type(exc).__name__)
+                body = f"Account positions unavailable: {type(exc).__name__}"
+        return (await self._status_message("📈 ACCOUNT POSITIONS")) + \
+            f"\n\n<b>Open positions</b>\n<pre>{escape(body)}</pre>"
+
+    async def _leader_positions_message(self):
+        if not self.fetch_leader_positions:
+            body = "Leader positions unavailable."
+        else:
+            try:
+                body = await self.fetch_leader_positions()
+            except Exception as exc:
+                log.warning("Telegram leader positions query failed (%s)", type(exc).__name__)
+                body = f"Leader positions unavailable: {type(exc).__name__}"
+        return f"<b>👥 LEADER POSITIONS</b>\n<i>━━━━━━━━━━━━</i>\n<pre>{escape(body)}</pre>"
 
     async def _request(self, session, method, **params):
         async with session.post(f"{self._api_url}/{method}", data=params) as response:
@@ -188,6 +247,7 @@ class TelegramManager:
                             "sendMessage",
                             chat_id=self.chat_id,
                             text=reply,
+                            parse_mode="HTML",
                         )
                 except asyncio.CancelledError:
                     raise
