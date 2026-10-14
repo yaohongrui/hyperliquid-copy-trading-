@@ -1,6 +1,8 @@
 import ccxt.async_support as ccxt
+from decimal import Decimal
 
 from core.models import Order
+from .base import OrderQuantityTooSmall
 
 
 class CcxtExchange:
@@ -51,9 +53,13 @@ class CcxtExchange:
     async def create_order(self, symbol, side, amount, order_type="market", price=None, reduce_only=False):
         market = self._symbol(symbol)
         contract_size = float(self.client.markets[market].get('contractSize') or 1)
-        contracts = float(self.client.amount_to_precision(market, amount / contract_size))
-        if contracts <= 0:
-            raise ValueError('quantity below one exchange lot')
+        try:
+            contracts = float(self.client.amount_to_precision(market, amount / contract_size))
+        except ccxt.InvalidOrder as exc:
+            raise OrderQuantityTooSmall(str(exc)) from exc
+        minimum = self.client.markets[market].get('limits', {}).get('amount', {}).get('min') or 0
+        if contracts <= 0 or Decimal(str(contracts)) < Decimal(str(minimum)):
+            raise OrderQuantityTooSmall(f'quantity {contracts:g} is below exchange minimum {minimum}')
         if order_type == 'limit' and (price is None or price <= 0):
             raise ValueError('limit price must be positive')
         params = {"reduceOnly": True} if reduce_only else {}

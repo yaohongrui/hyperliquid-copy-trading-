@@ -1,4 +1,8 @@
 from abc import ABC, abstractmethod
+
+class OrderQuantityTooSmall(ValueError):
+ pass
+
 class Exchange(ABC):
  @abstractmethod
  async def create_order(self,symbol,side,amount,order_type='market',price=None,reduce_only=False): ...

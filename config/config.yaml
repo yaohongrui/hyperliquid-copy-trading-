@@ -26,19 +26,6 @@ execution_accounts:
       max_daily_loss_usdt: 40
     fixed_balance_usdt: 100
 leaders:
-- name: D
-  address: '0x0b38c01118342098d6f108cc3741349089cd9590'
-  source: hyperliquid
-  execution_account: binance_primary
-  coefficient: 1
-  enabled: true
-  symbol_blacklist: []
-  late_entry_enabled: true
-  late_entry_offset_pct: 0.2
-  position_stop_loss:
-    enabled: true
-    max_loss_usdt: 10
-  total_margin: 400000
 - name: A
   address: '0x15baf1cefcced43e971da85b7b4de5a0391f7b29'
   source: hyperliquid
@@ -58,27 +45,49 @@ leaders:
   symbol_blacklist: []
   late_entry_enabled: false
   late_entry_offset_pct: 0.2
+  position_stop_loss:
+    enabled: true
+    max_loss_usdt: 10
   total_margin: 200000
 - name: C
   address: '0xcb02837caaee310c178501855b63bf7f4f4b1f8b'
   source: hyperliquid
   execution_account: binance_primary
-  coefficient: 10
-  enabled: false
+  coefficient: 8
+  enabled: true
   symbol_blacklist: []
   late_entry_enabled: false
   late_entry_offset_pct: 0.1
+  position_stop_loss:
+    enabled: true
+    max_loss_usdt: 8
   total_margin: 1700000
-- name: stockd
-  address: '0x0b38c01118342098d6f108cc3741349089cd9590'
+- name: D
+  address: '0x7f15f9e8f49c07ab33d4dbd05a92dbd6dfd686ab'
   source: hyperliquid
   execution_account: binance_primary
-  coefficient: 2.5
+  coefficient: 1
   enabled: false
   symbol_blacklist: []
-  late_entry_enabled: true
+  late_entry_enabled: false
   late_entry_offset_pct: 0.2
-  total_margin: 400000
+  position_stop_loss:
+    enabled: true
+    max_loss_usdt: 10
+  total_margin: 120000
+- name: E
+  address: '0x4c921317a8301044a2287dfa34b18c37005b42db'
+  source: hyperliquid
+  execution_account: binance_primary
+  coefficient: 10
+  enabled: true
+  symbol_blacklist: []
+  late_entry_enabled: false
+  late_entry_offset_pct: 0.1
+  position_stop_loss:
+    enabled: true
+    max_loss_usdt: 6
+  total_margin: 100000
 state:
   path: data/state.json
 telegram:

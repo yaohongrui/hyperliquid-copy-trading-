@@ -2,6 +2,7 @@ import asyncio
 import logging
 from dataclasses import replace
 from .detector import diff_positions
+from exchanges.base import OrderQuantityTooSmall
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ class Engine:
         self.owners = {}
         if state_store:
             self.owners = self.runtime_state.get('symbol_owners', {})
+        self.small_order_carry = self.runtime_state.get('small_order_carry', {})
 
     def _account_key(self, leader):
         return str(self.leaders[leader].get('execution_account') or '__default__')
@@ -29,7 +31,16 @@ class Engine:
     def _save_state(self):
         if self.state_store:
             self.runtime_state['symbol_owners'] = self.owners
+            self.runtime_state['small_order_carry'] = self.small_order_carry
             self.state_store.save(self.runtime_state)
+
+    def _set_carry(self, leader, symbol, side=None, amount=0):
+        key = f'{leader}:{symbol}'
+        if side and amount > 1e-12:
+            self.small_order_carry[key] = {'side': side, 'amount': amount}
+        else:
+            self.small_order_carry.pop(key, None)
+        self._save_state()
 
     async def _claim_or_check(self, leader, symbol):
         key = self._owner_key(leader, symbol)
@@ -149,6 +160,10 @@ class Engine:
             signals = diff_positions(leader, self.previous.get(leader, {}), positions, ratio)
             self.previous[leader] = positions
             if startup:
+                for key in list(self.small_order_carry):
+                    if key.startswith(f'{leader}:') and key[len(leader) + 1:] not in positions:
+                        self.small_order_carry.pop(key)
+                        self._save_state()
                 log.info('STARTUP leader=%s equity=%g sizing_balance=%g total_margin=%g ratio=%g positions=%d', leader, equity, budget, denominator, ratio, len(positions))
             for s in signals:
                 try:
@@ -174,6 +189,11 @@ class Engine:
                             await self._skip(leader, s, 'opposite account position exists')
                             continue
                         gap = max(0, abs(target) - abs(live))
+                        carry = self.small_order_carry.get(f'{leader}:{s.symbol}', {})
+                        if carry and (gap <= 1e-12 or carry.get('side') != ('buy' if target > 0 else 'sell')):
+                            self._set_carry(leader, s.symbol)
+                        elif carry and float(carry.get('amount') or 0) > gap:
+                            self._set_carry(leader, s.symbol, carry['side'], gap)
                         if not gap:
                             await self._skip(leader, s, 'account position already meets target')
                             continue
@@ -189,7 +209,19 @@ class Engine:
                         await self._skip(leader, s, 'reversal requires reconciliation; automatic reversal disabled')
                         continue
                     reduce = s.kind in ('decrease', 'close')
+                    carry = self.small_order_carry.get(f'{leader}:{s.symbol}', {})
+                    carry_amount = float(carry.get('amount') or 0)
                     if reduce:
+                        carry_reducing = (carry.get('side') == 'buy' and s.delta < 0) or (carry.get('side') == 'sell' and s.delta > 0)
+                        if carry_amount and s.kind == 'decrease' and carry_reducing:
+                            remaining = max(0, carry_amount - abs(s.delta))
+                            self._set_carry(leader, s.symbol, carry.get('side'), remaining)
+                            if abs(s.delta) <= carry_amount:
+                                await self._skip(leader, s, 'reduction absorbed by unfilled small increases')
+                                continue
+                            s = replace(s, delta=(abs(s.delta) - carry_amount) * (1 if s.delta > 0 else -1))
+                        elif carry_amount:
+                            self._set_carry(leader, s.symbol)
                         if not live or live * s.delta >= 0:
                             await self._skip(leader, s, 'no matching account position to reduce')
                             continue
@@ -197,12 +229,25 @@ class Engine:
                     else:
                         amount = abs(s.delta)
                     side = 'buy' if s.delta > 0 else 'sell'
+                    if not reduce and not startup and carry.get('side') == side:
+                        amount += carry_amount
+                    elif not reduce and carry_amount and carry.get('side') != side:
+                        self._set_carry(leader, s.symbol)
                     typ = 'limit' if not startup and cfg.get('late_entry_enabled') and s.kind == 'open' else 'market'
                     price = None
                     if typ == 'limit':
                         anchor = positions[s.symbol].entry_price
                         price = anchor * (1 + (-1 if side == 'buy' else 1) * cfg.get('late_entry_offset_pct', 0) / 100)
-                    order = await self.exchange.create_order(s.symbol, side, amount, typ, price, reduce)
+                    try:
+                        order = await self.exchange.create_order(s.symbol, side, amount, typ, price, reduce)
+                    except OrderQuantityTooSmall as exc:
+                        if not reduce:
+                            self._set_carry(leader, s.symbol, side, amount)
+                        reason = 'quantity below exchange minimum; waiting to accumulate' if not reduce else 'reduction below exchange minimum'
+                        await self._skip(leader, s, f'{reason} ({exc})')
+                        continue
+                    if not reduce:
+                        self._set_carry(leader, s.symbol)
                     log.info('ORDER RESULT leader=%s symbol=%s id=%s status=%s amount=%s', leader, s.symbol, order.id, order.status, order.amount)
                     if self.notifier:
                         if order.status == 'closed':
