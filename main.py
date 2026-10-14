@@ -85,6 +85,7 @@ async def main(path):
         (c.get("hyperliquid") or {}).get("reconnect_seconds", 3),
     )
     ws_task = asyncio.create_task(_consume_leaders(ws, engine, leaders), name="hyperliquid-ws")
+    protection_task = asyncio.create_task(_reconcile_protections(engine, stop), name="protection-reconciler")
     api_runner = web.AppRunner(create_app(telegram))
     await api_runner.setup()
     await web.TCPSite(api_runner, "127.0.0.1", 8766).start()
@@ -93,6 +94,8 @@ async def main(path):
     finally:
         ws_task.cancel()
         await asyncio.gather(ws_task, return_exceptions=True)
+        protection_task.cancel()
+        await asyncio.gather(protection_task, return_exceptions=True)
         if not dry_run:
             await exchange.stop()
         if telegram:
@@ -141,6 +144,19 @@ async def _consume_leaders(source, engine, leaders):
                 log.info("Leader %s produced %d signal(s): %s", leader, len(signals), ", ".join(f"{s.kind} {s.symbol} {s.delta:g}" for s in signals))
         except Exception:
             log.exception("Leader event processing failed for %s", leader)
+
+
+async def _reconcile_protections(engine, stop, interval=5):
+    """Keep manually changed positions and exchange-native stop orders aligned."""
+    while not stop.is_set():
+        try:
+            await engine.reconcile_protections()
+        except Exception:
+            log.exception("Protection reconciliation failed")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

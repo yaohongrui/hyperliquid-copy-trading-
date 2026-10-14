@@ -50,11 +50,16 @@ class Engine:
             old = self.runtime_state.get('protection', {}).pop(key, None)
             if old:
                 try:
-                    await self.exchange.cancel_protection(old, symbol)
+                    await self.exchange.cancel_protection(self._protection_id(old), symbol)
                 except Exception:
                     log.warning('Failed to cancel protection order %s for %s', old, symbol, exc_info=True)
             self.owners.pop(key, None)
             self._save_state()
+
+    @staticmethod
+    def _protection_id(value):
+        # State files written by older versions contain the id directly.
+        return value.get('id') if isinstance(value, dict) else value
 
     async def _sync_protection(self, leader, symbol):
         cfg = self.leaders[leader].get('position_stop_loss') or {}
@@ -74,12 +79,52 @@ class Engine:
         # records the latest id for later replacement/cancellation.
         key = self._owner_key(leader, symbol)
         old = self.runtime_state.get('protection', {}).get(key)
-        if old and hasattr(self.exchange, 'cancel_protection'):
-            await self.exchange.cancel_protection(old, symbol)
+        old_id = self._protection_id(old)
+        old_contracts = float(old.get('contracts') or 0) if isinstance(old, dict) else 0
+        old_trigger = float(old.get('trigger') or 0) if isinstance(old, dict) else 0
+        # Do not churn orders on every reconciliation tick.  Recreate only
+        # when the live position or its loss-based trigger has changed.
+        if old_id and old_contracts and old_trigger and abs(old_contracts - contracts) <= 1e-12 and abs(old_trigger - trigger) <= max(abs(trigger), 1) * 1e-10:
+            return
+        if old_id and hasattr(self.exchange, 'cancel_protection'):
+            try:
+                await self.exchange.cancel_protection(old_id, symbol)
+            except Exception:
+                # The stop may already have fired or been canceled manually.
+                # Treat an unknown old id as already removed and continue.
+                log.info('Protection %s for %s is already gone; replacing it', old_id, symbol)
         oid = await self.exchange.set_protection(symbol, 'sell' if side == 'long' else 'buy', contracts, trigger)
         if self.state_store:
-            self.runtime_state.setdefault('protection', {})[key] = oid
+            self.runtime_state.setdefault('protection', {})[key] = {
+                'id': oid, 'contracts': contracts, 'trigger': trigger,
+            }
             self._save_state()
+
+    async def reconcile_protections(self):
+        """Reconcile exchange positions with locally tracked protection orders.
+
+        This catches manual closes and partial closes, which do not produce a
+        leader signal and therefore never pass through ``process``.
+        """
+        async with self._lock:
+            for key, leader in list(self.owners.items()):
+                try:
+                    symbol = key.split(':', 1)[1]
+                    live = await self.exchange.position_size(symbol)
+                    if abs(live) <= 1e-12:
+                        await self._release_if_flat(leader, symbol)
+                    else:
+                        await self._sync_protection(leader, symbol)
+                except ValueError as exc:
+                    if str(exc).startswith('No USDT perpetual market'):
+                        self.runtime_state.get('protection', {}).pop(key, None)
+                        self.owners.pop(key, None)
+                        self._save_state()
+                        log.warning('Dropped protection state for unsupported market %s', symbol)
+                    else:
+                        log.warning('Protection reconciliation failed for %s', key, exc_info=True)
+                except Exception:
+                    log.warning('Protection reconciliation failed for %s', key, exc_info=True)
 
     async def prepare_startup(self):
         # Failure must propagate; unknown account state is never zero exposure.

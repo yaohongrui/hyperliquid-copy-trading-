@@ -88,15 +88,20 @@ class CcxtExchange:
         return None
 
     async def set_protection(self, symbol, side, amount, trigger_price):
-        """Place an exchange-native reduce-only stop-market order (Binance demo)."""
+        """Place a Binance stop that closes the whole remaining position.
+
+        ``closePosition=true`` is important here: a stop order with a fixed
+        quantity can remain too large after a manual partial close. Binance
+        rejects ``quantity``/``reduceOnly`` together with closePosition and
+        resolves the quantity when the trigger fires.
+        """
         market = self._symbol(symbol)
-        contract_size = float(self.client.markets[market].get('contractSize') or 1)
-        contracts = float(self.client.amount_to_precision(market, amount / contract_size))
-        if contracts <= 0:
-            raise ValueError('protection quantity below one exchange lot')
-        params = {'stopPrice': float(self.client.price_to_precision(market, trigger_price)), 'reduceOnly': True}
+        params = {
+            'stopPrice': float(self.client.price_to_precision(market, trigger_price)),
+            'closePosition': True,
+        }
         if self.name == 'binance':
-            result = await self.client.create_order(market, 'STOP_MARKET', side, contracts, None, params)
+            result = await self.client.create_order(market, 'STOP_MARKET', side, None, None, params)
         else:
             raise NotImplementedError('position protection demo currently supports Binance only')
         return str(result.get('id', ''))
