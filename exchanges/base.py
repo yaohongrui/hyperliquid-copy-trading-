@@ -7,3 +7,5 @@ class Exchange(ABC):
  async def fetch_open_orders(self): return []
  async def cancel_order(self,order_id,symbol=None): return None
  async def set_protection(self,*args,**kwargs): return {}
+ async def cancel_protection(self,*args,**kwargs): return None
+ async def fetch_position_detail(self,symbol): return None

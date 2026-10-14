@@ -40,7 +40,9 @@ class CcxtExchange:
         raw = str(symbol).upper().replace("_", "/")
         if raw in self.client.markets:
             return raw
-        base = raw.split("/")[0]
+        # Hyperliquid HIP-3 symbols are namespaced (e.g. XYZ:AMD), while
+        # Binance/Gate list the underlying perpetual as AMD/USDT:USDT.
+        base = raw.split("/")[0].split(":")[-1]
         for candidate, market in self.client.markets.items():
             if market.get("swap") and market.get("base", "").upper() == base and market.get("quote", "").upper() == "USDT":
                 return candidate
@@ -76,6 +78,31 @@ class CcxtExchange:
 
     async def fetch_positions(self):
         return await self.client.fetch_positions()
+
+    async def fetch_position_detail(self, symbol):
+        market = self._symbol(symbol)
+        rows = await self.client.fetch_positions([market])
+        for row in rows:
+            if row.get('symbol') == market and float(row.get('contracts') or 0):
+                return row
+        return None
+
+    async def set_protection(self, symbol, side, amount, trigger_price):
+        """Place an exchange-native reduce-only stop-market order (Binance demo)."""
+        market = self._symbol(symbol)
+        contract_size = float(self.client.markets[market].get('contractSize') or 1)
+        contracts = float(self.client.amount_to_precision(market, amount / contract_size))
+        if contracts <= 0:
+            raise ValueError('protection quantity below one exchange lot')
+        params = {'stopPrice': float(self.client.price_to_precision(market, trigger_price)), 'reduceOnly': True}
+        if self.name == 'binance':
+            result = await self.client.create_order(market, 'STOP_MARKET', side, contracts, None, params)
+        else:
+            raise NotImplementedError('position protection demo currently supports Binance only')
+        return str(result.get('id', ''))
+
+    async def cancel_protection(self, order_id, symbol):
+        return await self.cancel_order(order_id, symbol)
 
     async def fetch_open_orders(self):
         return await self.client.fetch_open_orders()

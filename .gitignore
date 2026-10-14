@@ -1,6 +1,26 @@
+# Local secrets and environment overrides
 config/lead.env
-config/*.swp
+.env
+.env.*
+!.env.example
+
+# Runtime state, logs, and temporary files
 data/
+*.log
+*.pid
+*.tmp
+*.swp
+.*.swp
+
+# Python build and test artifacts
 __pycache__/
-*/__pycache__/
+*.py[cod]
+*.egg-info/
 .pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and OS metadata
+.DS_Store
+.idea/
+.vscode/

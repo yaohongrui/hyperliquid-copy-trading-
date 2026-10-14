@@ -9,6 +9,7 @@ from core.engine import Engine
 from sources.position_queries import account_positions, leader_positions, leader_snapshot
 from sources.hyperliquid_ws import HyperliquidWS
 from telegram.bot import TelegramManager
+from state.store import StateStore
 
 log = logging.getLogger("hyper")
 
@@ -27,7 +28,7 @@ async def main(path):
         raise RuntimeError("No execution account is configured for an enabled leader")
     dry_run = bool(account.get("dry_run", False))
     exchange = DryRunExchange(account) if dry_run else CcxtExchange(account)
-    engine = Engine(exchange, leaders)
+    engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')))
     mode = "dry-run" if dry_run else "LIVE"
     log.info("HL copytrade started in %s mode; leaders=%s account=%s", mode, ",".join(leaders) or "none", account_name)
     stop = asyncio.Event()

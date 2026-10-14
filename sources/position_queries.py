@@ -18,8 +18,8 @@ async def leader_snapshot(config):
     address = _address(config.get("address"))
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post("https://api.hyperliquid.xyz/info", json={"type":"clearinghouseState", "user":address}) as response:
-            response.raise_for_status(); state = await response.json()
+        states = await _leader_states(session, address)
+    state = {"assetPositions": [row for item in states for row in item.get("assetPositions", [])]}
     result = {}
     for row in state.get("assetPositions") or []:
         p = row.get("position") or row
@@ -30,6 +30,30 @@ async def leader_snapshot(config):
     return result
 
 
+async def _leader_states(session, address):
+    """Fetch the default perp dex and all HIP-3 perp dexes."""
+    dexes = [None]
+    try:
+        async with session.post("https://api.hyperliquid.xyz/info", json={"type": "perpDexs"}) as response:
+            response.raise_for_status()
+            for item in await response.json() or []:
+                if isinstance(item, dict):
+                    dex = item.get("name") or item.get("dex") or item.get("fullName")
+                    if dex:
+                        dexes.append(dex)
+    except Exception:
+        pass
+    states = []
+    for dex in dict.fromkeys(dexes):
+        payload = {"type": "clearinghouseState", "user": address}
+        if dex:
+            payload["dex"] = dex
+        async with session.post("https://api.hyperliquid.xyz/info", json=payload) as response:
+            response.raise_for_status()
+            states.append(await response.json())
+    return states
+
+
 async def leader_positions(leaders):
     lines = []
     timeout = aiohttp.ClientTimeout(total=15)
@@ -38,21 +62,18 @@ async def leader_positions(leaders):
             address = _address(config.get("address"))
             if not address:
                 continue
-            async with session.post(
-                "https://api.hyperliquid.xyz/info",
-                json={"type": "clearinghouseState", "user": address},
-            ) as response:
-                response.raise_for_status()
-                state = await response.json()
+            states = await _leader_states(session, address)
             lines.append(f"{name} ({address})")
-            positions = state.get("assetPositions") or []
+            positions = [row for state in states for row in (state.get("assetPositions") or [])]
             if not positions:
                 lines.append("  No open positions")
+            shown = 0
             for item in positions:
                 position = item.get("position") or item
                 size = _number(position.get("szi"))
                 if not size:
                     continue
+                shown += 1
                 leverage = position.get("leverage") or {}
                 leverage = leverage.get("value", 1) if isinstance(leverage, dict) else leverage
                 lines.append(
@@ -60,6 +81,8 @@ async def leader_positions(leaders):
                     f"{abs(size):g} | entry {_number(position.get('entryPx')):g} | "
                     f"PnL {_number(position.get('unrealizedPnl')):g} | {leverage}x"
                 )
+            if positions and not shown:
+                lines.append("  No open positions")
     return "\n".join(lines) if lines else "No leaders configured."
 
 

@@ -6,7 +6,7 @@ from .detector import diff_positions
 log = logging.getLogger(__name__)
 
 class Engine:
-    def __init__(self, exchange, leaders, account_state=None, notifier=None):
+    def __init__(self, exchange, leaders, account_state=None, notifier=None, state_store=None):
         self.exchange = exchange
         self.leaders = leaders
         self.state = account_state
@@ -14,6 +14,72 @@ class Engine:
         self.previous = {}
         self.paused = False
         self._lock = asyncio.Lock()
+        self.state_store = state_store
+        self.runtime_state = state_store.load() if state_store else {}
+        self.owners = {}
+        if state_store:
+            self.owners = self.runtime_state.get('symbol_owners', {})
+
+    def _account_key(self, leader):
+        return str(self.leaders[leader].get('execution_account') or '__default__')
+
+    def _owner_key(self, leader, symbol):
+        return f'{self._account_key(leader)}:{symbol.upper()}'
+
+    def _save_state(self):
+        if self.state_store:
+            self.runtime_state['symbol_owners'] = self.owners
+            self.state_store.save(self.runtime_state)
+
+    async def _claim_or_check(self, leader, symbol):
+        key = self._owner_key(leader, symbol)
+        owner = self.owners.get(key)
+        if owner and owner != leader:
+            return False, owner
+        if not owner:
+            self.owners[key] = leader
+            self._save_state()
+        return True, leader
+
+    async def _release_if_flat(self, leader, symbol):
+        key = self._owner_key(leader, symbol)
+        if self.owners.get(key) != leader:
+            return
+        live = await self.exchange.position_size(symbol)
+        if abs(live) <= 1e-12:
+            old = self.runtime_state.get('protection', {}).pop(key, None)
+            if old:
+                try:
+                    await self.exchange.cancel_protection(old, symbol)
+                except Exception:
+                    log.warning('Failed to cancel protection order %s for %s', old, symbol, exc_info=True)
+            self.owners.pop(key, None)
+            self._save_state()
+
+    async def _sync_protection(self, leader, symbol):
+        cfg = self.leaders[leader].get('position_stop_loss') or {}
+        if not cfg.get('enabled') or cfg.get('max_loss_usdt') is None:
+            return
+        detail = await self.exchange.fetch_position_detail(symbol)
+        if not detail:
+            return
+        contracts = abs(float(detail.get('contracts') or 0))
+        entry = float(detail.get('entryPrice') or 0)
+        if not contracts or entry <= 0:
+            return
+        side = str(detail.get('side') or '').lower()
+        loss = float(cfg['max_loss_usdt'])
+        trigger = entry - loss / contracts if side == 'long' else entry + loss / contracts
+        # Native stop orders are intentionally owned by the exchange; this demo
+        # records the latest id for later replacement/cancellation.
+        key = self._owner_key(leader, symbol)
+        old = self.runtime_state.get('protection', {}).get(key)
+        if old and hasattr(self.exchange, 'cancel_protection'):
+            await self.exchange.cancel_protection(old, symbol)
+        oid = await self.exchange.set_protection(symbol, 'sell' if side == 'long' else 'buy', contracts, trigger)
+        if self.state_store:
+            self.runtime_state.setdefault('protection', {})[key] = oid
+            self._save_state()
 
     async def prepare_startup(self):
         # Failure must propagate; unknown account state is never zero exposure.
@@ -46,6 +112,15 @@ class Engine:
                         continue
                     if self.paused and s.kind in ('open', 'increase', 'close_reverse'):
                         await self._skip(leader, s, 'new exposure is paused')
+                        continue
+                    account_key = self._owner_key(leader, s.symbol)
+                    if s.kind in ('open', 'increase', 'close_reverse'):
+                        ok, owner = await self._claim_or_check(leader, s.symbol)
+                        if not ok:
+                            await self._skip(leader, s, f'symbol is owned by leader {owner}')
+                            continue
+                    elif s.kind in ('decrease', 'close') and self.owners.get(account_key) not in (None, leader):
+                        await self._skip(leader, s, f'symbol is owned by leader {self.owners[account_key]}')
                         continue
                     live = await self.exchange.position_size(s.symbol)
                     if startup:
@@ -89,6 +164,10 @@ class Engine:
                             await self.notifier.notify_filled(leader, replace(s, delta=order.amount if side == 'buy' else -order.amount), order)
                         else:
                             await self.notifier.notify_accepted(leader, s, order)
+                    if reduce:
+                        await self._release_if_flat(leader, s.symbol)
+                    elif order.status == 'closed':
+                        await self._sync_protection(leader, s.symbol)
                 except Exception as exc:
                     log.exception('Order processing failed: %s %s', leader, s.symbol)
                     if self.notifier:
