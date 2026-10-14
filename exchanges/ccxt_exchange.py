@@ -22,7 +22,10 @@ class CcxtExchange:
             "apiKey": config.get("api_key"),
             "secret": secret,
             "enableRateLimit": True,
-            "options": {"defaultType": "swap"},
+            "options": {
+                "defaultType": "swap",
+                "fetchOpenOrders": {"warnWithoutSymbol": False},
+            },
         })
         self._markets_loaded = False
 
@@ -73,6 +76,9 @@ class CcxtExchange:
 
     async def fetch_positions(self):
         return await self.client.fetch_positions()
+
+    async def fetch_open_orders(self):
+        return await self.client.fetch_open_orders()
 
     async def position_size(self, symbol):
         market = self._symbol(symbol)

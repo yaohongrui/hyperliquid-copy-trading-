@@ -50,6 +50,7 @@ async def main(path):
                 account_name=account_name,
                 account_config=account,
                 mode=mode,
+                report_format=telegram_config.get("report_format", "image"),
             )
             engine.notifier = telegram
             telegram_task = asyncio.create_task(telegram.run(), name="telegram-bot")
@@ -64,6 +65,7 @@ async def main(path):
             account_name=account_name,
             account_config=account,
             mode=mode,
+            report_format=telegram_config.get("report_format", "image"),
         )
     if not dry_run:
         await exchange.start()

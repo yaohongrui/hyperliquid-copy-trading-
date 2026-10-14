@@ -80,9 +80,17 @@ async def account_positions(accounts, leaders):
         else:
             lines.append(f"{name}: unsupported exchange {exchange_type}")
             continue
-        exchange = exchange_class({**credentials, "enableRateLimit": True, "options": {"defaultType": "swap"}})
+        exchange = exchange_class({
+            **credentials,
+            "enableRateLimit": True,
+            "options": {
+                "defaultType": "swap",
+                "fetchOpenOrders": {"warnWithoutSymbol": False},
+            },
+        })
         try:
             positions = await exchange.fetch_positions()
+            orders = await exchange.fetch_open_orders()
             lines.append(f"{name} ({exchange_type})")
             open_positions = [p for p in positions if _number(p.get("contracts"))]
             if not open_positions:
@@ -93,6 +101,20 @@ async def account_positions(accounts, leaders):
                     f"{_number(position.get('contracts')):g} | entry {_number(position.get('entryPrice')):g} | "
                     f"mark {_number(position.get('markPrice')):g} | "
                     f"PnL {_number(position.get('unrealizedPnl')):g}"
+                )
+            lines.append("  Open orders")
+            if not orders:
+                lines.append("    No open orders")
+            for order in orders:
+                info = order.get('info') or {}
+                reduce_only = order.get('reduceOnly')
+                if reduce_only is None:
+                    reduce_only = info.get('reduceOnly', info.get('reduce_only', False))
+                lines.append(
+                    f"    {order.get('symbol', '?')} {str(order.get('side') or '?').upper()} "
+                    f"{_number(order.get('amount') or order.get('remaining')):g} @ "
+                    f"{_number(order.get('price')):g} | {str(order.get('type') or '?').upper()} "
+                    f"| reduce-only {bool(reduce_only)} | id {order.get('id', '?')}"
                 )
         finally:
             await exchange.close()

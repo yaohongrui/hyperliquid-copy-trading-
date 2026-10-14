@@ -83,3 +83,4 @@ telegram:
   bot_token: ${TELEGRAM_GATE_BOT_TOKEN}
   chat_id: ${TELEGRAM_GATE_CHAT_ID}
   polling_timeout: 25
+  report_format: image

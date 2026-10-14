@@ -5,6 +5,8 @@ import logging
 
 import aiohttp
 
+from .report_image import render_report
+
 
 log = logging.getLogger(__name__)
 
@@ -15,7 +17,7 @@ class TelegramManager:
     def __init__(self, engine, token, chat_id, polling_timeout=25,
                  fetch_account_positions=None, fetch_leader_positions=None,
                  fetch_equity=None, account_name=None, account_config=None,
-                 mode=None):
+                 mode=None, report_format="image"):
         self.engine = engine
         self.token = token
         self.chat_id = str(chat_id) if chat_id is not None else None
@@ -28,6 +30,7 @@ class TelegramManager:
         self.account_name = account_name or "-"
         self.account_config = account_config or {}
         self.mode = mode or "UNKNOWN"
+        self.report_format = str(report_format or "image").lower()
         self.session = None
 
     def stop(self):
@@ -81,6 +84,16 @@ class TelegramManager:
             ("Account equity", await self._equity_text()),
         ])
 
+    async def _status_report(self):
+        equity = await self._equity_text()
+        return "\n".join([
+            f"Mode: {self.mode}",
+            f"Account: {self.account_name}",
+            f"New entries: {'PAUSED' if self.engine.paused else 'ENABLED'}",
+            f"Stop loss: {self._stop_loss_text()}",
+            f"Account equity: {equity}",
+        ])
+
     async def _positions_message(self):
         if not self.fetch_account_positions:
             body = "Account positions unavailable."
@@ -104,8 +117,25 @@ class TelegramManager:
                 body = f"Leader positions unavailable: {type(exc).__name__}"
         return f"<b>👥 LEADER POSITIONS</b>\n<i>━━━━━━━━━━━━</i>\n<pre>{escape(body)}</pre>"
 
-    async def _request(self, session, method, **params):
-        async with session.post(f"{self._api_url}/{method}", data=params) as response:
+    async def _report_photo(self, command):
+        if command == "/positions":
+            if not self.fetch_account_positions:
+                body = "Account positions unavailable."
+            else:
+                body = await self.fetch_account_positions()
+            text = f"{await self._status_report()}\n\nOPEN POSITIONS\n{body}"
+            return await self.send_photo("ACCOUNT POSITIONS", text)
+        if command == "/leader_positions":
+            if not self.fetch_leader_positions:
+                body = "Leader positions unavailable."
+            else:
+                body = await self.fetch_leader_positions()
+            return await self.send_photo("LEADER POSITIONS", body)
+        return False
+
+    async def _request(self, session, method, data=None, **params):
+        request_data = data if data is not None else params
+        async with session.post(f"{self._api_url}/{method}", data=request_data) as response:
             response.raise_for_status()
             payload = await response.json()
             if not payload.get("ok"):
@@ -124,6 +154,22 @@ class TelegramManager:
             raise
         except Exception as exc:
             log.warning("Telegram notification failed (%s)", type(exc).__name__)
+            return False
+
+    async def send_photo(self, title, body):
+        if not self.session or not self.chat_id:
+            return False
+        try:
+            form = aiohttp.FormData()
+            form.add_field("chat_id", self.chat_id)
+            form.add_field("photo", render_report(title, body), filename="report.png", content_type="image/png")
+            form.add_field("caption", title)
+            await self._request(self.session, "sendPhoto", data=form)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Telegram report image failed (%s)", type(exc).__name__)
             return False
 
     @staticmethod
@@ -237,6 +283,13 @@ class TelegramManager:
                         text = message.get("text")
                         if not text:
                             continue
+                        command = text.strip().split()[0].split("@", 1)[0] if text.strip() else ""
+                        if self.report_format != "text" and command in {"/positions", "/leader_positions"}:
+                            try:
+                                if await self._report_photo(command):
+                                    continue
+                            except Exception:
+                                log.exception("Telegram report image failed")
                         try:
                             reply = await self.handle(text)
                         except Exception:
