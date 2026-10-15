@@ -30,7 +30,7 @@ leaders:
   address: '0x15baf1cefcced43e971da85b7b4de5a0391f7b29'
   source: hyperliquid
   execution_account: gate_primary
-  coefficient: 6
+  coefficient: 40
   enabled: true
   symbol_blacklist: []
   late_entry_enabled: true
@@ -93,6 +93,9 @@ leaders:
   total_margin: 100000
 state:
   path: data/state.json
+console:
+  database: data/console.sqlite3
+  domain: yhr.lol
 telegram:
   enabled: true
   bot_token: ${TELEGRAM_GATE_BOT_TOKEN}

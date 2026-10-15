@@ -17,6 +17,7 @@ class Engine:
         self.paused = False
         self._lock = asyncio.Lock()
         self.state_store = state_store
+        self.config_manager = None
         self.runtime_state = state_store.load() if state_store else {}
         self.risk = RiskManager(self.exchange.config.get('hard_stop'), self.runtime_state.get('risk'))
         self._risk_state_saved = None
@@ -24,6 +25,13 @@ class Engine:
         if state_store:
             self.owners = self.runtime_state.get('symbol_owners', {})
         self.small_order_carry = self.runtime_state.get('small_order_carry', {})
+
+    async def update_leader_config(self, leader, changes):
+        """Apply validated console changes without replacing the leader map."""
+        async with self._lock:
+            if leader not in self.leaders:
+                raise KeyError(leader)
+            self.leaders[leader].update(changes)
 
     def _account_key(self, leader):
         return str(self.leaders[leader].get('execution_account') or '__default__')

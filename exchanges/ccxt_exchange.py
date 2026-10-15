@@ -177,6 +177,46 @@ class CcxtExchange:
     async def fetch_open_orders(self):
         return await self.client.fetch_open_orders()
 
+    async def fetch_realized_pnl(self):
+        """Return recent exchange realized-PnL rows in the console schema."""
+        if self.client.has.get('fetchIncome'):
+            try:
+                income = await self.client.fetch_income(limit=100)
+                rows = []
+                for row in income or []:
+                    info = row.get('info') or {}
+                    kind = str(row.get('type') or info.get('incomeType') or info.get('type') or '').lower()
+                    if kind and not any(x in kind for x in ('realized', 'pnl', 'profit')):
+                        continue
+                    amount = row.get('amount')
+                    if amount is None:
+                        amount = info.get('income', info.get('realizedPnl', info.get('realised_pnl', 0)))
+                    rows.append({'id': row.get('id') or info.get('tranId'),
+                                 'symbol': row.get('symbol'), 'side': row.get('side'),
+                                 'amount': row.get('amount'), 'price': row.get('price'),
+                                 'realizedPnl': float(amount or 0), 'fee': 0,
+                                 'timestamp': row.get('timestamp')})
+                if rows:
+                    return rows
+            except (NotImplementedError, AttributeError, ccxt.NotSupported):
+                pass
+        if not self.client.has.get('fetchMyTrades'):
+            return []
+        rows = await self.client.fetch_my_trades(limit=100)
+        result = []
+        for row in rows or []:
+            info = row.get('info') or {}
+            realized = row.get('realizedPnl')
+            if realized is None:
+                realized = info.get('realizedPnl', info.get('realised_pnl', info.get('realized_pnl', 0)))
+            fee = row.get('fee') or {}
+            result.append({
+                'id': row.get('id'), 'symbol': row.get('symbol'), 'side': row.get('side'),
+                'amount': row.get('amount'), 'price': row.get('price'), 'realizedPnl': float(realized or 0),
+                'fee': float(fee.get('cost') or 0), 'timestamp': row.get('timestamp'),
+            })
+        return result
+
     async def position_size(self, symbol):
         market = self._symbol(symbol)
         rows = await self.client.fetch_positions([market])
@@ -200,6 +240,16 @@ class CcxtExchange:
         positions = await self.client.fetch_positions()
         unrealized = sum(float(position.get('unrealizedPnl') or 0) for position in positions)
         return wallet_equity + unrealized
+
+    async def wallet_balance(self):
+        """Return wallet balance excluding current position unrealized PnL."""
+        balance = await self.client.fetch_balance({'type': 'swap'})
+        if self.name == 'gate':
+            rows = balance.get('info') or []
+            row = next(x for x in rows if str(x.get('currency')).upper() == 'USDT')
+            return float(row.get('total') or 0)
+        account = balance.get('USDT') or {}
+        return float(account.get('total') or account.get('free') or 0)
 
     async def close_all_positions(self):
         """Market-close every open USDT perpetual position reduce-only."""

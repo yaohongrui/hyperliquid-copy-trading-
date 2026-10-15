@@ -1,6 +1,7 @@
+from pathlib import Path
 from aiohttp import web
 
-def create_app(manager):
+def create_app(manager, console=None):
     async def command(request):
         payload = await request.json()
         text = payload.get("command", "")
@@ -10,4 +11,9 @@ def create_app(manager):
 
     app = web.Application()
     app.router.add_post("/command", command)
+    if console:
+        console.install(app)
+    static = Path(__file__).with_name("static")
+    app.router.add_get("/", lambda request: web.FileResponse(static / "index.html"))
+    app.router.add_static("/static/", static)
     return app

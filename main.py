@@ -10,6 +10,8 @@ from sources.position_queries import account_positions, leader_positions, leader
 from sources.hyperliquid_ws import HyperliquidWS
 from telegram.bot import TelegramManager
 from state.store import StateStore
+from api.console import ConsoleService
+from config.manager import ConfigManager
 
 log = logging.getLogger("hyper")
 
@@ -29,6 +31,7 @@ async def main(path):
     dry_run = bool(account.get("dry_run", False))
     exchange = DryRunExchange(account) if dry_run else CcxtExchange(account)
     engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')))
+    engine.config_manager = ConfigManager(path)
     mode = "dry-run" if dry_run else "LIVE"
     log.info("HL copytrade started in %s mode; leaders=%s account=%s", mode, ",".join(leaders) or "none", account_name)
     stop = asyncio.Event()
@@ -86,7 +89,8 @@ async def main(path):
     )
     ws_task = asyncio.create_task(_consume_leaders(ws, engine, leaders), name="hyperliquid-ws")
     protection_task = asyncio.create_task(_reconcile_protections(engine, stop), name="protection-reconciler")
-    api_runner = web.AppRunner(create_app(telegram))
+    console = ConsoleService(engine, c, (c.get('console') or {}).get('database', 'data/console.sqlite3'), ws)
+    api_runner = web.AppRunner(create_app(telegram, console))
     await api_runner.setup()
     await web.TCPSite(api_runner, "127.0.0.1", 8766).start()
     try:
@@ -109,13 +113,13 @@ async def main(path):
 
 
 async def _consume_leaders(source, engine, leaders):
-    address_map = {_address(item.get("address")).lower(): name for name, item in leaders.items()}
     async for event in source.stream():
         log.debug("HL event channel=%s", event.get("channel"))
         if event.get("channel") != "allDexsClearinghouseState":
             continue
         data = event.get("data") or {}
         address = str(data.get("user", "")).lower()
+        address_map = {_address(item.get("address")).lower(): name for name, item in leaders.items()}
         leader = address_map.get(address)
         if not leader:
             log.warning("HL event for unknown leader address %s", address)
