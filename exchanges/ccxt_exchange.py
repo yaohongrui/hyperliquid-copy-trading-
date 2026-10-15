@@ -137,10 +137,29 @@ class CcxtExchange:
         return str(result.get('id', ''))
 
     async def cancel_protection(self, order_id, symbol):
+        if self.name == 'gate':
+            return await self.client.privateFuturesDeleteSettlePriceOrdersOrderId({
+                'settle': self.config.get('settle', 'usdt'),
+                'order_id': str(order_id),
+            })
         return await self.cancel_order(order_id, symbol)
 
     async def cancel_protection_orders(self, symbol, keep_id=None):
         """Remove duplicate conditional reduce-only orders for one market."""
+        if self.name == 'gate':
+            market = self._symbol(symbol)
+            contract = self.client.markets[market]['id']
+            orders = await self.client.privateFuturesGetSettlePriceOrders({
+                'settle': self.config.get('settle', 'usdt'), 'status': 'open',
+            })
+            for order in orders or []:
+                initial = order.get('initial') or {}
+                oid = str(order.get('id_string') or order.get('id') or '')
+                if (oid and oid != str(keep_id or '') and
+                        str(initial.get('contract', '')).upper() == contract.upper() and
+                        bool(initial.get('is_reduce_only') or initial.get('reduce_only'))):
+                    await self.cancel_protection(oid, symbol)
+            return
         market = self._symbol(symbol)
         for order in await self.client.fetch_open_orders(market):
             oid = str(order.get('id') or '')
