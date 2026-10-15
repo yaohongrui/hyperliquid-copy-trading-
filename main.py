@@ -150,6 +150,7 @@ async def _reconcile_protections(engine, stop, interval=5):
     """Keep manually changed positions and exchange-native stop orders aligned."""
     while not stop.is_set():
         try:
+            await engine.check_hard_stop()
             await engine.reconcile_protections()
         except Exception:
             log.exception("Protection reconciliation failed")

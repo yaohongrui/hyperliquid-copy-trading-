@@ -50,7 +50,7 @@ class TelegramManager:
             return await self._status_message()
         if cmd == "/positions":
             return await self._positions_message()
-        if cmd == "/leader_positions":
+        if cmd in {"/leader_positions", "/leader_positons"}:
             return await self._leader_positions_message()
         return self._event_message("❔ UNKNOWN COMMAND", [
             ("Available", "/status, /positions, /leader_positions"),
@@ -188,43 +188,43 @@ class TelegramManager:
             lines.extend(("", f"<b>Reason</b>: {escape(str(reason)[:300])}"))
         return "\n".join(lines)
 
+    @staticmethod
+    def _order_side(signal, order=None):
+        """Return the actual execution direction, independent of position side."""
+        side = getattr(order, "side", None) if order is not None else None
+        if side:
+            return str(side).upper()
+        return "BUY" if signal.delta > 0 else "SELL"
+
+    @classmethod
+    def _trade_fields(cls, leader, signal, order=None):
+        return [
+            ("Leader", leader),
+            ("Symbol", signal.symbol),
+            ("Position direction", signal.side.upper()),
+            ("Order direction", cls._order_side(signal, order)),
+            ("Action", signal.kind.upper()),
+        ]
+
     async def notify_filled(self, leader, signal, order):
         kind = {"open": "OPEN", "increase": "INCREASE", "decrease": "DECREASE", "close": "CLOSE"}.get(signal.kind, signal.kind.upper())
         price = getattr(order, "price", None)
-        fields = [
-            ("Leader", leader),
-            ("Symbol", signal.symbol),
-            ("Position", signal.side.upper()),
-            ("Action", kind),
-            ("Filled qty", abs(order.amount)),
-        ]
+        fields = self._trade_fields(leader, signal, order)
+        fields[-1] = ("Action", kind)
+        fields.append(("Filled qty", abs(order.amount)))
         if price is not None:
             fields.append(("Avg price", price))
         await self.send(self._event_message("✅ ORDER FILLED", fields))
 
     async def notify_failed(self, leader, signal, exc):
-        await self.send(self._event_message("❌ ORDER FAILED", [
-            ("Leader", leader),
-            ("Symbol", signal.symbol),
-            ("Position", signal.side.upper()),
-            ("Action", signal.kind.upper()),
-        ], reason=exc))
+        await self.send(self._event_message("❌ ORDER FAILED", self._trade_fields(leader, signal), reason=exc))
 
     async def notify_skipped(self, leader, signal, reason):
-        await self.send(self._event_message("⏭️ ORDER SKIPPED", [
-            ("Leader", leader),
-            ("Symbol", signal.symbol),
-            ("Position", signal.side.upper()),
-            ("Action", signal.kind.upper()),
-        ], reason=reason))
+        await self.send(self._event_message("⏭️ ORDER SKIPPED", self._trade_fields(leader, signal), reason=reason))
 
     async def notify_accepted(self, leader, signal, order):
         """Notify when an exchange accepts an order that is not filled yet."""
-        await self.send(self._event_message("🕒 ORDER ACCEPTED", [
-            ("Leader", leader),
-            ("Symbol", signal.symbol),
-            ("Position", signal.side.upper()),
-            ("Action", signal.kind.upper()),
+        await self.send(self._event_message("🕒 ORDER ACCEPTED", self._trade_fields(leader, signal, order) + [
             ("Order", order.id),
             ("Status", order.status.upper()),
         ]))
@@ -284,9 +284,9 @@ class TelegramManager:
                         if not text:
                             continue
                         command = text.strip().split()[0].split("@", 1)[0] if text.strip() else ""
-                        if self.report_format != "text" and command in {"/positions", "/leader_positions"}:
+                        if self.report_format != "text" and command in {"/positions", "/leader_positions", "/leader_positons"}:
                             try:
-                                if await self._report_photo(command):
+                                if await self._report_photo("/leader_positions" if command == "/leader_positons" else command):
                                     continue
                             except Exception:
                                 log.exception("Telegram report image failed")

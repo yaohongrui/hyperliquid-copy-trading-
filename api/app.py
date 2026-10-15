@@ -4,7 +4,7 @@ def create_app(manager):
     async def command(request):
         payload = await request.json()
         text = payload.get("command", "")
-        if text not in {"/status", "/positions", "/leader_positions", "/pause", "/resume"}:
+        if text not in {"/status", "/positions", "/leader_positions", "/leader_positons", "/pause", "/resume"}:
             raise web.HTTPBadRequest(text="Unknown command")
         return web.Response(text=await manager.handle(text))
 

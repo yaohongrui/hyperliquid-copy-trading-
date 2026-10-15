@@ -14,6 +14,52 @@ def _address(value):
     # YAML parses unquoted 0x... values as integers.
     return hex(value) if isinstance(value, int) else str(value)
 
+
+def _leverage(position):
+    info = position.get("info") or {}
+    value = (position.get("leverage") or info.get("leverage") or
+             info.get("leverage_value") or info.get("leverageValue") or 1)
+    if isinstance(value, dict):
+        value = value.get("value") or value.get("amount") or value.get("leverage") or 1
+    return _number(value)
+
+
+def _field(position, *names):
+    info = position.get("info") or {}
+    for name in names:
+        value = position.get(name)
+        if value is None or value == "":
+            value = info.get(name)
+        if value is not None and value != "":
+            number = _number(value)
+            if number:
+                return abs(number)
+    return 0.0
+
+
+def _roi(pnl, size, entry, leverage, notional=0.0, margin=0.0):
+    # Prefer exchange supplied margin/notional; contract sizes differ by venue.
+    margin = margin or (notional / (leverage or 1))
+    margin = margin or (abs(size) * abs(entry) / (leverage or 1))
+    return (pnl / margin * 100) if margin else 0.0
+
+
+def _fmt(value):
+    return f"{_number(value):g}"
+
+
+def _symbol(value):
+    return str(value or "?").split("/", 1)[0].split(":", 1)[-1]
+
+
+def _table(rows, include_leverage=True):
+    headers = (("Symbol", "Direction", "Leverage", "ROI", "PnL", "Entry", "Mark", "Size")
+               if include_leverage else
+               ("Symbol", "Direction", "ROI", "PnL", "Entry", "Mark", "Size"))
+    lines = [" | ".join(headers), " | ".join("---" for _ in headers)]
+    lines.extend(" | ".join(row) for row in rows)
+    return "\n".join(lines)
+
 async def leader_snapshot(config):
     address = _address(config.get("address"))
     timeout = aiohttp.ClientTimeout(total=15)
@@ -68,21 +114,28 @@ async def leader_positions(leaders):
             if not positions:
                 lines.append("  No open positions")
             shown = 0
+            rows = []
             for item in positions:
                 position = item.get("position") or item
                 size = _number(position.get("szi"))
                 if not size:
                     continue
                 shown += 1
-                leverage = position.get("leverage") or {}
-                leverage = leverage.get("value", 1) if isinstance(leverage, dict) else leverage
-                lines.append(
-                    f"  {position.get('coin', '?')} {'LONG' if size > 0 else 'SHORT'} "
-                    f"{abs(size):g} | entry {_number(position.get('entryPx')):g} | "
-                    f"PnL {_number(position.get('unrealizedPnl')):g} | {leverage}x"
-                )
+                entry = _number(position.get("entryPx"))
+                mark = _number(position.get("markPx"))
+                if not mark and size:
+                    mark = abs(_number(position.get("positionValue"))) / abs(size)
+                pnl = _number(position.get("unrealizedPnl"))
+                notional = _field(position, "positionValue", "notional")
+                margin = _field(position, "marginUsed", "initialMargin", "collateral")
+                leverage = _leverage(position) or (notional / margin if margin else 1.0)
+                rows.append((_symbol(position.get("coin", "?")), "LONG" if size > 0 else "SHORT",
+                             f"{leverage:g}x", f"{_roi(pnl, size, entry, leverage, notional, margin):g}%",
+                             _fmt(pnl), _fmt(entry), _fmt(mark), _fmt(abs(size))))
             if positions and not shown:
                 lines.append("  No open positions")
+            elif rows:
+                lines.append(_table(rows))
     return "\n".join(lines) if lines else "No leaders configured."
 
 
@@ -118,13 +171,23 @@ async def account_positions(accounts, leaders):
             open_positions = [p for p in positions if _number(p.get("contracts"))]
             if not open_positions:
                 lines.append("  No open positions")
+            rows = []
             for position in open_positions:
-                lines.append(
-                    f"  {position.get('symbol', '?')} {str(position.get('side') or '?').upper()} "
-                    f"{_number(position.get('contracts')):g} | entry {_number(position.get('entryPrice')):g} | "
-                    f"mark {_number(position.get('markPrice')):g} | "
-                    f"PnL {_number(position.get('unrealizedPnl')):g}"
-                )
+                contracts = _number(position.get("contracts"))
+                contract_size = _number(position.get("contractSize")) or _number((position.get("info") or {}).get("contractSize")) or 1.0
+                size = contracts * contract_size
+                entry = _number(position.get("entryPrice"))
+                mark = _number(position.get("markPrice"))
+                pnl = _number(position.get("unrealizedPnl"))
+                notional = _field(position, "notional", "positionValue")
+                margin = _field(position, "initialMargin", "marginUsed", "collateral")
+                leverage = _leverage(position) or (notional / margin if margin else 1.0)
+                direction = str(position.get("side") or ("long" if size > 0 else "short")).upper()
+                rows.append((_symbol(position.get("symbol", "?")), direction,
+                             f"{_roi(pnl, size, entry, leverage, notional, margin):g}%", _fmt(pnl), _fmt(entry),
+                             _fmt(mark), _fmt(abs(size))))
+            if rows:
+                lines.append(_table(rows, include_leverage=False))
             lines.append("  Open orders")
             if not orders:
                 lines.append("    No open orders")

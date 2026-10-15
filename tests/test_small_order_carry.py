@@ -32,6 +32,13 @@ class LotExchange:
         return Order('1', symbol, side, amount, 1, 'closed', reduce_only)
 
 
+class NotionalExchange(LotExchange):
+    async def create_order(self, symbol, side, amount, order_type, price, reduce_only):
+        if amount * 100 < 5:
+            raise OrderQuantityTooSmall('binanceusdm {"code":-4164,"msg":"Order\'s notional must be no smaller than 5"}')
+        return await super().create_order(symbol, side, amount, order_type, price, reduce_only)
+
+
 def snapshot(size):
     return {'XYZ:DELL': Position('XYZ:DELL', size, 1)} if size else {}
 
@@ -98,6 +105,16 @@ class SmallOrderCarryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(store.load()['small_order_carry'], {})
             await restarted.process('D', snapshot(0.014))
             self.assertEqual(self.exchange.orders, [('buy', 0.01, False)])
+
+    async def test_minimum_notional_failure_is_accumulated(self):
+        self.exchange = NotionalExchange()
+        engine = Engine(self.exchange, self.leaders)
+        await engine.process('D', {})
+        await engine.process('D', snapshot(0.02))
+        await engine.process('D', snapshot(0.04))
+        self.assertEqual(self.exchange.orders, [])
+        await engine.process('D', snapshot(0.06))
+        self.assertEqual(self.exchange.orders, [('buy', 0.06, False)])
 
 
 if __name__ == '__main__':

@@ -76,7 +76,26 @@ class CcxtExchange:
                 await self.client.set_leverage(0, market, {'cross_leverage_limit': effective})
             else:
                 await self.client.set_leverage(effective, market)
-        result = await self.client.create_order(market, order_type, side, contracts, price, params)
+        try:
+            result = await self.client.create_order(market, order_type, side, contracts, price, params)
+        except ccxt.InvalidOrder as exc:
+            # Binance enforces a separate minimum notional (currently often
+            # 5 USDT) at order submission. Treat it like a small quantity so
+            # the engine can accumulate this increment for a later retry.
+            message = str(exc)
+            lowered = message.lower()
+            small_order_error = (
+                '-4164' in lowered
+                or 'notional must be no smaller than' in lowered
+                or 'minimum notional' in lowered
+                or 'minimum order size' in lowered
+                or 'minimum order amount' in lowered
+                or 'order size is too small' in lowered
+                or 'amount is less than the minimum' in lowered
+            )
+            if small_order_error:
+                raise OrderQuantityTooSmall(message) from exc
+            raise
         return Order(
             str(result.get("id", "")), symbol, side, float(result.get('filled') or result.get('amount') or contracts) * contract_size, result.get('average') or result.get('price'),
             result.get("status", "open"), reduce_only,
@@ -94,7 +113,7 @@ class CcxtExchange:
         return None
 
     async def set_protection(self, symbol, side, amount, trigger_price):
-        """Place a Binance stop that closes the whole remaining position.
+        """Place an exchange-native stop that closes the whole position.
 
         ``closePosition=true`` is important here: a stop order with a fixed
         quantity can remain too large after a manual partial close. Binance
@@ -102,18 +121,39 @@ class CcxtExchange:
         resolves the quantity when the trigger fires.
         """
         market = self._symbol(symbol)
-        params = {
-            'stopPrice': float(self.client.price_to_precision(market, trigger_price)),
-            'closePosition': True,
-        }
+        trigger = float(self.client.price_to_precision(market, trigger_price))
         if self.name == 'binance':
+            params = {'stopPrice': trigger, 'closePosition': True}
             result = await self.client.create_order(market, 'STOP_MARKET', side, None, None, params)
+        elif self.name == 'gate':
+            # Gate's futures API exposes trigger orders through CCXT's
+            # unified triggerPrice parameter.  reduceOnly keeps the order
+            # from opening a reverse position when it fires.
+            params = {'triggerPrice': trigger, 'reduceOnly': True}
+            result = await self.client.create_order(market, 'market', side, amount, None, params)
         else:
-            raise NotImplementedError('position protection demo currently supports Binance only')
+            params = {'triggerPrice': trigger, 'reduceOnly': True}
+            result = await self.client.create_order(market, 'market', side, amount, None, params)
         return str(result.get('id', ''))
 
     async def cancel_protection(self, order_id, symbol):
         return await self.cancel_order(order_id, symbol)
+
+    async def cancel_protection_orders(self, symbol, keep_id=None):
+        """Remove duplicate conditional reduce-only orders for one market."""
+        market = self._symbol(symbol)
+        for order in await self.client.fetch_open_orders(market):
+            oid = str(order.get('id') or '')
+            if keep_id and oid == str(keep_id):
+                continue
+            info = order.get('info') or {}
+            conditional = order.get('triggerPrice') is not None or order.get('stopPrice') is not None
+            conditional = conditional or bool(info.get('trigger') or info.get('stopPrice') or info.get('stop_price'))
+            reduce_only = order.get('reduceOnly')
+            if reduce_only is None:
+                reduce_only = info.get('reduceOnly', info.get('reduce_only', False))
+            if oid and conditional and reduce_only:
+                await self.cancel_order(oid, symbol)
 
     async def fetch_open_orders(self):
         return await self.client.fetch_open_orders()
@@ -141,6 +181,19 @@ class CcxtExchange:
         positions = await self.client.fetch_positions()
         unrealized = sum(float(position.get('unrealizedPnl') or 0) for position in positions)
         return wallet_equity + unrealized
+
+    async def close_all_positions(self):
+        """Market-close every open USDT perpetual position reduce-only."""
+        closed = 0
+        for position in await self.client.fetch_positions():
+            contracts = abs(float(position.get('contracts') or 0))
+            symbol = position.get('symbol')
+            if not symbol or contracts <= 0:
+                continue
+            side = 'sell' if str(position.get('side')).lower() == 'long' else 'buy'
+            await self.create_order(symbol, side, contracts, 'market', reduce_only=True)
+            closed += 1
+        return closed
 
     async def cancel_order(self, order_id, symbol=None):
         return await self.client.cancel_order(order_id, self._symbol(symbol) if symbol else None)

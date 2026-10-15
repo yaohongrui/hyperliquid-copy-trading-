@@ -3,6 +3,7 @@ import logging
 from dataclasses import replace
 from .detector import diff_positions
 from exchanges.base import OrderQuantityTooSmall
+from risk.manager import RiskManager
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +18,8 @@ class Engine:
         self._lock = asyncio.Lock()
         self.state_store = state_store
         self.runtime_state = state_store.load() if state_store else {}
+        self.risk = RiskManager(self.exchange.config.get('hard_stop'), self.runtime_state.get('risk'))
+        self._risk_state_saved = None
         self.owners = {}
         if state_store:
             self.owners = self.runtime_state.get('symbol_owners', {})
@@ -32,7 +35,25 @@ class Engine:
         if self.state_store:
             self.runtime_state['symbol_owners'] = self.owners
             self.runtime_state['small_order_carry'] = self.small_order_carry
+            self.runtime_state['risk'] = self.risk.state()
             self.state_store.save(self.runtime_state)
+
+    async def check_hard_stop(self):
+        """Check daily account drawdown and close exposure once if breached."""
+        if not self.risk.config:
+            return False
+        equity = await self.exchange.equity()
+        locked_before = self.risk.locked
+        hit = self.risk.evaluate(equity)
+        if self.state_store and (self._risk_state_saved != self.risk.state()):
+            self._save_state()
+            self._risk_state_saved = self.risk.state()
+        if hit and not locked_before:
+            log.critical('HARD STOP triggered equity=%g baseline=%g', equity, self.risk.baseline)
+            self.paused = True
+            await self.exchange.close_all_positions()
+            return True
+        return hit
 
     def _set_carry(self, leader, symbol, side=None, amount=0):
         key = f'{leader}:{symbol}'
@@ -80,12 +101,23 @@ class Engine:
         if not detail:
             return
         contracts = abs(float(detail.get('contracts') or 0))
+        contract_size = abs(float(detail.get('contractSize') or 1))
+        position_amount = contracts * contract_size
         entry = float(detail.get('entryPrice') or 0)
-        if not contracts or entry <= 0:
+        if not position_amount or entry <= 0:
             return
         side = str(detail.get('side') or '').lower()
         loss = float(cfg['max_loss_usdt'])
-        trigger = entry - loss / contracts if side == 'long' else entry + loss / contracts
+        # Gate and other contract venues report ``contracts`` rather than
+        # base-asset quantity.  Convert before translating a dollar loss into
+        # a price distance, otherwise non-unit contract sizes trigger early.
+        trigger = entry - loss / position_amount if side == 'long' else entry + loss / position_amount
+        mark = float(detail.get('markPrice') or detail.get('markPx') or 0)
+        if trigger <= 0 or (mark > 0 and ((side == 'long' and trigger >= mark) or (side == 'short' and trigger <= mark))):
+            log.warning('Protection price invalid for %s: side=%s entry=%g mark=%g trigger=%g; no order created', symbol, side, entry, mark, trigger)
+            if hasattr(self.exchange, 'cancel_protection_orders'):
+                await self.exchange.cancel_protection_orders(symbol)
+            return
         # Native stop orders are intentionally owned by the exchange; this demo
         # records the latest id for later replacement/cancellation.
         key = self._owner_key(leader, symbol)
@@ -93,6 +125,8 @@ class Engine:
         old_id = self._protection_id(old)
         old_contracts = float(old.get('contracts') or 0) if isinstance(old, dict) else 0
         old_trigger = float(old.get('trigger') or 0) if isinstance(old, dict) else 0
+        if hasattr(self.exchange, 'cancel_protection_orders'):
+            await self.exchange.cancel_protection_orders(symbol, old_id)
         # Do not churn orders on every reconciliation tick.  Recreate only
         # when the live position or its loss-based trigger has changed.
         if old_id and old_contracts and old_trigger and abs(old_contracts - contracts) <= 1e-12 and abs(old_trigger - trigger) <= max(abs(trigger), 1) * 1e-10:

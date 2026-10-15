@@ -12,3 +12,6 @@ class DryRunExchange(Exchange):
  async def equity(self): return float(self.config.get('fixed_balance_usdt') or 0)
  async def cancel_order(self,order_id,symbol=None):
   if order_id in self.orders: self.orders[order_id].status='canceled'
+ async def close_all_positions(self):
+  self.positions.clear()
+  return 0
