@@ -83,8 +83,17 @@ class Engine:
             if old:
                 try:
                     await self.exchange.cancel_protection(self._protection_id(old), symbol)
-                except Exception:
-                    log.warning('Failed to cancel protection order %s for %s', old, symbol, exc_info=True)
+                except Exception as exc:
+                    # Gate removes a conditional order automatically when the
+                    # position reaches zero.  Treat its ORDER_NOT_FOUND reply
+                    # as an already-completed cancellation.
+                    if type(exc).__name__ != 'OrderNotFound':
+                        log.warning('Failed to cancel protection order %s for %s', old, symbol, exc_info=True)
+                if hasattr(self.exchange, 'cancel_protection_orders'):
+                    try:
+                        await self.exchange.cancel_protection_orders(symbol)
+                    except Exception:
+                        log.warning('Failed to clean residual protection orders for %s', symbol, exc_info=True)
             self.owners.pop(key, None)
             self._save_state()
 
