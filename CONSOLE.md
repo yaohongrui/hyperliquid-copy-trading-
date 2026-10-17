@@ -11,7 +11,8 @@ leader sizing, blacklist, delayed-entry, and position-stop-loss settings.
 The console has no login; access to the public hostname grants control of the
 running engine.
 API keys, exchange selection, and manual orders are intentionally unavailable
-from the web UI.
+from the web UI. Account positions, open orders, trades, and performance rows
+show the Hyperliquid symbol name when `symbol_map` maps the venue instrument.
 
 The Performance page and `/api/v1/performance/overview` expose realized gross
 PnL, fees, funding, cash-flow-adjusted return, drawdown, and trader aggregates.

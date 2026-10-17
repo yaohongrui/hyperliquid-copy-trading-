@@ -3,13 +3,14 @@ import logging
 import time
 from dataclasses import replace
 from .detector import diff_positions
+from .symbols import SymbolMap
 from exchanges.base import OrderQuantityTooSmall
 from risk.manager import RiskManager
 
 log = logging.getLogger(__name__)
 
 class Engine:
-    def __init__(self, exchange, leaders, account_state=None, notifier=None, state_store=None):
+    def __init__(self, exchange, leaders, account_state=None, notifier=None, state_store=None, symbol_map=None):
         self.exchange = exchange
         self.leaders = leaders
         self.state = account_state
@@ -18,6 +19,7 @@ class Engine:
         self.paused = False
         self._lock = asyncio.Lock()
         self.state_store = state_store
+        self.symbol_map = symbol_map if isinstance(symbol_map, SymbolMap) else SymbolMap(symbol_map)
         self.config_manager = None
         self.runtime_state = state_store.load() if state_store else {}
         self.risk = RiskManager(self.exchange.config.get('hard_stop'), self.runtime_state.get('risk'))
@@ -176,6 +178,8 @@ class Engine:
             for key, leader in list(self.owners.items()):
                 try:
                     symbol = key.split(':', 1)[1]
+                    if self.symbol_map.is_skipped(symbol):
+                        continue
                     live = await self.exchange.position_size(symbol)
                     if abs(live) <= 1e-12:
                         await self._release_if_flat(leader, symbol)
@@ -222,6 +226,11 @@ class Engine:
                 log.info('STARTUP leader=%s equity=%g sizing_balance=%g total_margin=%g ratio=%g positions=%d', leader, equity, budget, denominator, ratio, len(positions))
             for s in signals:
                 try:
+                    if self.symbol_map.is_skipped(s.symbol):
+                        if f'{leader}:{s.symbol}' in self.small_order_carry:
+                            self._set_carry(leader, s.symbol)
+                        await self._skip(leader, s, 'symbol is mapped to skip')
+                        continue
                     if s.symbol in cfg.get('symbol_blacklist', []) or s.symbol + 'USDT' in cfg.get('symbol_blacklist', []):
                         await self._skip(leader, s, 'symbol is blacklisted')
                         continue

@@ -3,6 +3,7 @@ from decimal import Decimal
 import time
 
 from core.models import Order
+from core.symbols import SymbolMap, normalize
 from .base import OrderQuantityTooSmall
 
 
@@ -16,8 +17,9 @@ def _float(value, default=0.0):
 class CcxtExchange:
     """Small adapter for the configured USDT perpetual account."""
 
-    def __init__(self, config):
+    def __init__(self, config, symbol_map=None):
         self.config = config
+        self.symbol_map = symbol_map if isinstance(symbol_map, SymbolMap) else SymbolMap(symbol_map)
         name = str(config.get("exchange", "")).lower()
         if name == "gate":
             cls = ccxt.gate
@@ -47,16 +49,47 @@ class CcxtExchange:
         await self.client.close()
 
     def _symbol(self, symbol):
-        raw = str(symbol).upper().replace("_", "/")
-        if raw in self.client.markets:
+        raw = str(symbol or "").strip().upper().replace("_", "/")
+        market = self.client.markets.get(raw)
+        if market and market.get("swap"):
             return raw
-        # Hyperliquid HIP-3 symbols are namespaced (e.g. XYZ:AMD), while
-        # Binance/Gate list the underlying perpetual as AMD/USDT:USDT.
-        base = raw.split("/")[0].split(":")[-1]
-        for candidate, market in self.client.markets.items():
-            if market.get("swap") and market.get("base", "").upper() == base and market.get("quote", "").upper() == "USDT":
+        mapped = self.symbol_map.target(symbol)
+        if mapped:
+            candidate = mapped.strip().upper()
+            if "/" in candidate and candidate in self.client.markets:
+                if not self._is_usdt_swap(self.client.markets[candidate]):
+                    raise ValueError(f"symbol_map target {mapped} is not a USDT perpetual market")
                 return candidate
-        raise ValueError(f"No USDT perpetual market for {symbol}")
+            base = normalize(mapped)
+        else:
+            # Hyperliquid HIP-3 symbols are namespaced (e.g. XYZ:AMD), while
+            # Binance/Gate list the underlying perpetual as AMD/USDT:USDT.
+            base = normalize(symbol)
+        candidate = f"{base}/USDT:USDT"
+        market = self.client.markets.get(candidate)
+        if market and self._is_usdt_swap(market):
+            return candidate
+        for candidate, market in self.client.markets.items():
+            if self._is_usdt_swap(market) and market.get("base", "").upper() == base:
+                return candidate
+        if mapped:
+            raise ValueError(f"No USDT perpetual market for {symbol} (symbol_map -> {mapped})")
+        raise ValueError(f"No USDT perpetual market for {symbol}; add a symbol_map entry if the venue names it differently")
+
+    @staticmethod
+    def _is_usdt_swap(market):
+        return bool(market.get("swap")) and market.get("quote", "").upper() == "USDT"
+
+    def validate_symbol_map(self):
+        """Resolve every mapping once so typos fail at startup, not at order time."""
+        errors = []
+        for name, target in self.symbol_map.entries().items():
+            try:
+                self._symbol(name)
+            except ValueError as exc:
+                errors.append(f"{name} -> {target}: {exc}")
+        if errors:
+            raise ValueError("; ".join(errors))
 
     async def create_order(self, symbol, side, amount, order_type="market", price=None, reduce_only=False):
         market = self._symbol(symbol)

@@ -41,6 +41,19 @@ Hyperliquid 交易员跟单系统：订阅 HL 官方 WebSocket 监控交易员�
 - `state.path`: 状态文件（symbol 所有权、小单 carry、风控基线、止损单 id），每次变动原子写入
 - `console`: `database`、`domain`
 - `telegram`: `enabled`、`bot_token`、`chat_id`、`polling_timeout`、`report_format`
+- `symbol_map`（顶层，可选）: HL 币名 -> 执行交易所合约，用于两边名称不一致的情况
+  - 值可以是 CCXT 统一标的（`AMD/USDT:USDT`）、基础币种（`AMD`）或交易所原生写法（`AMD_USDT`）
+  - 值为 `skip` / `null` 表示完全忽略该币：不开仓、不加仓、不减仓、不平仓
+  - HIP-3 名称含冒号，YAML 里必须加引号（如 `'XYZ:SKHX'`）
+  - 精确名称优先，未命中再按基础币种匹配；控制台和 Telegram 会反向显示 HL 名称
+  - 仅支持配置文件，修改后需重启进程
+
+```yaml
+symbol_map:
+  'XYZ:SKHX': SKHX/USDT:USDT
+  PEPE: 1000PEPE
+  'XYZ:OLD': skip
+```
 
 ## 运行
 

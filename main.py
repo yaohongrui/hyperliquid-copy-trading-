@@ -6,6 +6,7 @@ from config.loader import load
 from exchanges.dry_run import DryRunExchange
 from exchanges.ccxt_exchange import CcxtExchange
 from core.engine import Engine
+from core.symbols import SymbolMap
 from sources.position_queries import account_positions, leader_positions, leader_snapshot
 from sources.hyperliquid_ws import HyperliquidWS
 from telegram.bot import TelegramManager
@@ -29,8 +30,9 @@ async def main(path):
     if not account:
         raise RuntimeError("No execution account is configured for an enabled leader")
     dry_run = bool(account.get("dry_run", False))
-    exchange = DryRunExchange(account) if dry_run else CcxtExchange(account)
-    engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')))
+    symbol_map = SymbolMap(c.get("symbol_map"))
+    exchange = DryRunExchange(account, symbol_map) if dry_run else CcxtExchange(account, symbol_map)
+    engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')), symbol_map=symbol_map)
     engine.config_manager = ConfigManager(path)
     mode = "dry-run" if dry_run else "LIVE"
     log.info("HL copytrade started in %s mode; leaders=%s account=%s", mode, ",".join(leaders) or "none", account_name)
@@ -48,7 +50,7 @@ async def main(path):
                 token,
                 chat_id,
                 telegram_config.get("polling_timeout", 25),
-                fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, leaders),
+                fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, leaders, symbol_map),
                 fetch_leader_positions=partial(leader_positions, leaders),
                 fetch_equity=exchange.equity,
                 account_name=account_name,
@@ -63,7 +65,7 @@ async def main(path):
     else:
         telegram = TelegramManager(
             engine, "", None,
-            fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, leaders),
+            fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, leaders, symbol_map),
             fetch_leader_positions=partial(leader_positions, leaders),
             fetch_equity=getattr(exchange, "equity", None),
             account_name=account_name,
@@ -73,6 +75,10 @@ async def main(path):
         )
     if not dry_run:
         await exchange.start()
+        try:
+            exchange.validate_symbol_map()
+        except ValueError as exc:
+            raise RuntimeError(f"invalid symbol_map: {exc}") from exc
         await engine.prepare_startup()
     # WebSocket updates are change-driven and may not send a restart snapshot.
     # Seed the engine from the official REST state so startup sync is evaluated.

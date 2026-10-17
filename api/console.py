@@ -7,14 +7,16 @@ from pathlib import Path
 
 from aiohttp import web
 
-from sources.position_queries import _number, _roi, _symbol, leader_snapshot
+from sources.position_queries import _number, _roi, leader_snapshot
+from core.symbols import SymbolMap
 
 log = logging.getLogger(__name__)
 
 
 class ConsoleStore:
-    def __init__(self, path):
+    def __init__(self, path, symbol_map=None):
         self.path = Path(path)
+        self.symbol_map = symbol_map if isinstance(symbol_map, SymbolMap) else SymbolMap(symbol_map)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path) as db:
             db.executescript("""
@@ -60,9 +62,10 @@ class ConsoleStore:
     def trades(self, account, limit=100):
         with sqlite3.connect(self.path) as db:
             db.row_factory = sqlite3.Row
-            return [dict(row) for row in db.execute(
+            rows = [dict(row) for row in db.execute(
                 "SELECT * FROM trades WHERE account=? ORDER BY timestamp DESC LIMIT ?", (account, limit)
             )]
+        return [dict(row, symbol=self.symbol_map.display(row.get("symbol"))) for row in rows]
 
     def insert_trades(self, account, rows):
         with sqlite3.connect(self.path) as db:
@@ -119,11 +122,12 @@ class ConsoleStore:
             curve.append({"timestamp": snap.get("created_at"), "equity": equity, "adjusted_equity": adjusted, "drawdown": dd})
         if len(curve) >= 2 and curve[0]["adjusted_equity"]:
             return_pct = (curve[-1]["adjusted_equity"] - curve[0]["adjusted_equity"]) / abs(curve[0]["adjusted_equity"]) * 100
+        items = [dict(row, symbol=self.symbol_map.display(row.get("symbol"))) for row in rows]
         return {"account": account, "gross_pnl": gross, "fees": fees, "funding": funding, "net_pnl": net, "return_pct": return_pct,
                 "cash_flow": sum(_number(x.get("amount")) for x in flows), "trades": len(rows),
                 "leaders": sorted(by_leader.values(), key=lambda x: x["net_pnl"], reverse=True),
                 "window": {"since": since, "until": until},
-                "max_drawdown": max_dd, "max_drawdown_pct": max_dd_pct, "curve": curve, "items": rows}
+                "max_drawdown": max_dd, "max_drawdown_pct": max_dd_pct, "curve": curve, "items": items}
 
     @staticmethod
     def _downsampled_snapshots(db, clause, args, points=400):
@@ -185,7 +189,7 @@ class ConsoleStore:
             for trade in trades:
                 candidates = []
                 for fill in fills:
-                    if fill["id"] in used or not fill.get("reduce_only") or _symbol(fill.get("symbol")) != _symbol(trade.get("symbol")):
+                    if fill["id"] in used or not fill.get("reduce_only") or self.symbol_map.display(fill.get("symbol")) != self.symbol_map.display(trade.get("symbol")):
                         continue
                     delta = abs(_number(fill.get("timestamp")) - _number(trade.get("timestamp")))
                     if delta <= 86400:
@@ -210,7 +214,10 @@ class ConsoleService:
         self.engine = engine
         self.config = config
         self.leader_stream = leader_stream
-        self.store = ConsoleStore(store_path)
+        self.symbol_map = getattr(engine, "symbol_map", None)
+        if not isinstance(self.symbol_map, SymbolMap):
+            self.symbol_map = SymbolMap((config or {}).get("symbol_map"))
+        self.store = ConsoleStore(store_path, self.symbol_map)
         self._snapshot = {"updated_at": 0, "leaders": [], "accounts": [], "status": {}}
         self._subscribers = set()
         self._task = None
@@ -249,7 +256,6 @@ class ConsoleService:
     async def stats(self, request):
         account = self._account_name()
         snapshots = self.store.snapshots(account)
-        trades = self.store.trades(account, 500)
         result = self.store.performance(account)
         return web.json_response({"account": account, "snapshots": snapshots, **result})
 
@@ -350,11 +356,11 @@ class ConsoleService:
         for key, leader in getattr(self.engine, "owners", {}).items():
             symbol = key.partition(":")[2]
             if symbol:
-                owners[symbol.upper()] = leader
-        fills = self.store.latest_open_fill_leaders(self._account_name())
+                owners[self.symbol_map.display(symbol)] = leader
+        fills = {self.symbol_map.display(k): v for k, v in self.store.latest_open_fill_leaders(self._account_name()).items()}
         result = []
         for row in rows:
-            symbol = str(row.get("symbol") or "").upper()
+            symbol = self.symbol_map.display(row.get("symbol"))
             annotated = dict(row)
             annotated["leader"] = owners.get(symbol) or fills.get(symbol) or "unattributed"
             result.append(annotated)
@@ -392,7 +398,8 @@ class ConsoleService:
         except Exception:
             log.exception("Console account refresh failed")
         try:
-            orders = await exchange.fetch_open_orders()
+            orders = [dict(order, symbol=self.symbol_map.display(order.get("symbol")))
+                      for order in await exchange.fetch_open_orders()]
         except Exception as exc:
             log.warning("Console open orders refresh failed: %s", exc)
             orders = [{"error": type(exc).__name__}]
@@ -418,21 +425,19 @@ class ConsoleService:
             except Exception:
                 self._subscribers.discard(response)
 
-    @staticmethod
-    def _position_dict(p):
+    def _position_dict(self, p):
         margin = abs(p.size * p.entry_price / (p.leverage or 1))
-        return {"symbol": _symbol(p.symbol), "side": p.side.upper(), "size": abs(p.size),
+        return {"symbol": self.symbol_map.display(p.symbol), "side": p.side.upper(), "size": abs(p.size),
                 "entry_price": p.entry_price, "mark_price": p.mark_price,
                 "unrealized_pnl": p.unrealized_pnl, "leverage": p.leverage,
                 "roi": _roi(p.unrealized_pnl, p.size, p.entry_price, p.leverage,
                              margin * (p.leverage or 1), margin)}
 
-    @staticmethod
-    def _account_position(p):
+    def _account_position(self, p):
         contracts = _number(p.get("contracts")); size = contracts * (_number(p.get("contractSize")) or 1)
         entry = _number(p.get("entryPrice")); pnl = _number(p.get("unrealizedPnl"))
         notional = _number(p.get("notional")); leverage = _number(p.get("leverage")) or 1
-        return {"symbol": _symbol(p.get("symbol")), "side": str(p.get("side") or "").upper(),
+        return {"symbol": self.symbol_map.display(p.get("symbol")), "side": str(p.get("side") or "").upper(),
                 "size": abs(size), "entry_price": entry, "mark_price": _number(p.get("markPrice")),
                 "unrealized_pnl": pnl, "leverage": leverage,
                 "roi": _roi(pnl, size, entry, leverage, notional)}

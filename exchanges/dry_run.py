@@ -2,7 +2,7 @@ import itertools
 from core.models import Order
 from .base import Exchange
 class DryRunExchange(Exchange):
- def __init__(self, config=None): self.config=config or {}; self.orders={}; self.positions={}; self._ids=itertools.count(1)
+ def __init__(self, config=None, symbol_map=None): self.config=config or {}; self.symbol_map=symbol_map; self.orders={}; self.positions={}; self._ids=itertools.count(1)
  async def create_order(self,symbol,side,amount,order_type='market',price=None,reduce_only=False):
   oid=str(next(self._ids)); o=Order(oid,symbol,side,amount,price,'closed' if order_type=='market' else 'open',reduce_only); self.orders[oid]=o
   if order_type=='market': self.positions[symbol]=self.positions.get(symbol,0)+(amount if side=='buy' else -amount)

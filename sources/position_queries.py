@@ -52,6 +52,13 @@ def _symbol(value):
     return str(value or "?").split("/", 1)[0].split(":", 1)[-1]
 
 
+def _display(value, symbol_map=None):
+    """Show a venue instrument under its Hyperliquid name when mapped."""
+    if symbol_map:
+        return symbol_map.display(value) or _symbol(value)
+    return _symbol(value)
+
+
 def _table(rows, include_leverage=True):
     headers = (("Symbol", "Direction", "Leverage", "ROI", "PnL", "Entry", "Mark", "Size")
                if include_leverage else
@@ -129,7 +136,7 @@ async def leader_positions(leaders):
                 notional = _field(position, "positionValue", "notional")
                 margin = _field(position, "marginUsed", "initialMargin", "collateral")
                 leverage = _leverage(position) or (notional / margin if margin else 1.0)
-                rows.append((_symbol(position.get("coin", "?")), "LONG" if size > 0 else "SHORT",
+                rows.append((str(position.get("coin") or "?").strip().upper(), "LONG" if size > 0 else "SHORT",
                              f"{leverage:g}x", f"{_roi(pnl, size, entry, leverage, notional, margin):g}%",
                              _fmt(pnl), _fmt(entry), _fmt(mark), _fmt(abs(size))))
             if positions and not shown:
@@ -139,7 +146,7 @@ async def leader_positions(leaders):
     return "\n".join(lines) if lines else "No leaders configured."
 
 
-async def account_positions(accounts, leaders):
+async def account_positions(accounts, leaders, symbol_map=None):
     names = {item.get("execution_account") for item in leaders.values()}
     lines = []
     for name in sorted(names):
@@ -183,7 +190,7 @@ async def account_positions(accounts, leaders):
                 margin = _field(position, "initialMargin", "marginUsed", "collateral")
                 leverage = _leverage(position) or (notional / margin if margin else 1.0)
                 direction = str(position.get("side") or ("long" if size > 0 else "short")).upper()
-                rows.append((_symbol(position.get("symbol", "?")), direction,
+                rows.append((_display(position.get("symbol", "?"), symbol_map), direction,
                              f"{_roi(pnl, size, entry, leverage, notional, margin):g}%", _fmt(pnl), _fmt(entry),
                              _fmt(mark), _fmt(abs(size))))
             if rows:
@@ -197,7 +204,7 @@ async def account_positions(accounts, leaders):
                 if reduce_only is None:
                     reduce_only = info.get('reduceOnly', info.get('reduce_only', False))
                 lines.append(
-                    f"    {order.get('symbol', '?')} {str(order.get('side') or '?').upper()} "
+                    f"    {_display(order.get('symbol', '?'), symbol_map)} {str(order.get('side') or '?').upper()} "
                     f"{_number(order.get('amount') or order.get('remaining')):g} @ "
                     f"{_number(order.get('price')):g} | {str(order.get('type') or '?').upper()} "
                     f"| reduce-only {bool(reduce_only)} | id {order.get('id', '?')}"
