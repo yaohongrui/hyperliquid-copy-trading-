@@ -24,7 +24,8 @@ class ConsoleStore:
             CREATE TABLE IF NOT EXISTS trades (
               id INTEGER PRIMARY KEY, account TEXT, exchange_trade_id TEXT UNIQUE,
               symbol TEXT, side TEXT, quantity REAL, price REAL, realized_pnl REAL,
-              fee REAL, funding REAL DEFAULT 0, leader TEXT, attribution TEXT DEFAULT 'unattributed', timestamp REAL
+              fee REAL, funding REAL DEFAULT 0, leader TEXT, attribution TEXT DEFAULT 'unattributed',
+              source TEXT, timestamp REAL
             );
             CREATE TABLE IF NOT EXISTS cash_flows (
               id INTEGER PRIMARY KEY, account TEXT, kind TEXT, amount REAL, timestamp REAL, external_id TEXT UNIQUE
@@ -38,9 +39,18 @@ class ConsoleStore:
             );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(trades)")}
-            for name, definition in (("funding", "REAL DEFAULT 0"), ("leader", "TEXT"), ("attribution", "TEXT DEFAULT 'unattributed'")):
+            for name, definition in (("funding", "REAL DEFAULT 0"), ("leader", "TEXT"), ("attribution", "TEXT DEFAULT 'unattributed'"), ("source", "TEXT")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE trades ADD COLUMN {name} {definition}")
+            # Exchange trade rows arrived with millisecond timestamps while local
+            # fills and query windows use seconds, so attribution and time filters
+            # never matched. Normalize in place; idempotent because only clearly
+            # millisecond values are rescaled.
+            db.execute("UPDATE trades SET timestamp = timestamp / 1000.0 WHERE timestamp > 10000000000")
+            # Rows written before realized PnL was sourced correctly come from a
+            # feed that reports fee only (no PnL); keeping them would double-count
+            # fees once the real source starts writing.
+            db.execute("DELETE FROM trades WHERE source IS NULL AND realized_pnl = 0")
 
     def snapshot(self, account, equity, unrealized):
         with sqlite3.connect(self.path) as db:
@@ -60,11 +70,14 @@ class ConsoleStore:
                 external_id = row.get("id") or row.get("tradeId") or row.get("timestamp")
                 if external_id is None:
                     continue
+                timestamp = row.get("timestamp") or time.time()
+                if timestamp > 1e10:
+                    timestamp = timestamp / 1000.0
                 db.execute("""INSERT OR IGNORE INTO trades
-                    (account,exchange_trade_id,symbol,side,quantity,price,realized_pnl,fee,funding,timestamp)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)""", (account, f"{account}:{external_id}", row.get("symbol"), row.get("side"),
+                    (account,exchange_trade_id,symbol,side,quantity,price,realized_pnl,fee,funding,source,timestamp)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (account, f"{account}:{external_id}", row.get("symbol"), row.get("side"),
                     row.get("amount"), row.get("price"), row.get("realizedPnl", row.get("realized_pnl", 0)),
-                    row.get("fee", 0), row.get("funding", 0), row.get("timestamp") or time.time()))
+                    row.get("fee", 0), row.get("funding", 0), row.get("source"), timestamp))
 
     def performance(self, account=None, since=None, until=None):
         """Return flow-adjusted account and trader aggregates for the console."""
@@ -80,7 +93,7 @@ class ConsoleStore:
             clause = " WHERE " + " AND ".join(where) if where else ""
             rows = [dict(x) for x in db.execute("SELECT * FROM trades" + clause + " ORDER BY timestamp", args)]
             flows = [dict(x) for x in db.execute("SELECT * FROM cash_flows" + clause, args)] if clause else [dict(x) for x in db.execute("SELECT * FROM cash_flows")]
-            snaps = [dict(x) for x in db.execute("SELECT * FROM equity_snapshots" + clause.replace("timestamp", "created_at"), args)] if clause else [dict(x) for x in db.execute("SELECT * FROM equity_snapshots")]
+            snaps = self._downsampled_snapshots(db, clause, args)
         gross = sum(_number(x.get("realized_pnl")) for x in rows)
         fees = sum(_number(x.get("fee")) for x in rows)
         funding = sum(_number(x.get("funding")) for x in rows)
@@ -109,7 +122,31 @@ class ConsoleStore:
         return {"account": account, "gross_pnl": gross, "fees": fees, "funding": funding, "net_pnl": net, "return_pct": return_pct,
                 "cash_flow": sum(_number(x.get("amount")) for x in flows), "trades": len(rows),
                 "leaders": sorted(by_leader.values(), key=lambda x: x["net_pnl"], reverse=True),
+                "window": {"since": since, "until": until},
                 "max_drawdown": max_dd, "max_drawdown_pct": max_dd_pct, "curve": curve, "items": rows}
+
+    @staticmethod
+    def _downsampled_snapshots(db, clause, args, points=400):
+        """Bucket the equity curve to at most ``points`` samples.
+
+        Snapshots are written every few seconds, so a long window would
+        otherwise pull hundreds of thousands of rows into memory per request.
+        Each bucket keeps its most recent row (highest id).
+        """
+        where = clause.replace("timestamp", "created_at")
+        bounds = db.execute("SELECT MIN(created_at),MAX(created_at) FROM equity_snapshots" + where, args).fetchone()
+        span = (bounds[1] or 0) - (bounds[0] or 0)
+        bucket = max(60.0, span / points) if span else 60.0
+        inner = "SELECT MAX(id) FROM equity_snapshots" + where + " GROUP BY CAST(created_at / ? AS INTEGER)"
+        return [dict(x) for x in db.execute(
+            "SELECT * FROM equity_snapshots WHERE id IN (" + inner + ") ORDER BY created_at", args + [bucket])]
+
+    def latest_open_fill_leaders(self, account):
+        """Map symbol -> leader from each symbol's newest non-reduce local fill."""
+        with sqlite3.connect(self.path) as db:
+            return {str(row[0]).upper(): row[1] for row in db.execute(
+                "SELECT symbol, leader, MAX(timestamp) FROM local_fills WHERE account=? AND reduce_only=0 GROUP BY symbol",
+                (account,))}
 
     def snapshots(self, account, limit=240):
         with sqlite3.connect(self.path) as db:
@@ -224,7 +261,9 @@ class ConsoleService:
         return self.store.performance(account, number("since"), number("until"))
 
     async def performance_overview(self, request):
-        return web.json_response(self._performance(request))
+        result = self._performance(request)
+        result["positions"] = self._attributed_positions()
+        return web.json_response(result)
 
     async def performance_leaders(self, request):
         return web.json_response({"items": self._performance(request)["leaders"]})
@@ -294,6 +333,32 @@ class ConsoleService:
     def _account_name(self):
         return next((x.get("execution_account") for x in self.engine.leaders.values()
                       if x.get("execution_account")), "default")
+
+    def _attributed_positions(self):
+        """Annotate the latest account positions with the owning leader.
+
+        Ownership comes from the engine's symbol claims; when a symbol was
+        never claimed (manual or pre-existing exposure) we fall back to the
+        symbol's newest opening fill, then to ``unattributed`` rather than
+        guessing.
+        """
+        accounts = self._snapshot.get("accounts") or []
+        rows = accounts[0].get("positions") if accounts else []
+        if not isinstance(rows, list):
+            return []
+        owners = {}
+        for key, leader in getattr(self.engine, "owners", {}).items():
+            symbol = key.partition(":")[2]
+            if symbol:
+                owners[symbol.upper()] = leader
+        fills = self.store.latest_open_fill_leaders(self._account_name())
+        result = []
+        for row in rows:
+            symbol = str(row.get("symbol") or "").upper()
+            annotated = dict(row)
+            annotated["leader"] = owners.get(symbol) or fills.get(symbol) or "unattributed"
+            result.append(annotated)
+        return result
 
     async def refresh_loop(self):
         while True:

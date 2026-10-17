@@ -6,6 +6,13 @@ from core.models import Order
 from .base import OrderQuantityTooSmall
 
 
+def _float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class CcxtExchange:
     """Small adapter for the configured USDT perpetual account."""
 
@@ -179,7 +186,11 @@ class CcxtExchange:
         return await self.client.fetch_open_orders()
 
     async def fetch_realized_pnl(self):
-        """Return recent exchange realized-PnL rows in the console schema."""
+        """Return recent exchange realized-PnL rows in the console schema.
+
+        Rows carry ``source`` so the store can retire rows from a superseded
+        feed (e.g. Gate trade history, which reports no PnL at all).
+        """
         if self.client.has.get('fetchIncome'):
             try:
                 income = await self.client.fetch_income(limit=100)
@@ -192,7 +203,7 @@ class CcxtExchange:
                     amount = row.get('amount')
                     if amount is None:
                         amount = info.get('income', info.get('realizedPnl', info.get('realised_pnl', 0)))
-                    rows.append({'id': row.get('id') or info.get('tranId'),
+                    rows.append({'id': row.get('id') or info.get('tranId'), 'source': 'income',
                                  'symbol': row.get('symbol'), 'side': row.get('side'),
                                  'amount': row.get('amount'), 'price': row.get('price'),
                                  'realizedPnl': float(amount or 0), 'fee': 0,
@@ -201,6 +212,17 @@ class CcxtExchange:
                     return rows
             except (NotImplementedError, AttributeError, ccxt.NotSupported):
                 pass
+        # Gate never reports realized PnL through trade history; the closed
+        # position endpoint is the only source that carries it.
+        if self.client.has.get('fetchPositionsHistory'):
+            try:
+                closed = await self.client.fetch_positions_history(limit=100)
+            except (NotImplementedError, AttributeError, ccxt.NotSupported):
+                closed = []
+            rows = [self._closed_position_row(row) for row in closed or []]
+            rows = [row for row in rows if row]
+            if rows:
+                return rows
         if not self.client.has.get('fetchMyTrades'):
             return []
         rows = await self.client.fetch_my_trades(limit=100)
@@ -212,11 +234,40 @@ class CcxtExchange:
                 realized = info.get('realizedPnl', info.get('realised_pnl', info.get('realized_pnl', 0)))
             fee = row.get('fee') or {}
             result.append({
-                'id': row.get('id'), 'symbol': row.get('symbol'), 'side': row.get('side'),
+                'id': row.get('id'), 'source': 'my_trades', 'symbol': row.get('symbol'), 'side': row.get('side'),
                 'amount': row.get('amount'), 'price': row.get('price'), 'realizedPnl': float(realized or 0),
                 'fee': float(fee.get('cost') or 0), 'timestamp': row.get('timestamp'),
             })
         return result
+
+    @staticmethod
+    def _closed_position_row(row):
+        """Map a closed-position record onto the console trade schema.
+
+        Gate splits PnL into price/fee/funding legs; the legs must stay separate
+        because the console computes ``net = gross - fees + funding`` and the
+        endpoint's total ``pnl`` already folds in fee and funding.
+        """
+        info = row.get('info') or {}
+        # Only Gate's closed-position payload carries these legs; other venues
+        # also expose position history and must not be parsed as Gate records.
+        if info.get('contract') is None or info.get('pnl_pnl') is None:
+            return None
+        identifier = f"{info.get('contract')}:{info.get('time')}"
+        if identifier == ':None' or identifier == ':':
+            identifier = f"{row.get('symbol')}:{row.get('timestamp')}"
+        if not identifier or identifier == ':':
+            return None
+        return {
+            'id': identifier, 'source': 'position_close',
+            'symbol': row.get('symbol'), 'side': row.get('side'),
+            'amount': _float(info.get('accum_size')),
+            'price': _float(info.get('long_price') or info.get('short_price')),
+            'realizedPnl': _float(info.get('pnl_pnl')),
+            'fee': -_float(info.get('pnl_fee')),
+            'funding': _float(info.get('pnl_fund')),
+            'timestamp': row.get('timestamp'),
+        }
 
     async def fetch_cash_flows(self):
         """Normalize deposits, withdrawals and funding payments for analytics."""

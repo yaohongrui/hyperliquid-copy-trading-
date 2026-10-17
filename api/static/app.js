@@ -41,15 +41,130 @@ function render(data) {
   $('#leaders').innerHTML = (data.leaders || []).map((leader) => `<article class="panel leader"><div class="toolbar"><div><strong>${leader.name}</strong> <span class="muted">${leader.address} · ${leader.positions?.length || 0} open positions</span></div></div>${table(leader.positions)}</article>`).join('') || '<p class="muted">No leaders configured.</p>';
   $('#configs').innerHTML = (data.leaders || []).map(configForm).join('') || '<p class="muted">No leaders configured.</p>';
   $('#toggle').textContent = status.paused ? 'Resume entries' : 'Pause entries';
-  loadPerformance();
+  if (!$('#performance-page')?.hidden) loadPerformance();
 }
 
-async function loadPerformance() {
+const perf = { preset: 'all', since: null, until: null, charts: {}, last: 0 };
+const CHART = { line: '#3987e5', up: '#48d597', down: '#ff7373', grid: '#2b3748', ink: '#e8edf5', muted: '#91a0b5', surface: '#171e29' };
+
+function esc(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function signed(value) { const n = Number(value || 0); return `${n >= 0 ? '+' : ''}${n.toFixed(2)}`; }
+
+function toDateInput(epoch) {
+  const d = new Date(epoch * 1000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function dayToEpoch(value, endOfDay) {
+  if (!value) return null;
+  const d = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return null;
+  if (endOfDay) d.setHours(23, 59, 59, 999);
+  return Math.floor(d.getTime() / 1000);
+}
+
+function presetRange(preset) {
+  const now = Math.floor(Date.now() / 1000);
+  if (preset === 'today') { const d = new Date(); d.setHours(0, 0, 0, 0); return { since: Math.floor(d.getTime() / 1000), until: now }; }
+  if (preset === '7d') return { since: now - 7 * 86400, until: now };
+  if (preset === '30d') return { since: now - 30 * 86400, until: now };
+  return { since: null, until: null };
+}
+
+function setPreset(name) {
+  perf.preset = name;
+  ({ since: perf.since, until: perf.until } = presetRange(name));
+  document.querySelectorAll('#perf-presets .chip').forEach((chip) => chip.classList.toggle('active', chip.dataset.preset === name));
+  const since = $('#perf-since'); const until = $('#perf-until');
+  if (since) since.value = perf.since ? toDateInput(perf.since) : '';
+  if (until) until.value = perf.until ? toDateInput(perf.until) : '';
+  loadPerformance(true);
+}
+
+function perfMetrics(p) {
+  const tile = (label, value, klass = '') => `<div><small>${label}</small><strong class="${klass}">${value}</strong></div>`;
+  return `<div class="kpis">${tile('Net PnL', money(p.net_pnl), cls(p.net_pnl))}${tile('Return', `${Number(p.return_pct || 0).toFixed(2)}%`, cls(p.return_pct))}${tile('Max drawdown', `${money(p.max_drawdown)} (${Number(p.max_drawdown_pct || 0).toFixed(2)}%)`, 'negative')}${tile('Gross / fees', `${money(p.gross_pnl)} / ${money(p.fees)}`)}${tile('Funding', money(p.funding), cls(p.funding))}${tile('Realized trades', String(p.trades || 0))}</div>`;
+}
+
+function leaderTable(leaders) {
+  if (!leaders?.length) return '<p class="muted">No realized trades in this period.</p>';
+  const rows = leaders.map((x) => `<tr class="${x.leader === 'unattributed' ? 'muted' : ''}"><td>${esc(x.leader)}</td><td class="${cls(x.net_pnl)}">${money(x.net_pnl)}</td><td>${money(x.gross_pnl)}</td><td>${money(x.fees)}</td><td class="${cls(x.funding)}">${money(x.funding)}</td><td>${(Number(x.win_rate) * 100).toFixed(1)}%</td><td>${x.trades}</td><td>${Number(x.contribution_pct).toFixed(2)}%</td></tr>`).join('');
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>Trader</th><th>Net PnL</th><th>Gross</th><th>Fees</th><th>Funding</th><th>Win rate</th><th>Trades</th><th>Contribution</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function positionTable(rows) {
+  if (!rows?.length) return '<p class="muted">No open positions.</p>';
+  const body = rows.map((p) => `<tr><td>${esc(p.symbol)}</td><td>${esc(p.side)}</td><td>${Number(p.size || 0).toFixed(5)}</td><td>${Number(p.leverage || 0).toFixed(1)}x</td><td>${Number(p.entry_price || 0).toFixed(5)}</td><td>${Number(p.mark_price || 0).toFixed(5)}</td><td class="${cls(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td><td class="${cls(p.roi)}">${Number(p.roi || 0).toFixed(2)}%</td><td>${p.leader === 'unattributed' ? '<span class="muted">unattributed</span>' : esc(p.leader)}</td></tr>`).join('');
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Leverage</th><th>Entry</th><th>Mark</th><th>Unrealized PnL</th><th>ROI</th><th>Trader</th></tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function disposeCharts() {
+  Object.values(perf.charts).forEach((chart) => { try { chart.dispose(); } catch (_) { /* already gone */ } });
+  perf.charts = {};
+}
+
+function tooltipShell() {
+  return { backgroundColor: CHART.surface, borderColor: CHART.grid, textStyle: { color: CHART.ink } };
+}
+
+function renderEquity(node, curve) {
+  if (typeof echarts === 'undefined' || !node || !node.clientWidth) return;
+  const chart = perf.charts.equity = echarts.getInstanceByDom(node) || echarts.init(node);
+  const rows = curve || [];
+  chart.setOption({
+    backgroundColor: 'transparent',
+    grid: { left: 8, right: 16, top: 16, bottom: 8, containLabel: true },
+    tooltip: { trigger: 'axis', ...tooltipShell(), axisPointer: { type: 'line', lineStyle: { color: CHART.grid } },
+      formatter: (items) => { const row = rows[items[0]?.dataIndex] || {}; return `<strong>${money(row.adjusted_equity)}</strong> adjusted equity<br><span class="muted">equity</span> ${money(row.equity)} · <span class="muted">drawdown</span> ${money(row.drawdown)}<br><span class="muted">${new Date((row.timestamp || 0) * 1000).toLocaleString()}</span>`; } },
+    xAxis: { type: 'time', axisLine: { lineStyle: { color: CHART.grid } }, axisLabel: { color: CHART.muted }, splitLine: { show: false } },
+    yAxis: { type: 'value', scale: true, axisLabel: { color: CHART.muted }, splitLine: { lineStyle: { color: CHART.grid, type: 'solid' } } },
+    series: [{ type: 'line', data: rows.map((x) => [Number(x.timestamp) * 1000, Number(x.adjusted_equity)]), showSymbol: false, lineStyle: { color: CHART.line, width: 2 }, itemStyle: { color: CHART.line }, areaStyle: { color: 'rgba(57,135,229,0.10)' } }],
+  }, true);
+  chart.resize();
+}
+
+function renderLeaderBars(node, leaders) {
+  if (typeof echarts === 'undefined' || !node || !node.clientWidth) return;
+  const chart = perf.charts.leaders = echarts.getInstanceByDom(node) || echarts.init(node);
+  const rows = (leaders || []).slice().reverse();
+  const data = rows.map((x) => {
+    const positive = Number(x.net_pnl || 0) >= 0;
+    return { value: Number(x.net_pnl || 0), itemStyle: { color: positive ? CHART.up : CHART.down, borderRadius: positive ? [0, 4, 4, 0] : [4, 0, 0, 4] }, label: { position: positive ? 'right' : 'left' } };
+  });
+  chart.setOption({
+    backgroundColor: 'transparent',
+    grid: { left: 8, right: 64, top: 8, bottom: 8, containLabel: true },
+    tooltip: { trigger: 'item', ...tooltipShell(), formatter: (item) => `<strong>${money(item.value)}</strong> · ${esc(rows[item.dataIndex]?.leader)}` },
+    xAxis: { type: 'value', axisLabel: { color: CHART.muted }, splitLine: { lineStyle: { color: CHART.grid, type: 'solid' } } },
+    yAxis: { type: 'category', data: rows.map((x) => x.leader), axisLine: { lineStyle: { color: CHART.grid } }, axisLabel: { color: CHART.muted }, axisTick: { show: false } },
+    series: [{ type: 'bar', data, barMaxWidth: 24, label: { show: true, color: CHART.ink, formatter: (item) => signed(item.value) } }],
+  }, true);
+  chart.resize();
+}
+
+function renderPerformance(p) {
   const node = $('#performance');
-  if (!node) return;
+  disposeCharts();
+  const charts = typeof echarts === 'undefined' ? '<p class="muted">Charts unavailable (chart library failed to load).</p>' : '<div class="charts"><div class="panel"><h3>Account equity</h3><div id="chart-equity" class="chart"></div></div><div class="panel"><h3>Realized PnL by trader</h3><div id="chart-leaders" class="chart"></div></div></div>';
+  const w = p.window || {};
+  const windowText = w.since || w.until ? `${w.since ? toDateInput(w.since) : 'start'} → ${w.until ? toDateInput(w.until) : 'now'}` : 'All time';
+  node.innerHTML = `${perfMetrics(p)}${charts}<h3>By trader</h3>${leaderTable(p.leaders)}<p class="muted">Trader PnL is attributed by matching exchange fills to local orders; records that cannot be matched stay under <em>unattributed</em>.</p><h3>Open positions by trader</h3>${positionTable(p.positions)}<p class="muted">Ownership comes from the engine's symbol claims; positions it never claimed show as <em>unattributed</em>. Window: ${windowText}.</p>`;
+  if (typeof echarts !== 'undefined') { renderEquity($('#chart-equity'), p.curve); renderLeaderBars($('#chart-leaders'), p.leaders); }
+}
+
+async function loadPerformance(force) {
+  const page = $('#performance-page');
+  const node = $('#performance');
+  if (!page || page.hidden || !node) return;
+  const now = Date.now();
+  if (!force && now - perf.last < 15000) return;
+  perf.last = now;
+  const params = new URLSearchParams();
+  if (perf.since != null) params.set('since', perf.since);
+  if (perf.until != null) params.set('until', perf.until);
+  const query = params.toString();
   try {
-    const p = await (await fetch('/api/v1/performance/overview')).json();
-    node.innerHTML = `<div class="metrics"><div><small>Net PnL</small><strong class="${cls(p.net_pnl)}">${money(p.net_pnl)}</strong></div><div><small>Return</small><strong>${Number(p.return_pct || 0).toFixed(2)}%</strong></div><div><small>Max drawdown</small><strong class="negative">${money(p.max_drawdown)} (${Number(p.max_drawdown_pct || 0).toFixed(2)}%)</strong></div><div><small>Fees / funding</small><strong>${money(p.fees)} / ${money(p.funding)}</strong></div></div><h3>By trader</h3>${p.leaders?.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Trader</th><th>Net PnL</th><th>Contribution</th><th>Win rate</th><th>Trades</th></tr></thead><tbody>${p.leaders.map(x => `<tr><td>${x.leader}</td><td class="${cls(x.net_pnl)}">${money(x.net_pnl)}</td><td>${Number(x.contribution_pct).toFixed(2)}%</td><td>${(Number(x.win_rate) * 100).toFixed(1)}%</td><td>${x.trades}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">No realized trades yet.</p>'}`;
+    renderPerformance(await (await fetch(`/api/v1/performance/overview${query ? `?${query}` : ''}`)).json());
   } catch (_) { node.innerHTML = '<p class="error">Performance unavailable.</p>'; }
 }
 
@@ -78,7 +193,7 @@ document.addEventListener('click', async (event) => {
     document.querySelectorAll('.tab').forEach((item) => item.classList.remove('active'));
     tab.classList.add('active');
     document.querySelectorAll('#monitor-page,#performance-page,#config-page').forEach((page) => { page.hidden = page.id !== tab.dataset.page; });
-    if (tab.dataset.page === 'performance-page') loadPerformance();
+    if (tab.dataset.page === 'performance-page') loadPerformance(true);
     return;
   }
   const button = event.target.closest('[data-save]');
@@ -101,5 +216,18 @@ document.addEventListener('click', async (event) => {
   updatedMessage.textContent = 'Saved and applied to the running engine.';
   updatedMessage.className = 'config-message positive';
 });
+
+document.querySelectorAll('#perf-presets .chip').forEach((chip) => { chip.onclick = () => setPreset(chip.dataset.preset); });
+
+const perfApply = $('#perf-apply');
+if (perfApply) perfApply.onclick = () => {
+  perf.preset = 'custom';
+  perf.since = dayToEpoch($('#perf-since').value, false);
+  perf.until = dayToEpoch($('#perf-until').value, true);
+  document.querySelectorAll('#perf-presets .chip').forEach((chip) => chip.classList.remove('active'));
+  loadPerformance(true);
+};
+
+window.addEventListener('resize', () => Object.values(perf.charts).forEach((chart) => chart.resize()));
 
 load().then(connect).catch(() => { $('#status').textContent = 'Dashboard unavailable'; });
