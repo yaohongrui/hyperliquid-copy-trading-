@@ -23,8 +23,6 @@ function configForm(leader) {
 }
 
 function render(data) {
-  $('#dashboard').hidden = false;
-  $('#login').hidden = true;
   const account = data.accounts?.[0] || {};
   const status = data.status || {};
   $('#equity').textContent = money(account.balance ?? account.equity);
@@ -43,21 +41,23 @@ function render(data) {
   $('#leaders').innerHTML = (data.leaders || []).map((leader) => `<article class="panel leader"><div class="toolbar"><div><strong>${leader.name}</strong> <span class="muted">${leader.address} · ${leader.positions?.length || 0} open positions</span></div></div>${table(leader.positions)}</article>`).join('') || '<p class="muted">No leaders configured.</p>';
   $('#configs').innerHTML = (data.leaders || []).map(configForm).join('') || '<p class="muted">No leaders configured.</p>';
   $('#toggle').textContent = status.paused ? 'Resume entries' : 'Pause entries';
+  loadPerformance();
+}
+
+async function loadPerformance() {
+  const node = $('#performance');
+  if (!node) return;
+  try {
+    const p = await (await fetch('/api/v1/performance/overview')).json();
+    node.innerHTML = `<div class="metrics"><div><small>Net PnL</small><strong class="${cls(p.net_pnl)}">${money(p.net_pnl)}</strong></div><div><small>Return</small><strong>${Number(p.return_pct || 0).toFixed(2)}%</strong></div><div><small>Max drawdown</small><strong class="negative">${money(p.max_drawdown)} (${Number(p.max_drawdown_pct || 0).toFixed(2)}%)</strong></div><div><small>Fees / funding</small><strong>${money(p.fees)} / ${money(p.funding)}</strong></div></div><h3>By trader</h3>${p.leaders?.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Trader</th><th>Net PnL</th><th>Contribution</th><th>Win rate</th><th>Trades</th></tr></thead><tbody>${p.leaders.map(x => `<tr><td>${x.leader}</td><td class="${cls(x.net_pnl)}">${money(x.net_pnl)}</td><td>${Number(x.contribution_pct).toFixed(2)}%</td><td>${(Number(x.win_rate) * 100).toFixed(1)}%</td><td>${x.trades}</td></tr>`).join('')}</tbody></table></div>` : '<p class="muted">No realized trades yet.</p>'}`;
+  } catch (_) { node.innerHTML = '<p class="error">Performance unavailable.</p>'; }
 }
 
 async function load() {
   const response = await fetch('/api/v1/dashboard');
-  if (response.status === 401) throw Error('auth');
+  if (!response.ok) throw Error(`Dashboard request failed: ${response.status}`);
   render(await response.json());
 }
-
-$('#login form').onsubmit = async (event) => {
-  event.preventDefault();
-  const form = new FormData(event.target);
-  const response = await fetch('/api/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.fromEntries(form)) });
-  if (!response.ok) { $('#login-error').textContent = 'Invalid credentials'; return; }
-  load().then(connect).catch(() => { $('#login-error').textContent = 'Unable to load dashboard'; });
-};
 
 function connect() {
   if (source) source.close();
@@ -77,7 +77,8 @@ document.addEventListener('click', async (event) => {
   if (tab) {
     document.querySelectorAll('.tab').forEach((item) => item.classList.remove('active'));
     tab.classList.add('active');
-    document.querySelectorAll('#monitor-page,#config-page').forEach((page) => { page.hidden = page.id !== tab.dataset.page; });
+    document.querySelectorAll('#monitor-page,#performance-page,#config-page').forEach((page) => { page.hidden = page.id !== tab.dataset.page; });
+    if (tab.dataset.page === 'performance-page') loadPerformance();
     return;
   }
   const button = event.target.closest('[data-save]');
@@ -101,4 +102,4 @@ document.addEventListener('click', async (event) => {
   updatedMessage.className = 'config-message positive';
 });
 
-load().then(connect).catch(() => {});
+load().then(connect).catch(() => { $('#status').textContent = 'Dashboard unavailable'; });

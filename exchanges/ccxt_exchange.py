@@ -1,5 +1,6 @@
 import ccxt.async_support as ccxt
 from decimal import Decimal
+import time
 
 from core.models import Order
 from .base import OrderQuantityTooSmall
@@ -216,6 +217,30 @@ class CcxtExchange:
                 'fee': float(fee.get('cost') or 0), 'timestamp': row.get('timestamp'),
             })
         return result
+
+    async def fetch_cash_flows(self):
+        """Normalize deposits, withdrawals and funding payments for analytics."""
+        rows = []
+        for method, kind, sign in (("fetch_deposits", "deposit", 1), ("fetch_withdrawals", "withdrawal", -1),
+                                   ("fetch_funding_history", "funding", 1)):
+            fetcher = getattr(self.client, method, None)
+            if not fetcher or self.client.has.get(method) is False:
+                continue
+            try:
+                values = await fetcher(limit=100)
+            except (NotImplementedError, AttributeError, ccxt.NotSupported, ccxt.PermissionDenied):
+                continue
+            for row in values or []:
+                amount = row.get("amount")
+                if amount is None:
+                    info = row.get("info") or {}
+                    amount = info.get("income", info.get("amount", info.get("realizedPnl", 0)))
+                rows.append({"id": row.get("id"), "kind": kind, "amount": float(amount or 0) * sign,
+                             "timestamp": row.get("timestamp") or time.time() * 1000})
+        for row in rows:
+            if row["timestamp"] > 10_000_000_000:
+                row["timestamp"] /= 1000
+        return rows
 
     async def position_size(self, symbol):
         market = self._symbol(symbol)

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from dataclasses import replace
 from .detector import diff_positions
 from exchanges.base import OrderQuantityTooSmall
@@ -25,6 +26,9 @@ class Engine:
         if state_store:
             self.owners = self.runtime_state.get('symbol_owners', {})
         self.small_order_carry = self.runtime_state.get('small_order_carry', {})
+        # Console consumes these immutable fill events to attribute exchange
+        # realized PnL back to the leader that generated the order.
+        self.fill_events = []
 
     async def update_leader_config(self, leader, changes):
         """Apply validated console changes without replacing the leader map."""
@@ -300,6 +304,12 @@ class Engine:
                     if not reduce:
                         self._set_carry(leader, s.symbol)
                     log.info('ORDER RESULT leader=%s symbol=%s id=%s status=%s amount=%s', leader, s.symbol, order.id, order.status, order.amount)
+                    if order.status == 'closed' and order.amount:
+                        self.fill_events.append({'account': self._account_key(leader), 'leader': leader,
+                                                 'order_id': str(order.id), 'symbol': s.symbol,
+                                                 'side': side, 'quantity': float(order.amount),
+                                                 'price': float(order.price or s.price or 0),
+                                                 'reduce_only': reduce, 'timestamp': time.time()})
                     if self.notifier:
                         if order.status == 'closed':
                             await self.notifier.notify_filled(leader, replace(s, delta=order.amount if side == 'buy' else -order.amount), order)

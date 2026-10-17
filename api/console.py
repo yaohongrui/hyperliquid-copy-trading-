@@ -1,10 +1,6 @@
 import asyncio
-import base64
-import hashlib
-import hmac
 import json
-import os
-import secrets
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -12,6 +8,8 @@ from pathlib import Path
 from aiohttp import web
 
 from sources.position_queries import _number, _roi, _symbol, leader_snapshot
+
+log = logging.getLogger(__name__)
 
 
 class ConsoleStore:
@@ -26,12 +24,23 @@ class ConsoleStore:
             CREATE TABLE IF NOT EXISTS trades (
               id INTEGER PRIMARY KEY, account TEXT, exchange_trade_id TEXT UNIQUE,
               symbol TEXT, side TEXT, quantity REAL, price REAL, realized_pnl REAL,
-              fee REAL, timestamp REAL
+              fee REAL, funding REAL DEFAULT 0, leader TEXT, attribution TEXT DEFAULT 'unattributed', timestamp REAL
+            );
+            CREATE TABLE IF NOT EXISTS cash_flows (
+              id INTEGER PRIMARY KEY, account TEXT, kind TEXT, amount REAL, timestamp REAL, external_id TEXT UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS local_fills (
+              id INTEGER PRIMARY KEY, account TEXT, leader TEXT, order_id TEXT, symbol TEXT, side TEXT,
+              quantity REAL, price REAL, reduce_only INTEGER DEFAULT 0, timestamp REAL
             );
             CREATE TABLE IF NOT EXISTS audit_logs (
               id INTEGER PRIMARY KEY, action TEXT, detail TEXT, created_at REAL
             );
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(trades)")}
+            for name, definition in (("funding", "REAL DEFAULT 0"), ("leader", "TEXT"), ("attribution", "TEXT DEFAULT 'unattributed'")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE trades ADD COLUMN {name} {definition}")
 
     def snapshot(self, account, equity, unrealized):
         with sqlite3.connect(self.path) as db:
@@ -48,11 +57,59 @@ class ConsoleStore:
     def insert_trades(self, account, rows):
         with sqlite3.connect(self.path) as db:
             for row in rows:
+                external_id = row.get("id") or row.get("tradeId") or row.get("timestamp")
+                if external_id is None:
+                    continue
                 db.execute("""INSERT OR IGNORE INTO trades
-                    (account,exchange_trade_id,symbol,side,quantity,price,realized_pnl,fee,timestamp)
-                    VALUES(?,?,?,?,?,?,?,?,?)""", (account, str(row.get("id")), row.get("symbol"), row.get("side"),
+                    (account,exchange_trade_id,symbol,side,quantity,price,realized_pnl,fee,funding,timestamp)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""", (account, f"{account}:{external_id}", row.get("symbol"), row.get("side"),
                     row.get("amount"), row.get("price"), row.get("realizedPnl", row.get("realized_pnl", 0)),
-                    row.get("fee", 0), row.get("timestamp") or time.time()))
+                    row.get("fee", 0), row.get("funding", 0), row.get("timestamp") or time.time()))
+
+    def performance(self, account=None, since=None, until=None):
+        """Return flow-adjusted account and trader aggregates for the console."""
+        with sqlite3.connect(self.path) as db:
+            db.row_factory = sqlite3.Row
+            where, args = [], []
+            if account:
+                where.append("account=?"); args.append(account)
+            if since is not None:
+                where.append("timestamp>=?"); args.append(float(since))
+            if until is not None:
+                where.append("timestamp<=?"); args.append(float(until))
+            clause = " WHERE " + " AND ".join(where) if where else ""
+            rows = [dict(x) for x in db.execute("SELECT * FROM trades" + clause + " ORDER BY timestamp", args)]
+            flows = [dict(x) for x in db.execute("SELECT * FROM cash_flows" + clause, args)] if clause else [dict(x) for x in db.execute("SELECT * FROM cash_flows")]
+            snaps = [dict(x) for x in db.execute("SELECT * FROM equity_snapshots" + clause.replace("timestamp", "created_at"), args)] if clause else [dict(x) for x in db.execute("SELECT * FROM equity_snapshots")]
+        gross = sum(_number(x.get("realized_pnl")) for x in rows)
+        fees = sum(_number(x.get("fee")) for x in rows)
+        funding = sum(_number(x.get("funding")) for x in rows)
+        net = gross - fees + funding
+        by_leader = {}
+        for row in rows:
+            key = row.get("leader") or "unattributed"
+            item = by_leader.setdefault(key, {"leader": key, "gross_pnl": 0, "fees": 0, "funding": 0, "net_pnl": 0, "trades": 0, "wins": 0})
+            value = _number(row.get("realized_pnl")); fee = _number(row.get("fee")); fund = _number(row.get("funding"))
+            item["gross_pnl"] += value; item["fees"] += fee; item["funding"] += fund; item["net_pnl"] += value - fee + fund; item["trades"] += 1; item["wins"] += value - fee + fund > 0
+        for item in by_leader.values():
+            item["win_rate"] = item["wins"] / item["trades"] if item["trades"] else 0
+            item["contribution_pct"] = item["net_pnl"] / net * 100 if net else 0
+        curve = []
+        return_pct = 0
+        peak = None; max_dd = 0; max_dd_pct = 0
+        for snap in sorted(snaps, key=lambda x: x.get("created_at") or 0):
+            equity = _number(snap.get("equity")); flow = sum(_number(x.get("amount")) for x in flows if _number(x.get("timestamp")) <= _number(snap.get("created_at")))
+            adjusted = equity - flow
+            peak = adjusted if peak is None else max(peak, adjusted)
+            dd = peak - adjusted
+            max_dd = max(max_dd, dd); max_dd_pct = max(max_dd_pct, dd / peak * 100 if peak else 0)
+            curve.append({"timestamp": snap.get("created_at"), "equity": equity, "adjusted_equity": adjusted, "drawdown": dd})
+        if len(curve) >= 2 and curve[0]["adjusted_equity"]:
+            return_pct = (curve[-1]["adjusted_equity"] - curve[0]["adjusted_equity"]) / abs(curve[0]["adjusted_equity"]) * 100
+        return {"account": account, "gross_pnl": gross, "fees": fees, "funding": funding, "net_pnl": net, "return_pct": return_pct,
+                "cash_flow": sum(_number(x.get("amount")) for x in flows), "trades": len(rows),
+                "leaders": sorted(by_leader.values(), key=lambda x: x["net_pnl"], reverse=True),
+                "max_drawdown": max_dd, "max_drawdown_pct": max_dd_pct, "curve": curve, "items": rows}
 
     def snapshots(self, account, limit=240):
         with sqlite3.connect(self.path) as db:
@@ -60,6 +117,47 @@ class ConsoleStore:
             return [dict(row) for row in db.execute(
                 "SELECT * FROM equity_snapshots WHERE account=? ORDER BY created_at DESC LIMIT ?", (account, limit)
             )]
+
+    def insert_cash_flows(self, account, rows):
+        with sqlite3.connect(self.path) as db:
+            for row in rows:
+                external_id = row.get("id") or f"{row.get('kind')}:{row.get('timestamp')}:{row.get('amount')}"
+                db.execute("INSERT OR IGNORE INTO cash_flows(account,kind,amount,timestamp,external_id) VALUES(?,?,?,?,?)",
+                           (account, row.get("kind"), row.get("amount", 0), row.get("timestamp") or time.time(), f"{account}:{external_id}"))
+
+    def insert_local_fills(self, rows):
+        with sqlite3.connect(self.path) as db:
+            for row in rows:
+                db.execute("""INSERT OR IGNORE INTO local_fills
+                    (account,leader,order_id,symbol,side,quantity,price,reduce_only,timestamp)
+                    VALUES(?,?,?,?,?,?,?,?,?)""", (row.get("account"), row.get("leader"), row.get("order_id"),
+                    row.get("symbol"), row.get("side"), row.get("quantity"), row.get("price"),
+                    int(bool(row.get("reduce_only"))), row.get("timestamp") or time.time()))
+
+    def attribute_trades(self, account):
+        """Match exchange rows to local fills by symbol, side and execution time.
+
+        A fill is used at most once; unmatched rows deliberately stay in the
+        unattributed bucket so the UI never invents a trader assignment.
+        """
+        with sqlite3.connect(self.path) as db:
+            db.row_factory = sqlite3.Row
+            trades = [dict(x) for x in db.execute("SELECT * FROM trades WHERE account=? AND (leader IS NULL OR leader='')", (account,))]
+            fills = [dict(x) for x in db.execute("SELECT * FROM local_fills WHERE account=? ORDER BY timestamp", (account,))]
+            used = set()
+            for trade in trades:
+                candidates = []
+                for fill in fills:
+                    if fill["id"] in used or not fill.get("reduce_only") or _symbol(fill.get("symbol")) != _symbol(trade.get("symbol")):
+                        continue
+                    delta = abs(_number(fill.get("timestamp")) - _number(trade.get("timestamp")))
+                    if delta <= 86400:
+                        candidates.append((delta, fill))
+                if not candidates:
+                    continue
+                _, fill = min(candidates, key=lambda x: x[0])
+                used.add(fill["id"])
+                db.execute("UPDATE trades SET leader=?, attribution='local_fill' WHERE id=?", (fill["leader"], trade["id"]))
 
     def audit(self, action, detail):
         with sqlite3.connect(self.path) as db:
@@ -76,26 +174,17 @@ class ConsoleService:
         self.config = config
         self.leader_stream = leader_stream
         self.store = ConsoleStore(store_path)
-        self.username = os.getenv("CONSOLE_USERNAME", "admin")
-        # A missing password must not silently create an admin account with an
-        # empty password. Operators must explicitly configure the credential.
-        configured_password = os.getenv("CONSOLE_PASSWORD")
-        self.password_hash = self._hash(configured_password) if configured_password else None
-        self.sessions = {}
         self._snapshot = {"updated_at": 0, "leaders": [], "accounts": [], "status": {}}
         self._subscribers = set()
         self._task = None
 
-    @staticmethod
-    def _hash(value):
-        return hashlib.sha256(value.encode()).hexdigest()
-
     def install(self, app):
-        app.router.add_post("/api/v1/auth/login", self.login)
-        app.router.add_post("/api/v1/auth/logout", self.logout)
         app.router.add_get("/api/v1/dashboard", self.dashboard)
         app.router.add_get("/api/v1/trades", self.trades)
         app.router.add_get("/api/v1/stats", self.stats)
+        app.router.add_get("/api/v1/performance/overview", self.performance_overview)
+        app.router.add_get("/api/v1/performance/leaders", self.performance_leaders)
+        app.router.add_get("/api/v1/performance/equity", self.performance_equity)
         app.router.add_get("/api/v1/events", self.events)
         app.router.add_patch("/api/v1/leaders/{name}", self.update_leader)
         app.router.add_post("/api/v1/control/{action}", self.control)
@@ -112,67 +201,38 @@ class ConsoleService:
         for response in list(self._subscribers):
             response.force_close()
 
-    def _authorized(self, request):
-        token = request.cookies.get("console_session")
-        if token and token in self.sessions and self.sessions[token] > time.time():
-            return True
-        try:
-            payload, signature = token.rsplit('.', 1)
-            expected = hmac.new(self.password_hash.encode(), payload.encode(), hashlib.sha256).hexdigest()
-            expires = int(payload.rsplit('.', 1)[0])
-            return expires > int(time.time()) and hmac.compare_digest(signature, expected)
-        except (AttributeError, ValueError):
-            return False
-
-    async def _require(self, request):
-        if not self._authorized(request):
-            raise web.HTTPUnauthorized(headers={"WWW-Authenticate": "Session"})
-
-    async def login(self, request):
-        payload = await request.json()
-        if (not self.password_hash or
-                not hmac.compare_digest(str(payload.get("username", "")), self.username) or
-                not hmac.compare_digest(self.password_hash, self._hash(str(payload.get("password", ""))))):
-            raise web.HTTPUnauthorized(text="Invalid credentials")
-        expires = int(time.time()) + 86400 * 30
-        payload = f"{expires}.{secrets.token_urlsafe(16)}"
-        token = payload + "." + hmac.new(self.password_hash.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        response = web.json_response({"ok": True})
-        # Keep local HTTP development usable while retaining Secure cookies
-        # when the console is served through the HTTPS reverse proxy.
-        forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
-        secure = request.secure or forwarded_proto == "https"
-        response.set_cookie("console_session", token, httponly=True, secure=secure,
-                            samesite="Lax", max_age=86400 * 30)
-        return response
-
-    async def logout(self, request):
-        token = request.cookies.get("console_session")
-        self.sessions.pop(token, None)
-        response = web.json_response({"ok": True})
-        response.del_cookie("console_session")
-        return response
-
     async def dashboard(self, request):
-        await self._require(request)
         return web.json_response(self._snapshot)
 
     async def trades(self, request):
-        await self._require(request)
         account = self._account_name()
         limit = min(int(request.query.get("limit", 100)), 500)
         return web.json_response({"items": self.store.trades(account, limit)})
 
     async def stats(self, request):
-        await self._require(request)
         account = self._account_name()
         snapshots = self.store.snapshots(account)
         trades = self.store.trades(account, 500)
-        return web.json_response({"account": account, "snapshots": snapshots,
-                                  "realized_pnl": sum(_number(x.get("realized_pnl")) for x in trades)})
+        result = self.store.performance(account)
+        return web.json_response({"account": account, "snapshots": snapshots, **result})
+
+    def _performance(self, request):
+        account = request.query.get("account") or self._account_name()
+        def number(name):
+            value = request.query.get(name)
+            return float(value) if value not in (None, "") else None
+        return self.store.performance(account, number("since"), number("until"))
+
+    async def performance_overview(self, request):
+        return web.json_response(self._performance(request))
+
+    async def performance_leaders(self, request):
+        return web.json_response({"items": self._performance(request)["leaders"]})
+
+    async def performance_equity(self, request):
+        return web.json_response({"items": self._performance(request)["curve"]})
 
     async def events(self, request):
-        await self._require(request)
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"})
         await response.prepare(request)
         self._subscribers.add(response)
@@ -188,7 +248,6 @@ class ConsoleService:
         return response
 
     async def update_leader(self, request):
-        await self._require(request)
         name = request.match_info["name"]
         if name not in self.engine.leaders:
             raise web.HTTPNotFound(text="Unknown leader")
@@ -225,7 +284,6 @@ class ConsoleService:
         return web.json_response({"ok": True, "leader": self.engine.leaders[name]})
 
     async def control(self, request):
-        await self._require(request)
         action = request.match_info["action"]
         if action not in ("pause", "resume"):
             raise web.HTTPNotFound()
@@ -257,17 +315,30 @@ class ConsoleService:
         account_rows, orders, equity, balance, unrealized = [], [], 0.0, 0.0, 0.0
         exchange = self.engine.exchange
         try:
+            if self.engine.fill_events:
+                self.store.insert_local_fills(self.engine.fill_events)
+                self.engine.fill_events.clear()
             raw = await exchange.fetch_positions()
             account_rows = [self._account_position(p) for p in raw if _number(p.get("contracts"))]
-            orders = await exchange.fetch_open_orders()
             equity = await exchange.equity()
             unrealized = sum(_number(x.get("unrealizedPnl")) for x in raw)
             balance = await exchange.wallet_balance() if hasattr(exchange, "wallet_balance") else equity - unrealized
             self.store.snapshot(self._account_name(), equity, unrealized)
+        except Exception:
+            log.exception("Console account refresh failed")
+        try:
+            orders = await exchange.fetch_open_orders()
+        except Exception as exc:
+            log.warning("Console open orders refresh failed: %s", exc)
+            orders = [{"error": type(exc).__name__}]
+        try:
             if hasattr(exchange, "fetch_realized_pnl"):
                 self.store.insert_trades(self._account_name(), await exchange.fetch_realized_pnl())
-        except Exception as exc:
-            orders = [{"error": type(exc).__name__}]
+                self.store.attribute_trades(self._account_name())
+            if hasattr(exchange, "fetch_cash_flows"):
+                self.store.insert_cash_flows(self._account_name(), await exchange.fetch_cash_flows())
+        except Exception:
+            log.exception("Console performance refresh failed")
         self._snapshot = {"updated_at": time.time(), "leaders": leaders,
                           "accounts": [{"name": self._account_name(), "balance": balance, "equity": equity, "unrealized_pnl": unrealized,
                                         "positions": account_rows, "orders": orders}],
