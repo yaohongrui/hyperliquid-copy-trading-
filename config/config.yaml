@@ -25,15 +25,8 @@ execution_accounts:
     hard_stop:
       max_daily_loss_usdt: 40
     fixed_balance_usdt: 100
-# 顶层币种映射：HL 名称 -> 执行交易所合约。修改后需重启生效。
-# 值可以是 CCXT 统一标的、基础币种、交易所原生写法，或 skip（完全忽略该标的）。
-# HIP-3 名称含冒号，必须加引号。
-# symbol_map:
-#   'XYZ:SKHX': SKHX/USDT:USDT
-#   PEPE: 1000PEPE
-#   'XYZ:OLD': skip
 symbol_map:
-  'XYZ:SKHX': SKHY/USDT:USDT
+  XYZ:SKHX: SKHY/USDT:USDT
 leaders:
 - name: A
   address: '0x15baf1cefcced43e971da85b7b4de5a0391f7b29'
@@ -46,20 +39,20 @@ leaders:
   late_entry_offset_pct: 0.2
   position_stop_loss:
     enabled: true
-    max_loss_usdt: 6
+    max_loss_usdt: 10
   total_margin: 500000
 - name: B
   address: '0xd83989ae5084a9b68ef52393f780249e0e597255'
   source: hyperliquid
   execution_account: gate_primary
-  coefficient: 1
+  coefficient: 2
   enabled: true
   symbol_blacklist: []
   late_entry_enabled: false
   late_entry_offset_pct: 0.2
   position_stop_loss:
     enabled: true
-    max_loss_usdt: 6
+    max_loss_usdt: 8
   total_margin: 200000
 - name: C
   address: '0xcb02837caaee310c178501855b63bf7f4f4b1f8b'
@@ -78,27 +71,27 @@ leaders:
   address: '0x7f15f9e8f49c07ab33d4dbd05a92dbd6dfd686ab'
   source: hyperliquid
   execution_account: gate_primary
-  coefficient: 1
+  coefficient: 2
   enabled: true
   symbol_blacklist: []
   late_entry_enabled: false
   late_entry_offset_pct: 0.2
   position_stop_loss:
     enabled: true
-    max_loss_usdt: 6
+    max_loss_usdt: 8
   total_margin: 120000
 - name: E
   address: '0x4c921317a8301044a2287dfa34b18c37005b42db'
   source: hyperliquid
   execution_account: gate_primary
-  coefficient: 10
+  coefficient: 15
   enabled: true
   symbol_blacklist: []
   late_entry_enabled: false
   late_entry_offset_pct: 0.1
   position_stop_loss:
     enabled: true
-    max_loss_usdt: 6
+    max_loss_usdt: 8
   total_margin: 100000
 state:
   path: data/state.json

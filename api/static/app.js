@@ -3,16 +3,17 @@ let source;
 
 function money(value) { return `${Number(value || 0).toFixed(2)} USDT`; }
 function cls(value) { return Number(value) >= 0 ? 'positive' : 'negative'; }
+function td(label, value, klass = '') { return `<td data-label="${label}"${klass ? ` class="${klass}"` : ''}>${value}</td>`; }
 
 function table(rows) {
   if (!rows?.length) return '<p class="muted">No open positions.</p>';
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Leverage</th><th>Entry</th><th>Mark</th><th>PnL</th><th>ROI</th></tr></thead><tbody>${rows.map((p) => `<tr><td>${p.symbol || '--'}</td><td>${p.side || '--'}</td><td>${Number(p.size || 0).toFixed(5)}</td><td>${Number(p.leverage || 0).toFixed(1)}x</td><td>${Number(p.entry_price || 0).toFixed(5)}</td><td>${Number(p.mark_price || 0).toFixed(5)}</td><td class="${cls(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td><td class="${cls(p.roi)}">${Number(p.roi || 0).toFixed(2)}%</td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Leverage</th><th>Entry</th><th>Mark</th><th>PnL</th><th>ROI</th></tr></thead><tbody>${rows.map((p) => `<tr>${td('Symbol', p.symbol || '--')}${td('Side', p.side || '--')}${td('Size', Number(p.size || 0).toFixed(5))}${td('Leverage', `${Number(p.leverage || 0).toFixed(1)}x`)}${td('Entry', Number(p.entry_price || 0).toFixed(5))}${td('Mark', Number(p.mark_price || 0).toFixed(5))}${td('PnL', money(p.unrealized_pnl), cls(p.unrealized_pnl))}${td('ROI', `${Number(p.roi || 0).toFixed(2)}%`, cls(p.roi))}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function orders(rows) {
   if (!rows?.length) return '<p class="muted">No open orders.</p>';
   if (rows[0]?.error) return `<p class="error">Orders unavailable: ${rows[0].error}</p>`;
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th>Amount</th><th>Price</th><th>Status</th></tr></thead><tbody>${rows.map((o) => `<tr><td>${o.symbol || '--'}</td><td>${String(o.side || '--').toUpperCase()}</td><td>${String(o.type || '--').toUpperCase()}</td><td>${Number(o.amount || o.remaining || 0).toFixed(5)}</td><td>${Number(o.price || 0).toFixed(5)}</td><td>${o.status || 'open'}</td></tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th>Amount</th><th>Price</th><th>Status</th></tr></thead><tbody>${rows.map((o) => `<tr>${td('Symbol', o.symbol || '--')}${td('Side', String(o.side || '--').toUpperCase())}${td('Type', String(o.type || '--').toUpperCase())}${td('Amount', Number(o.amount || o.remaining || 0).toFixed(5))}${td('Price', Number(o.price || 0).toFixed(5))}${td('Status', o.status || 'open')}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function configForm(leader) {
@@ -49,6 +50,7 @@ const CHART = { line: '#3987e5', up: '#48d597', down: '#ff7373', grid: '#2b3748'
 
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function signed(value) { const n = Number(value || 0); return `${n >= 0 ? '+' : ''}${n.toFixed(2)}`; }
+function compact(value) { const n = Number(value || 0); return Math.abs(n) >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k` : String(Math.round(n)); }
 
 function toDateInput(epoch) {
   const d = new Date(epoch * 1000);
@@ -88,13 +90,13 @@ function perfMetrics(p) {
 
 function leaderTable(leaders) {
   if (!leaders?.length) return '<p class="muted">No realized trades in this period.</p>';
-  const rows = leaders.map((x) => `<tr class="${x.leader === 'unattributed' ? 'muted' : ''}"><td>${esc(x.leader)}</td><td class="${cls(x.net_pnl)}">${money(x.net_pnl)}</td><td>${money(x.gross_pnl)}</td><td>${money(x.fees)}</td><td class="${cls(x.funding)}">${money(x.funding)}</td><td>${(Number(x.win_rate) * 100).toFixed(1)}%</td><td>${x.trades}</td><td>${Number(x.contribution_pct).toFixed(2)}%</td></tr>`).join('');
+  const rows = leaders.map((x) => `<tr class="${x.leader === 'unattributed' ? 'muted' : ''}">${td('Trader', esc(x.leader))}${td('Net PnL', money(x.net_pnl), cls(x.net_pnl))}${td('Gross', money(x.gross_pnl))}${td('Fees', money(x.fees))}${td('Funding', money(x.funding), cls(x.funding))}${td('Win rate', `${(Number(x.win_rate) * 100).toFixed(1)}%`)}${td('Trades', x.trades)}${td('Contribution', `${Number(x.contribution_pct).toFixed(2)}%`)}</tr>`).join('');
   return `<div class="table-wrap"><table class="table"><thead><tr><th>Trader</th><th>Net PnL</th><th>Gross</th><th>Fees</th><th>Funding</th><th>Win rate</th><th>Trades</th><th>Contribution</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function positionTable(rows) {
   if (!rows?.length) return '<p class="muted">No open positions.</p>';
-  const body = rows.map((p) => `<tr><td>${esc(p.symbol)}</td><td>${esc(p.side)}</td><td>${Number(p.size || 0).toFixed(5)}</td><td>${Number(p.leverage || 0).toFixed(1)}x</td><td>${Number(p.entry_price || 0).toFixed(5)}</td><td>${Number(p.mark_price || 0).toFixed(5)}</td><td class="${cls(p.unrealized_pnl)}">${money(p.unrealized_pnl)}</td><td class="${cls(p.roi)}">${Number(p.roi || 0).toFixed(2)}%</td><td>${p.leader === 'unattributed' ? '<span class="muted">unattributed</span>' : esc(p.leader)}</td></tr>`).join('');
+  const body = rows.map((p) => `<tr>${td('Symbol', esc(p.symbol))}${td('Side', esc(p.side))}${td('Size', Number(p.size || 0).toFixed(5))}${td('Leverage', `${Number(p.leverage || 0).toFixed(1)}x`)}${td('Entry', Number(p.entry_price || 0).toFixed(5))}${td('Mark', Number(p.mark_price || 0).toFixed(5))}${td('Unrealized PnL', money(p.unrealized_pnl), cls(p.unrealized_pnl))}${td('ROI', `${Number(p.roi || 0).toFixed(2)}%`, cls(p.roi))}${td('Trader', p.leader === 'unattributed' ? '<span class="muted">unattributed</span>' : esc(p.leader))}</tr>`).join('');
   return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Leverage</th><th>Entry</th><th>Mark</th><th>Unrealized PnL</th><th>ROI</th><th>Trader</th></tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
@@ -135,7 +137,7 @@ function renderLeaderBars(node, leaders) {
     backgroundColor: 'transparent',
     grid: { left: 8, right: 64, top: 8, bottom: 8, containLabel: true },
     tooltip: { trigger: 'item', ...tooltipShell(), formatter: (item) => `<strong>${money(item.value)}</strong> · ${esc(rows[item.dataIndex]?.leader)}` },
-    xAxis: { type: 'value', axisLabel: { color: CHART.muted }, splitLine: { lineStyle: { color: CHART.grid, type: 'solid' } } },
+    xAxis: { type: 'value', splitNumber: 3, axisLabel: { color: CHART.muted, formatter: compact }, splitLine: { lineStyle: { color: CHART.grid, type: 'solid' } } },
     yAxis: { type: 'category', data: rows.map((x) => x.leader), axisLine: { lineStyle: { color: CHART.grid } }, axisLabel: { color: CHART.muted }, axisTick: { show: false } },
     series: [{ type: 'bar', data, barMaxWidth: 24, label: { show: true, color: CHART.ink, formatter: (item) => signed(item.value) } }],
   }, true);
