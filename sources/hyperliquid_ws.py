@@ -13,6 +13,10 @@ class HyperliquidWS:
      for address in self.addresses:
       log.info('HL subscribing to %s', address)
       await ws.send(json.dumps({'method':'subscribe','subscription':{'type':'allDexsClearinghouseState','user':address}}))
+     # The stream is change-driven: closes that happened while the socket was
+     # down are never replayed.  Ask the consumer to re-pull a REST snapshot
+     # once per (re)connect so the diff baseline sees them.
+     yield {'channel': 'resync'}
      async for raw in ws: yield json.loads(raw)
    except asyncio.CancelledError: raise
    except Exception as exc: log.warning('HL websocket disconnected: %s',exc); await asyncio.sleep(self.reconnect_seconds)

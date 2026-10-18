@@ -53,6 +53,11 @@ class ConsoleStore:
             # feed that reports fee only (no PnL); keeping them would double-count
             # fees once the real source starts writing.
             db.execute("DELETE FROM trades WHERE source IS NULL AND realized_pnl = 0")
+            # Gate position-close rows predate the ledger feed.  The ledger
+            # re-reports every close (including stop-outs that position history
+            # merges into a reopened episode), so retire the old rows rather
+            # than double-count them.
+            db.execute("DELETE FROM trades WHERE source = 'position_close'")
 
     def snapshot(self, account, equity, unrealized):
         with sqlite3.connect(self.path) as db:
@@ -68,7 +73,13 @@ class ConsoleStore:
         return [dict(row, symbol=self.symbol_map.display(row.get("symbol"))) for row in rows]
 
     def insert_trades(self, account, rows):
+        rows = list(rows)
         with sqlite3.connect(self.path) as db:
+            # The ledger supersedes position history: a refresh that falls back
+            # to position_close while the ledger endpoint is unavailable must
+            # not leave duplicates behind once the ledger recovers.
+            if any(row.get("source") == "ledger" for row in rows):
+                db.execute("DELETE FROM trades WHERE account=? AND source='position_close'", (account,))
             for row in rows:
                 external_id = row.get("id") or row.get("tradeId") or row.get("timestamp")
                 if external_id is None:
@@ -198,7 +209,26 @@ class ConsoleStore:
                     continue
                 _, fill = min(candidates, key=lambda x: x[0])
                 used.add(fill["id"])
+                trade["leader"] = fill["leader"]
                 db.execute("UPDATE trades SET leader=?, attribution='local_fill' WHERE id=?", (fill["leader"], trade["id"]))
+            # Exchange-side closes (native stop-loss, liquidation, manual) never
+            # produce a local reduce-only fill.  Attribute them to the leader
+            # whose newest opening fill at or before the close belongs to; fills
+            # after the close belong to a reopened episode and are ignored.
+            for trade in trades:
+                if trade.get("leader"):
+                    continue
+                trade_ts = _number(trade.get("timestamp"))
+                symbol = self.symbol_map.display(trade.get("symbol"))
+                opener = None
+                for fill in fills:
+                    if fill.get("reduce_only") or self.symbol_map.display(fill.get("symbol")) != symbol:
+                        continue
+                    if _number(fill.get("timestamp")) <= trade_ts:
+                        opener = fill
+                if opener and opener.get("leader"):
+                    db.execute("UPDATE trades SET leader=?, attribution='stop_close' WHERE id=?",
+                               (opener["leader"], trade["id"]))
 
     def audit(self, action, detail):
         with sqlite3.connect(self.path) as db:

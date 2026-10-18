@@ -76,6 +76,13 @@ class CcxtExchange:
             raise ValueError(f"No USDT perpetual market for {symbol} (symbol_map -> {mapped})")
         raise ValueError(f"No USDT perpetual market for {symbol}; add a symbol_map entry if the venue names it differently")
 
+    def _unified_symbol(self, contract):
+        """Map Gate's ``BASE_QUOTE`` contract id to the unified swap symbol."""
+        for symbol, market in self.client.markets.items():
+            if market.get('id') == contract and market.get('swap'):
+                return symbol
+        return contract
+
     @staticmethod
     def _is_usdt_swap(market):
         return bool(market.get("swap")) and market.get("quote", "").upper() == "USDT"
@@ -223,7 +230,16 @@ class CcxtExchange:
 
         Rows carry ``source`` so the store can retire rows from a superseded
         feed (e.g. Gate trade history, which reports no PnL at all).
+
+        Gate's closed-position endpoint only reports a position once the whole
+        episode is over, and it merges a stop-out with a reopen into a single
+        still-open episode.  The account book (ledger) is the only feed that
+        carries every realized close, so Gate rows come from there.
         """
+        if self.name == 'gate':
+            rows = await self._gate_ledger_rows()
+            if rows is not None:
+                return rows
         if self.client.has.get('fetchIncome'):
             try:
                 income = await self.client.fetch_income(limit=100)
@@ -271,6 +287,71 @@ class CcxtExchange:
                 'amount': row.get('amount'), 'price': row.get('price'), 'realizedPnl': float(realized or 0),
                 'fee': float(fee.get('cost') or 0), 'timestamp': row.get('timestamp'),
             })
+        return result
+
+    async def _gate_ledger_rows(self):
+        """Realized closes from Gate's futures account book.
+
+        Each ``pnl`` entry is one closing execution and references the order in
+        its ``text`` (``CONTRACT:ORDER_ID``); sibling ``fee`` entries share the
+        same text, so they fold into the same console row.  The dedupe key is
+        stable, which lets repeated refreshes insert idempotently.  Pagination
+        walks backwards with ``to`` until a page comes back short.
+        """
+        settle = self.config.get('settle', 'usdt')
+        rows = {}
+        until = None
+        for _ in range(10):
+            params = {'settle': settle, 'limit': 100}
+            if until is not None:
+                params['to'] = until
+            try:
+                book = await self.client.privateFuturesGetSettleAccountBook(params)
+            except (AttributeError, ccxt.NotSupported, ccxt.PermissionDenied, ccxt.AuthenticationError, ccxt.ExchangeError):
+                return None if not rows else self._ledger_rows_result(rows)
+            if not book:
+                break
+            oldest = None
+            for entry in book:
+                stamp = _float(entry.get('time'))
+                if stamp and (oldest is None or stamp < oldest):
+                    oldest = stamp
+                kind = str(entry.get('type') or '').lower()
+                if kind not in ('pnl', 'fee'):
+                    continue
+                text = str(entry.get('text') or '')
+                contract, _, order_id = text.partition(':')
+                if not contract or not order_id:
+                    continue
+                key = (contract, order_id)
+                row = rows.setdefault(key, {'id': f"ledger:{contract}:{order_id}", 'source': 'ledger',
+                                            'symbol': self._unified_symbol(contract),
+                                            'side': None, 'amount': 0, 'price': 0,
+                                            'realizedPnl': 0.0, 'fee': 0.0, 'timestamp': 0.0,
+                                            'has_pnl': False})
+                change = _float(entry.get('change'))
+                if kind == 'pnl':
+                    row['realizedPnl'] += change
+                    row['has_pnl'] = True
+                else:
+                    # Fees are negative changes in the book; store cost positive.
+                    row['fee'] -= change
+                if stamp > row['timestamp']:
+                    row['timestamp'] = stamp
+            if len(book) < 100 or oldest is None:
+                break
+            until = int(oldest) - 1
+        return self._ledger_rows_result(rows)
+
+    @staticmethod
+    def _ledger_rows_result(rows):
+        # Fee-only keys belong to opening executions; without a closing leg
+        # they would fabricate losing trades.  A closing leg with exactly zero
+        # PnL is still a real close, so keep it.
+        result = []
+        for row in rows.values():
+            if row.pop('has_pnl', False):
+                result.append(row)
         return result
 
     @staticmethod

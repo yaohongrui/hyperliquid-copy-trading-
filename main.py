@@ -80,6 +80,16 @@ async def main(path):
         except ValueError as exc:
             raise RuntimeError(f"invalid symbol_map: {exc}") from exc
         await engine.prepare_startup()
+    ws = HyperliquidWS(
+        (c.get("hyperliquid") or {}).get("ws_url", "wss://api.hyperliquid.xyz/ws"),
+        [_address(item.get("address")) for item in enabled],
+        (c.get("hyperliquid") or {}).get("reconnect_seconds", 3),
+    )
+    console = ConsoleService(engine, c, (c.get('console') or {}).get('database', 'data/console.sqlite3'), ws)
+    # Installs predating the entered map have no record of which symbols were
+    # actually filled.  Rebuild it from local fills; otherwise a restart after
+    # an exchange-native stop looks like a never-filled entry and re-enters.
+    _seed_entered(engine, console.store)
     # WebSocket updates are change-driven and may not send a restart snapshot.
     # Seed the engine from the official REST state so startup sync is evaluated.
     for name, leader_cfg in leaders.items():
@@ -88,14 +98,8 @@ async def main(path):
             log.info("Initial leader snapshot processed for %s", name)
         except Exception:
             log.exception("Initial leader snapshot failed for %s", name)
-    ws = HyperliquidWS(
-        (c.get("hyperliquid") or {}).get("ws_url", "wss://api.hyperliquid.xyz/ws"),
-        [_address(item.get("address")) for item in enabled],
-        (c.get("hyperliquid") or {}).get("reconnect_seconds", 3),
-    )
     ws_task = asyncio.create_task(_consume_leaders(ws, engine, leaders), name="hyperliquid-ws")
     protection_task = asyncio.create_task(_reconcile_protections(engine, stop), name="protection-reconciler")
-    console = ConsoleService(engine, c, (c.get('console') or {}).get('database', 'data/console.sqlite3'), ws)
     api_runner = web.AppRunner(create_app(telegram, console))
     await api_runner.setup()
     await web.TCPSite(api_runner, "127.0.0.1", 8766).start()
@@ -118,9 +122,27 @@ async def main(path):
         log.info("HL copytrade stopped")
 
 
+def _seed_entered(engine, store):
+    if not engine.leaders:
+        return
+    account_key = engine._account_key(next(iter(engine.leaders)))
+    for symbol, leader in store.latest_open_fill_leaders(account_key).items():
+        engine.entered.setdefault(f"{leader}:{symbol}", True)
+    engine._save_state()
+
+
 async def _consume_leaders(source, engine, leaders):
     async for event in source.stream():
         log.debug("HL event channel=%s", event.get("channel"))
+        if event.get("channel") == "resync":
+            # Websocket (re)connected: closes that fired during an outage are
+            # never replayed, so re-seed every leader from a REST snapshot.
+            for name, cfg in leaders.items():
+                try:
+                    await engine.process(name, await leader_snapshot(cfg))
+                except Exception:
+                    log.exception("Leader snapshot resync failed for %s", name)
+            continue
         if event.get("channel") != "allDexsClearinghouseState":
             continue
         data = event.get("data") or {}

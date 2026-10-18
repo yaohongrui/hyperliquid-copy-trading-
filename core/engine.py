@@ -27,6 +27,15 @@ class Engine:
         self.owners = {}
         if state_store:
             self.owners = self.runtime_state.get('symbol_owners', {})
+        # Symbols where the account was closed out (native stop, liquidation,
+        # manual close) while the leader still held.  Re-entry is suppressed
+        # until the leader goes flat, so an incremental add does not create a
+        # fresh position right after a stop.
+        self.stopped = self.runtime_state.get('stopped', {})
+        # Symbols for which a local opening order actually filled.  A flat
+        # account is only a stop-out if we had built a position first; an
+        # entry that never filled must keep accumulating normally.
+        self.entered = self.runtime_state.get('entered', {})
         self.small_order_carry = self.runtime_state.get('small_order_carry', {})
         # Console consumes these immutable fill events to attribute exchange
         # realized PnL back to the leader that generated the order.
@@ -48,9 +57,17 @@ class Engine:
     def _save_state(self):
         if self.state_store:
             self.runtime_state['symbol_owners'] = self.owners
+            self.runtime_state['stopped'] = self.stopped
+            self.runtime_state['entered'] = self.entered
             self.runtime_state['small_order_carry'] = self.small_order_carry
             self.runtime_state['risk'] = self.risk.state()
             self.state_store.save(self.runtime_state)
+
+    def _mark_stopped(self, leader, symbol):
+        key = f'{leader}:{symbol}'
+        if not self.stopped.get(key):
+            self.stopped[key] = True
+            self._save_state()
 
     async def check_hard_stop(self):
         """Check daily account drawdown and close exposure once if breached."""
@@ -99,9 +116,12 @@ class Engine:
                     await self.exchange.cancel_protection(self._protection_id(old), symbol)
                 except Exception as exc:
                     # Gate removes a conditional order automatically when the
-                    # position reaches zero.  Treat its ORDER_NOT_FOUND reply
-                    # as an already-completed cancellation.
-                    if type(exc).__name__ != 'OrderNotFound':
+                    # position reaches zero or its trigger fires, then answers
+                    # AUTO_ORDER_NOT_FOUND to a delete.  Treat both flavors of
+                    # "order is gone" as an already-completed cancellation
+                    # instead of aborting the release with the owner intact.
+                    message = str(exc).upper()
+                    if type(exc).__name__ != 'OrderNotFound' and 'ORDER_NOT_FOUND' not in message:
                         log.warning('Failed to cancel protection order %s for %s', old, symbol, exc_info=True)
                 if hasattr(self.exchange, 'cancel_protection_orders'):
                     try:
@@ -109,6 +129,7 @@ class Engine:
                     except Exception:
                         log.warning('Failed to clean residual protection orders for %s', symbol, exc_info=True)
             self.owners.pop(key, None)
+            self.entered.pop(f'{leader}:{symbol}', None)
             self._save_state()
 
     @staticmethod
@@ -182,8 +203,17 @@ class Engine:
                         continue
                     live = await self.exchange.position_size(symbol)
                     if abs(live) <= 1e-12:
+                        baseline = self.previous.get(leader, {}).get(symbol)
+                        if (baseline is not None and abs(baseline.size) > 1e-12
+                                and self.entered.get(f'{leader}:{symbol}')):
+                            # The account is flat but the leader still holds:
+                            # our side was stopped or closed manually.
+                            self._mark_stopped(leader, symbol)
                         await self._release_if_flat(leader, symbol)
                     else:
+                        if not self.entered.get(f'{leader}:{symbol}'):
+                            self.entered[f'{leader}:{symbol}'] = True
+                            self._save_state()
                         await self._sync_protection(leader, symbol)
                 except ValueError as exc:
                     if str(exc).startswith('No USDT perpetual market'):
@@ -218,6 +248,14 @@ class Engine:
             startup = leader not in self.previous
             signals = diff_positions(leader, self.previous.get(leader, {}), positions, ratio)
             self.previous[leader] = positions
+            # A stop-out suppression ends once the leader itself is flat; the
+            # next open is then a genuinely new episode worth copying.
+            for key in [k for k in self.stopped if k.startswith(f'{leader}:')]:
+                symbol = key[len(leader) + 1:]
+                position = positions.get(symbol)
+                if position is None or abs(position.size) <= 1e-12:
+                    self.stopped.pop(key, None)
+                    self._save_state()
             if startup:
                 for key in list(self.small_order_carry):
                     if key.startswith(f'{leader}:') and key[len(leader) + 1:] not in positions:
@@ -237,7 +275,12 @@ class Engine:
                     if self.paused and s.kind in ('open', 'increase', 'close_reverse'):
                         await self._skip(leader, s, 'new exposure is paused')
                         continue
+                    stopped_key = f'{leader}:{s.symbol}'
+                    if stopped_key in self.stopped and s.kind in ('open', 'increase'):
+                        await self._skip(leader, s, 'stopped out; waiting for the leader to close and reopen')
+                        continue
                     account_key = self._owner_key(leader, s.symbol)
+                    had_owner = self.owners.get(account_key) == leader
                     if s.kind in ('open', 'increase', 'close_reverse'):
                         ok, owner = await self._claim_or_check(leader, s.symbol)
                         if not ok:
@@ -247,6 +290,25 @@ class Engine:
                         await self._skip(leader, s, f'symbol is owned by leader {self.owners[account_key]}')
                         continue
                     live = await self.exchange.position_size(s.symbol)
+                    if (s.kind in ('open', 'increase') and abs(live) > 1e-12
+                            and not self.entered.get(stopped_key)):
+                        # A limit entry may fill after create_order returns
+                        # "open"; seeing the exposure here marks it too.
+                        self.entered[stopped_key] = True
+                        self._save_state()
+                    if (had_owner and s.kind in ('open', 'increase')
+                            and self.entered.get(stopped_key)
+                            and abs(live) <= 1e-12
+                            and not self.small_order_carry.get(stopped_key)):
+                        # We held this symbol but the account is now flat: a
+                        # native stop or manual close removed it while the
+                        # leader still holds.  Copying the add would create a
+                        # fresh position right after the stop, so suppress
+                        # re-entry until the leader goes flat and reopens.
+                        self._mark_stopped(leader, s.symbol)
+                        await self._release_if_flat(leader, s.symbol)
+                        await self._skip(leader, s, 'account is flat (native close?); waiting for the leader to close and reopen')
+                        continue
                     if startup:
                         target = s.target_size
                         if live * target < 0:
@@ -287,6 +349,15 @@ class Engine:
                         elif carry_amount:
                             self._set_carry(leader, s.symbol)
                         if not live or live * s.delta >= 0:
+                            # The account has nothing left to reduce (a native
+                            # stop fired, or the position was closed manually)
+                            # while the leader still holds it.  Release the
+                            # stale claim and remember the stop-out so a later
+                            # leader add does not reopen the position.
+                            if not live:
+                                if s.kind == 'decrease' and self.entered.get(stopped_key):
+                                    self._mark_stopped(leader, s.symbol)
+                                await self._release_if_flat(leader, s.symbol)
                             await self._skip(leader, s, 'no matching account position to reduce')
                             continue
                         amount = abs(live) if s.kind == 'close' else min(abs(live), abs(s.delta))
@@ -314,6 +385,9 @@ class Engine:
                         self._set_carry(leader, s.symbol)
                     log.info('ORDER RESULT leader=%s symbol=%s id=%s status=%s amount=%s', leader, s.symbol, order.id, order.status, order.amount)
                     if order.status == 'closed' and order.amount:
+                        if not reduce:
+                            self.entered[stopped_key] = True
+                            self._save_state()
                         self.fill_events.append({'account': self._account_key(leader), 'leader': leader,
                                                  'order_id': str(order.id), 'symbol': s.symbol,
                                                  'side': side, 'quantity': float(order.amount),
