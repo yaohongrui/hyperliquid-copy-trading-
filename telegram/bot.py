@@ -46,6 +46,20 @@ class TelegramManager:
         if cmd == "/resume":
             self.engine.paused = False
             return await self._status_message("▶️ NEW ENTRIES RESUMED")
+        if cmd in {"/unlock_hard_stop", "/unlock_hardstop"}:
+            try:
+                result = await self.engine.unlock_hard_stop()
+            except Exception as exc:
+                log.warning("Telegram hard stop unlock failed (%s)", type(exc).__name__)
+                return self._event_message(
+                    "❌ HARD STOP UNLOCK FAILED",
+                    [("Account", self.account_name)],
+                    reason=exc,
+                )
+            return (await self._status_message("🔓 HARD STOP UNLOCKED")) + (
+                f"\n<b>Daily baseline</b>: {escape(self._value(result['baseline']))} USDT"
+                f" (was {'LOCKED' if result['was_locked'] else 'unlocked'})"
+            )
         if cmd == "/status":
             return await self._status_message()
         if cmd == "/positions":
@@ -54,7 +68,7 @@ class TelegramManager:
             return await self._leader_positions_message()
         return self._event_message("❔ UNKNOWN COMMAND", [
             ("Available", "/status, /positions, /leader_positions"),
-            ("Controls", "/pause, /resume"),
+            ("Controls", "/pause, /resume, /unlock_hard_stop"),
         ], reason="Please choose a command from the bot menu.")
 
     def _stop_loss_text(self):
@@ -80,6 +94,7 @@ class TelegramManager:
             ("Mode", self.mode),
             ("Account", self.account_name),
             ("New entries", "PAUSED" if self.engine.paused else "ENABLED"),
+            ("Hard stop", "LOCKED" if self.engine.risk.locked else "OK"),
             ("Stop loss", self._stop_loss_text()),
             ("Account equity", await self._equity_text()),
         ])
@@ -90,6 +105,7 @@ class TelegramManager:
             f"Mode: {self.mode}",
             f"Account: {self.account_name}",
             f"New entries: {'PAUSED' if self.engine.paused else 'ENABLED'}",
+            f"Hard stop: {'LOCKED' if self.engine.risk.locked else 'OK'}",
             f"Stop loss: {self._stop_loss_text()}",
             f"Account equity: {equity}",
         ])
@@ -222,6 +238,17 @@ class TelegramManager:
     async def notify_skipped(self, leader, signal, reason):
         await self.send(self._event_message("⏭️ ORDER SKIPPED", self._trade_fields(leader, signal), reason=reason))
 
+    async def notify_hard_stop(self, equity, baseline, loss):
+        await self.send(self._event_message("🛑 HARD STOP TRIGGERED", [
+            ("Account", self.account_name),
+            ("Mode", self.mode),
+            ("Account equity", f"{self._value(float(equity))} USDT"),
+            ("Day baseline", f"{self._value(float(baseline))} USDT"),
+            ("Daily loss", f"{self._value(float(loss))} USDT"),
+            ("Limit", self._stop_loss_text()),
+            ("Action", "All positions closed; new entries paused"),
+        ], reason="Send /unlock_hard_stop to reset the daily baseline and resume entries."))
+
     async def notify_accepted(self, leader, signal, order):
         """Notify when an exchange accepts an order that is not filled yet."""
         await self.send(self._event_message("🕒 ORDER ACCEPTED", self._trade_fields(leader, signal, order) + [
@@ -252,6 +279,7 @@ class TelegramManager:
                         {"command": "leader_positions", "description": "Show leader positions"},
                         {"command": "pause", "description": "Pause new entries"},
                         {"command": "resume", "description": "Resume new entries"},
+                        {"command": "unlock_hard_stop", "description": "Unlock hard stop and resume entries"},
                     ]))
                     await self.send("<b>SYSTEM STARTED</b>\nTelegram control and notifications are online.")
                 except asyncio.CancelledError:

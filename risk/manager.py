@@ -37,5 +37,17 @@ class RiskManager:
             self.locked = True
         return self.locked
 
+    def unlock(self, equity, now=None):
+        """Clear the lock and rebaseline to current equity.
+
+        Keeping the old baseline would immediately re-trigger the same loss,
+        so a manual unlock starts a fresh daily baseline.
+        """
+        now = now or datetime.now(timezone.utc)
+        self.day = now.astimezone(timezone.utc).date().isoformat()
+        self.baseline = float(equity)
+        self.locked = False
+        return self.state()
+
     def check(self, equity):
         return not self.evaluate(equity)

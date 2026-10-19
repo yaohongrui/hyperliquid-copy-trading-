@@ -40,7 +40,7 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 
 ### 通知与控制
 
-- Telegram 长轮询机器人：`/status`、`/positions`、`/leader_positions`、`/pause`、`/resume`。
+- Telegram 长轮询机器人：`/status`、`/positions`、`/leader_positions`、`/pause`、`/resume`、`/unlock_hard_stop`。
 - 成交、挂单被接受、下单失败、信号跳过都会推送通知，并附带原因。
 - 持仓报告可渲染成 PNG 图片发送（`report_format: image|text`）。
 - 只响应配置的 `chat_id`；重启时会跳过旧消息，不会重放历史命令。
@@ -171,6 +171,8 @@ hard_stop:
   1. 设置 `paused = true`；
   2. 市价 reduce-only 平掉账户所有永续仓位（包括非引擎建立的仓位）；
   3. 当日保持 `locked`，不会重复触发平仓。
+  4. 通过 Telegram 推送 `HARD STOP TRIGGERED` 通知。
+- 手动解除：Telegram `/unlock_hard_stop`。会以当前权益重置当日基线、清除 `locked` 并恢复新开仓；否则旧基线会在下一次检查时立刻再次触发。
 - 注意：`paused` 只在内存中。进程重启后新开仓会恢复，即使风控仍处于当日 `locked` 状态；需要手动 `/pause` 或控制台暂停。跨日后 `locked` 自动解除，但 `paused` 仍需要手动恢复。
 
 ### 暂停/恢复
@@ -458,6 +460,7 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 | `/leader_positions` | 所有交易员的实时仓位（别名 `/leader_positons`，兼容旧拼写） |
 | `/pause` | 暂停新开仓/加仓 |
 | `/resume` | 恢复新开仓/加仓 |
+| `/unlock_hard_stop` | 解除硬止损锁定：按当前权益重置当日基线并恢复新开仓 |
 
 ### 通知
 
@@ -465,6 +468,7 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 - `ORDER ACCEPTED`：订单已被交易所接受但尚未成交（例如延迟入场的限价单）。
 - `ORDER FAILED`：下单异常及原因。
 - `ORDER SKIPPED`：跳过原因，包括暂停、黑名单、symbol skip、所有权冲突、启动价格不利、小单累计、无可减仓位、反手跳过等。
+- `HARD STOP TRIGGERED`：账户硬止损触发，包含权益、当日基线、当日亏损和限额；同时提示可用 `/unlock_hard_stop` 解除。
 - 启动/停止时分别发送 `SYSTEM STARTED` / `SYSTEM STOPPED`。
 - 启动时会先消费掉历史 update，避免重启后重放旧命令。
 

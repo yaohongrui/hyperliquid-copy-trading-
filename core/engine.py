@@ -82,9 +82,28 @@ class Engine:
         if hit and not locked_before:
             log.critical('HARD STOP triggered equity=%g baseline=%g', equity, self.risk.baseline)
             self.paused = True
-            await self.exchange.close_all_positions()
+            try:
+                await self.exchange.close_all_positions()
+            finally:
+                if self.notifier:
+                    await self.notifier.notify_hard_stop(
+                        equity, self.risk.baseline,
+                        float(self.risk.baseline) - float(equity),
+                    )
             return True
         return hit
+
+    async def unlock_hard_stop(self):
+        """Manually clear the hard-stop lock and rebaseline to current equity."""
+        equity = await self.exchange.equity()
+        was_locked = self.risk.locked
+        self.risk.unlock(equity)
+        self.paused = False
+        if self.state_store:
+            self._save_state()
+            self._risk_state_saved = self.risk.state()
+        log.warning('HARD STOP manually unlocked equity=%g baseline=%g', equity, self.risk.baseline)
+        return {'was_locked': was_locked, 'equity': equity, 'baseline': self.risk.baseline}
 
     def _set_carry(self, leader, symbol, side=None, amount=0):
         key = f'{leader}:{symbol}'
