@@ -43,6 +43,10 @@ class Engine:
         # ``leader:symbol``.  Without this a fill can arrive after the leader
         # has already closed and leave an orphan position behind.
         self.pending_orders = self.runtime_state.get('pending_orders', {})
+        # Symbols whose first snapshot failed before an order was placed.  The
+        # next event must still treat them as startup so the initial entry
+        # price check is not lost with the failed signal.
+        self.startup_pending = {}
         # Console consumes these immutable fill events to attribute exchange
         # realized PnL back to the leader that generated the order.
         self.fill_events = []
@@ -431,9 +435,11 @@ class Engine:
                 budget = float(budget)
             ratio = budget / denominator * float(cfg.get('coefficient', 1))
             startup = leader not in self.previous
-            signals = diff_positions(leader, self.previous.get(leader, {}), positions, ratio)
-            self.previous[leader] = positions
+            startup_symbols = self.startup_pending.get(leader, set())
+            previous = self.previous.get(leader, {})
+            signals = diff_positions(leader, previous, positions, ratio)
             self.previous_at[leader] = time.time()
+            failed = set()
             # A stop-out suppression ends once the leader itself is flat; the
             # next open is then a genuinely new episode worth copying.
             for key in [k for k in self.stopped if k.startswith(f'{leader}:')]:
@@ -449,6 +455,8 @@ class Engine:
                         self._save_state()
                 log.info('STARTUP leader=%s equity=%s sizing_balance=%g total_margin=%g ratio=%g positions=%d', leader, 'fixed' if equity is None else f'{equity:g}', budget, denominator, ratio, len(positions))
             for s in signals:
+                ordered = False
+                symbol_startup = startup or s.symbol in startup_symbols
                 try:
                     if self.symbol_map.is_skipped(s.symbol):
                         if f'{leader}:{s.symbol}' in self.small_order_carry:
@@ -506,7 +514,7 @@ class Engine:
                         await self._release_if_flat(leader, s.symbol)
                         await self._skip(leader, s, 'account is flat (native close?); waiting for the leader to close and reopen')
                         continue
-                    if startup:
+                    if symbol_startup:
                         target = s.target_size
                         if live * target < 0:
                             await self._skip(leader, s, 'opposite account position exists')
@@ -561,11 +569,11 @@ class Engine:
                     else:
                         amount = abs(s.delta)
                     side = 'buy' if s.delta > 0 else 'sell'
-                    if not reduce and not startup and carry.get('side') == side:
+                    if not reduce and not symbol_startup and carry.get('side') == side:
                         amount += carry_amount
                     elif not reduce and carry_amount and carry.get('side') != side:
                         self._set_carry(leader, s.symbol)
-                    typ = 'limit' if not startup and cfg.get('late_entry_enabled') and s.kind == 'open' else 'market'
+                    typ = 'limit' if not symbol_startup and cfg.get('late_entry_enabled') and s.kind == 'open' else 'market'
                     price = None
                     if typ == 'limit':
                         anchor = positions[s.symbol].entry_price
@@ -578,6 +586,7 @@ class Engine:
                         reason = 'quantity below exchange minimum; waiting to accumulate' if not reduce else 'reduction below exchange minimum'
                         await self._skip(leader, s, f'{reason} ({exc})')
                         continue
+                    ordered = True
                     if not reduce:
                         self._set_carry(leader, s.symbol)
                     log.info('ORDER RESULT leader=%s symbol=%s id=%s status=%s amount=%s', leader, s.symbol, order.id, order.status, order.amount)
@@ -603,8 +612,28 @@ class Engine:
                         protect.append((leader, s.symbol))
                 except Exception as exc:
                     log.exception('Order processing failed: %s %s', leader, s.symbol)
+                    if not ordered:
+                        failed.add(s.symbol)
                     if self.notifier:
                         await self.notifier.notify_failed(leader, s, exc)
+            # Commit the baseline per symbol.  A symbol whose order failed
+            # keeps its previous value, so the next event (or the REST
+            # fallback) regenerates the signal instead of silently dropping it.
+            committed = dict(positions)
+            for symbol in failed:
+                if symbol in previous:
+                    committed[symbol] = previous[symbol]
+                else:
+                    committed.pop(symbol, None)
+            self.previous[leader] = committed
+            if startup:
+                self.startup_pending[leader] = set(failed)
+            elif startup_symbols:
+                remaining = startup_symbols & failed
+                if remaining:
+                    self.startup_pending[leader] = remaining
+                else:
+                    self.startup_pending.pop(leader, None)
         # Protection setup is several REST calls; run it after releasing the
         # signal lock so the next leader event is not queued behind it.
         for protect_leader, protect_symbol in protect:
