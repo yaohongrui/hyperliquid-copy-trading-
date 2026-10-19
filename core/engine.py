@@ -37,16 +37,40 @@ class Engine:
         # entry that never filled must keep accumulating normally.
         self.entered = self.runtime_state.get('entered', {})
         self.small_order_carry = self.runtime_state.get('small_order_carry', {})
+        # Late-entry limit orders that are still live on the exchange, keyed by
+        # ``leader:symbol``.  Without this a fill can arrive after the leader
+        # has already closed and leave an orphan position behind.
+        self.pending_orders = self.runtime_state.get('pending_orders', {})
         # Console consumes these immutable fill events to attribute exchange
         # realized PnL back to the leader that generated the order.
         self.fill_events = []
 
     async def update_leader_config(self, leader, changes):
-        """Apply validated console changes without replacing the leader map."""
+        """Apply validated console changes without replacing the leader map.
+
+        Returns True when the address changed, so the caller can resubscribe
+        the WebSocket and seed the new address from REST.
+        """
         async with self._lock:
             if leader not in self.leaders:
                 raise KeyError(leader)
+            old_address = str(self.leaders[leader].get('address') or '').lower()
+            new_address = str(changes.get('address') or '').lower()
+            address_changed = 'address' in changes and new_address != old_address
             self.leaders[leader].update(changes)
+            if not address_changed:
+                return False
+            # A new address is a new leader episode.  Diffing the first event
+            # against the old address's positions would turn every old coin
+            # into a false close, so drop the baseline and per-episode state.
+            self.previous.pop(leader, None)
+            prefix = f'{leader}:'
+            for store in (self.stopped, self.entered, self.small_order_carry):
+                for key in [k for k in store if k.startswith(prefix)]:
+                    store.pop(key, None)
+            await self.cancel_pending_orders(leader=leader, reason='leader address changed')
+            self._save_state()
+            return True
 
     def _account_key(self, leader):
         return str(self.leaders[leader].get('execution_account') or '__default__')
@@ -60,6 +84,7 @@ class Engine:
             self.runtime_state['stopped'] = self.stopped
             self.runtime_state['entered'] = self.entered
             self.runtime_state['small_order_carry'] = self.small_order_carry
+            self.runtime_state['pending_orders'] = self.pending_orders
             self.runtime_state['risk'] = self.risk.state()
             self.state_store.save(self.runtime_state)
 
@@ -69,8 +94,72 @@ class Engine:
             self.stopped[key] = True
             self._save_state()
 
+    @staticmethod
+    def _pending_key(leader, symbol):
+        return f'{leader}:{symbol}'
+
+    @staticmethod
+    def _order_gone(exc):
+        message = str(exc).upper()
+        return any(token in message for token in (
+            'ORDER_NOT_FOUND', 'ORDER NOT FOUND', 'NOT_FOUND', 'NOT FOUND',
+            'UNKNOWN_ORDER', 'UNKNOWN ORDER', 'ALREADY FILLED', 'ALREADY CLOSED',
+            'NOT OPEN', 'DOES NOT EXIST', 'NO SUCH ORDER',
+        ))
+
+    def _track_pending(self, leader, symbol, order):
+        self.pending_orders[self._pending_key(leader, symbol)] = {
+            'id': str(order.id), 'leader': leader, 'symbol': symbol,
+            'side': order.side, 'amount': float(order.amount or 0),
+            'created_at': time.time(),
+        }
+        self._save_state()
+
+    async def _cancel_pending(self, leader, symbol, reason):
+        """Cancel one tracked limit entry; return True once it is off the book."""
+        key = self._pending_key(leader, symbol)
+        item = self.pending_orders.get(key)
+        if not item:
+            return False
+        order_id = item.get('id')
+        try:
+            await self.exchange.cancel_order(order_id, symbol)
+        except Exception as exc:
+            if not self._order_gone(exc):
+                log.warning('Failed to cancel pending order %s for %s (%s)', order_id, key, reason, exc_info=True)
+                return False
+            log.info('Pending order %s for %s is already gone (%s)', order_id, key, reason)
+        else:
+            log.info('Cancelled pending order %s for %s (%s)', order_id, key, reason)
+        self.pending_orders.pop(key, None)
+        self._save_state()
+        return True
+
+    async def cancel_pending_orders(self, leader=None, reason='cancelled'):
+        for item in list(self.pending_orders.values()):
+            if leader is not None and item.get('leader') != leader:
+                continue
+            await self._cancel_pending(item.get('leader'), item.get('symbol'), reason)
+
+    async def expire_pending_orders(self, now=None):
+        """Cancel late-entry limits that have stayed unfilled past their TTL."""
+        now = time.time() if now is None else now
+        async with self._lock:
+            for item in list(self.pending_orders.values()):
+                leader = item.get('leader')
+                symbol = item.get('symbol')
+                if not leader or not symbol:
+                    continue
+                cfg = self.leaders.get(leader) or {}
+                ttl = float(cfg.get('late_entry_ttl_seconds', 60) or 60)
+                age = now - float(item.get('created_at') or now)
+                if age >= ttl:
+                    await self._cancel_pending(
+                        leader, symbol, f'limit entry unfilled after {age:.0f}s (ttl {ttl:g}s)',
+                    )
+
     async def check_hard_stop(self):
-        """Check daily account drawdown and close exposure once if breached."""
+        """Check daily account drawdown and flatten exposure once per lock."""
         if not self.risk.config:
             return False
         equity = await self.exchange.equity()
@@ -79,19 +168,50 @@ class Engine:
         if self.state_store and (self._risk_state_saved != self.risk.state()):
             self._save_state()
             self._risk_state_saved = self.risk.state()
-        if hit and not locked_before:
-            log.critical('HARD STOP triggered equity=%g baseline=%g', equity, self.risk.baseline)
-            self.paused = True
-            try:
-                await self.exchange.close_all_positions()
-            finally:
-                if self.notifier:
-                    await self.notifier.notify_hard_stop(
-                        equity, self.risk.baseline,
-                        float(self.risk.baseline) - float(equity),
-                    )
-            return True
-        return hit
+        if not hit:
+            return False
+        self.paused = True
+        first_trigger = not locked_before
+        try:
+            # Serialize flattening with signal processing so an in-flight open
+            # order cannot land between cancellation and the close.
+            async with self._lock:
+                if self.risk.flattened:
+                    checker = getattr(self.exchange, 'has_open_positions', None)
+                    if not checker or not await checker():
+                        return True
+                    # A late fill or manual trade slipped through after
+                    # flattening; flatten again rather than leaving exposure.
+                    self.risk.flattened = False
+                    self._save_state()
+                log.critical('HARD STOP triggered equity=%g baseline=%g', equity, self.risk.baseline)
+                try:
+                    # Pending entry orders must be gone before flattening,
+                    # otherwise a fill can reopen exposure while locked.
+                    await self.cancel_pending_orders(reason='hard stop')
+                    cancel_all = getattr(self.exchange, 'cancel_all_orders', None)
+                    if cancel_all:
+                        await cancel_all()
+                except Exception:
+                    log.exception('HARD STOP order cancellation incomplete; flattening anyway')
+                try:
+                    await self.exchange.close_all_positions()
+                except Exception:
+                    # Keep ``flattened`` false so the next cycle retries.
+                    self.risk.flattened = False
+                    self._save_state()
+                    log.exception('HARD STOP flatten incomplete; retrying next cycle')
+                else:
+                    self.risk.flattened = True
+                    self._save_state()
+                    log.critical('HARD STOP flatten complete equity=%g', equity)
+        finally:
+            if first_trigger and self.notifier:
+                await self.notifier.notify_hard_stop(
+                    equity, self.risk.baseline,
+                    float(self.risk.baseline) - float(equity),
+                )
+        return True
 
     async def unlock_hard_stop(self):
         """Manually clear the hard-stop lock and rebaseline to current equity."""
@@ -129,6 +249,7 @@ class Engine:
             return
         live = await self.exchange.position_size(symbol)
         if abs(live) <= 1e-12:
+            await self._cancel_pending(leader, symbol, 'account position is flat')
             old = self.runtime_state.get('protection', {}).pop(key, None)
             if old:
                 try:
@@ -222,6 +343,10 @@ class Engine:
                         continue
                     live = await self.exchange.position_size(symbol)
                     if abs(live) <= 1e-12:
+                        if self.pending_orders.get(self._pending_key(leader, symbol)):
+                            # A late-entry limit is still working; a flat
+                            # account is expected and the owner must stay.
+                            continue
                         baseline = self.previous.get(leader, {}).get(symbol)
                         if (baseline is not None and abs(baseline.size) > 1e-12
                                 and self.entered.get(f'{leader}:{symbol}')):
@@ -291,8 +416,13 @@ class Engine:
                     if s.symbol in cfg.get('symbol_blacklist', []) or s.symbol + 'USDT' in cfg.get('symbol_blacklist', []):
                         await self._skip(leader, s, 'symbol is blacklisted')
                         continue
-                    if self.paused and s.kind in ('open', 'increase', 'close_reverse'):
-                        await self._skip(leader, s, 'new exposure is paused')
+                    if s.kind in ('decrease', 'close', 'close_reverse'):
+                        # The leader is leaving; an unfilled late-entry limit
+                        # would otherwise fill later as an orphan position.
+                        await self._cancel_pending(leader, s.symbol, f'{s.kind} signal from leader')
+                    if s.kind in ('open', 'increase', 'close_reverse') and (self.paused or self.risk.locked):
+                        reason = 'new exposure is paused' if self.paused else 'account is hard-stop locked'
+                        await self._skip(leader, s, reason)
                         continue
                     stopped_key = f'{leader}:{s.symbol}'
                     if stopped_key in self.stopped and s.kind in ('open', 'increase'):
@@ -308,6 +438,12 @@ class Engine:
                     elif s.kind in ('decrease', 'close') and self.owners.get(account_key) not in (None, leader):
                         await self._skip(leader, s, f'symbol is owned by leader {self.owners[account_key]}')
                         continue
+                    if s.kind == 'open' and self.pending_orders.get(self._pending_key(leader, s.symbol)):
+                        # A stale limit from an earlier episode is still live;
+                        # never place a second entry on top of it.
+                        if not await self._cancel_pending(leader, s.symbol, 'replaced by a new open signal'):
+                            await self._skip(leader, s, 'previous limit entry could not be cancelled')
+                            continue
                     live = await self.exchange.position_size(s.symbol)
                     if (s.kind in ('open', 'increase') and abs(live) > 1e-12
                             and not self.entered.get(stopped_key)):
@@ -403,6 +539,8 @@ class Engine:
                     if not reduce:
                         self._set_carry(leader, s.symbol)
                     log.info('ORDER RESULT leader=%s symbol=%s id=%s status=%s amount=%s', leader, s.symbol, order.id, order.status, order.amount)
+                    if typ == 'limit' and not reduce and order.status == 'open':
+                        self._track_pending(leader, s.symbol, order)
                     if order.status == 'closed' and order.amount:
                         if not reduce:
                             self.entered[stopped_key] = True

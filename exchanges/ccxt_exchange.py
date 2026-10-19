@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import ccxt.async_support as ccxt
 from decimal import Decimal
 import time
@@ -5,6 +7,8 @@ import time
 from core.models import Order
 from core.symbols import SymbolMap, normalize
 from .base import OrderQuantityTooSmall
+
+log = logging.getLogger(__name__)
 
 
 def _float(value, default=0.0):
@@ -441,17 +445,114 @@ class CcxtExchange:
         account = balance.get('USDT') or {}
         return float(account.get('total') or account.get('free') or 0)
 
-    async def close_all_positions(self):
-        """Market-close every open USDT perpetual position reduce-only."""
-        closed = 0
-        for position in await self.client.fetch_positions():
-            contracts = abs(float(position.get('contracts') or 0))
-            symbol = position.get('symbol')
-            if not symbol or contracts <= 0:
+    @staticmethod
+    def _order_gone(exc):
+        message = str(exc).upper()
+        return any(token in message for token in (
+            'ORDER_NOT_FOUND', 'ORDER NOT FOUND', 'NOT_FOUND', 'NOT FOUND',
+            'UNKNOWN_ORDER', 'UNKNOWN ORDER', 'ALREADY FILLED', 'ALREADY CLOSED',
+            'NOT OPEN', 'DOES NOT EXIST', 'NO SUCH ORDER',
+        ))
+
+    async def cancel_all_orders(self):
+        """Cancel every regular and conditional order on the account."""
+        canceled = 0
+        errors = []
+        try:
+            orders = await self.client.fetch_open_orders()
+        except Exception as exc:
+            orders = []
+            errors.append(exc)
+        for order in orders or []:
+            order_id = order.get('id')
+            if not order_id:
                 continue
-            side = 'sell' if str(position.get('side')).lower() == 'long' else 'buy'
-            await self.create_order(symbol, side, contracts, 'market', reduce_only=True)
-            closed += 1
+            try:
+                await self.client.cancel_order(order_id, order.get('symbol'))
+                canceled += 1
+            except Exception as exc:
+                if not self._order_gone(exc):
+                    errors.append(exc)
+        if self.name == 'gate':
+            # Gate keeps trigger/conditional orders outside fetch_open_orders.
+            try:
+                rows = await self.client.privateFuturesGetSettlePriceOrders({
+                    'settle': self.config.get('settle', 'usdt'), 'status': 'open',
+                })
+            except (AttributeError, ccxt.NotSupported):
+                rows = []
+            except Exception as exc:
+                rows = []
+                errors.append(exc)
+            for row in rows or []:
+                order_id = str(row.get('id_string') or row.get('id') or '')
+                if not order_id:
+                    continue
+                try:
+                    await self.cancel_protection(order_id, None)
+                    canceled += 1
+                except Exception as exc:
+                    if not self._order_gone(exc):
+                        errors.append(exc)
+        if errors:
+            raise RuntimeError(f'failed to cancel {len(errors)} order(s): {errors[0]}') from errors[0]
+        return canceled
+
+    async def has_open_positions(self):
+        return any(abs(float(position.get('contracts') or 0)) > 0
+                   for position in await self.client.fetch_positions())
+
+    async def close_all_positions(self, attempts=3):
+        """Cancel orders and market-close every open USDT perpetual position.
+
+        Retries the whole cancel/close cycle so a transient rejection or a
+        partially filled book cannot leave exposure open.  Raises if positions
+        remain, which lets the caller retry instead of recording a false
+        "flattened" state.
+        """
+        closed = 0
+        last_error = None
+        for attempt in range(attempts):
+            cancel_error = None
+            try:
+                await self.cancel_all_orders()
+            except Exception as exc:
+                cancel_error = exc
+                log.warning('Failed to cancel orders before flattening', exc_info=True)
+            positions = [position for position in await self.client.fetch_positions()
+                         if position.get('symbol') and abs(float(position.get('contracts') or 0)) > 0]
+            if not positions and cancel_error is None:
+                return closed
+            for position in positions:
+                symbol = position.get('symbol')
+                contracts = abs(float(position.get('contracts') or 0))
+                contract_size = float(
+                    position.get('contractSize')
+                    or self.client.markets.get(symbol, {}).get('contractSize')
+                    or 1
+                )
+                side = 'sell' if str(position.get('side')).lower() == 'long' else 'buy'
+                try:
+                    # create_order takes base-asset quantity and converts it to
+                    # contracts itself, so the position's contract count must
+                    # be multiplied by contractSize first.
+                    await self.create_order(
+                        symbol, side, contracts * contract_size, 'market', reduce_only=True,
+                    )
+                    closed += 1
+                except Exception as exc:
+                    last_error = exc
+                    log.warning('Failed to close %s (%g contracts)', symbol, contracts, exc_info=True)
+            if attempt < attempts - 1:
+                await asyncio.sleep(1)
+        remaining = [position for position in await self.client.fetch_positions()
+                     if position.get('symbol') and abs(float(position.get('contracts') or 0)) > 0]
+        if remaining:
+            raise RuntimeError(
+                'failed to flatten position(s): '
+                + ', '.join(str(position.get('symbol')) for position in remaining)
+            ) from last_error
+        await self.cancel_all_orders()
         return closed
 
     async def cancel_order(self, order_id, symbol=None):

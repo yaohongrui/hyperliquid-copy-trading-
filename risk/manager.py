@@ -15,9 +15,14 @@ class RiskManager:
         self.baseline = state.get("baseline")
         self.day = state.get("day")
         self.locked = bool(state.get("locked", False))
+        # ``locked`` means the day's loss limit was hit; ``flattened`` means the
+        # account was successfully closed out after that.  Keeping them apart
+        # lets a failed flatten retry without re-triggering the alert.
+        self.flattened = bool(state.get("flattened", False))
 
     def state(self):
-        return {"baseline": self.baseline, "day": self.day, "locked": self.locked}
+        return {"baseline": self.baseline, "day": self.day, "locked": self.locked,
+                "flattened": self.flattened}
 
     def evaluate(self, equity, now=None):
         now = now or datetime.now(timezone.utc)
@@ -26,6 +31,7 @@ class RiskManager:
             self.day = day
             self.baseline = float(equity)
             self.locked = False
+            self.flattened = False
             return False
         loss = float(self.baseline) - float(equity)
         hard = self.config.get("max_daily_loss_usdt")
@@ -34,6 +40,8 @@ class RiskManager:
             pct is not None and loss / max(float(self.baseline), 1e-9) * 100 >= float(pct)
         )
         if hit:
+            if not self.locked:
+                self.flattened = False
             self.locked = True
         return self.locked
 
@@ -47,6 +55,7 @@ class RiskManager:
         self.day = now.astimezone(timezone.utc).date().isoformat()
         self.baseline = float(equity)
         self.locked = False
+        self.flattened = False
         return self.state()
 
     def check(self, equity):

@@ -84,6 +84,8 @@ delta  = (交易员新仓位 - 交易员旧仓位) × ratio
 - `open`：默认市价；若 `late_entry_enabled: true` 且不是启动补仓，则挂限价单，价格为交易员入场价：
   - 买入：`entry × (1 - late_entry_offset_pct%)`
   - 卖出：`entry × (1 + late_entry_offset_pct%)`
+  - 限价单按 `leader:symbol` 跟踪，默认 60 秒未成交自动撤单（可用 `late_entry_ttl_seconds` 调整）。交易员发出 `decrease` / `close` / `close_reverse` 时也会立即撤掉对应挂单，避免成交后形成无人管理的孤儿仓位。
+  - 进程重启后未成交挂单仍会从 `state.json` 恢复跟踪并继续按 TTL 撤销。
 - `increase`：始终市价（延迟入场只作用于 `open`）。
 - `decrease` / `close`：reduce-only 市价。
 - Gate 的市价单会显式带 `IOC`；每次非 reduce-only 下单前会把该合约杠杆设置为配置值（不超过交易所上限），Gate 的 `margin_mode: crossed` 走全仓杠杆接口。
@@ -169,11 +171,12 @@ hard_stop:
 - 基线是 UTC 自然日第一次检查时的账户权益，保存在 `state.json`；跨 UTC 日后重置基线并解锁。
 - 每 5 秒检查一次。触发后：
   1. 设置 `paused = true`；
-  2. 市价 reduce-only 平掉账户所有永续仓位（包括非引擎建立的仓位）；
-  3. 当日保持 `locked`，不会重复触发平仓。
-  4. 通过 Telegram 推送 `HARD STOP TRIGGERED` 通知。
-- 手动解除：Telegram `/unlock_hard_stop`。会以当前权益重置当日基线、清除 `locked` 并恢复新开仓；否则旧基线会在下一次检查时立刻再次触发。
-- 注意：`paused` 只在内存中。进程重启后新开仓会恢复，即使风控仍处于当日 `locked` 状态；需要手动 `/pause` 或控制台暂停。跨日后 `locked` 自动解除，但 `paused` 仍需要手动恢复。
+  2. 撤销账户上所有普通挂单和条件单（包括延迟入场限价单），防止平仓后再次成交；
+  3. 市价 reduce-only 平掉账户所有永续仓位（包括非引擎建立的仓位）；逐个仓位处理，失败会重试直到账户为空；
+  4. 当日保持 `locked`；只有确认账户已空后才会记录 `flattened`，未完成平仓会持续重试。
+  5. 通过 Telegram 推送一次 `HARD STOP TRIGGERED` 通知。
+- 手动解除：Telegram `/unlock_hard_stop`。会以当前权益重置当日基线、清除 `locked` / `flattened` 并恢复新开仓；否则旧基线会在下一次检查时立刻再次触发。
+- `locked` 会持久化，且 `process()` 在 `paused` 或 `locked` 时都会拒绝 `open` / `increase` / `close_reverse`。因此进程重启后即使 `paused` 恢复为 `false`，当日锁定期间也不会再开新仓；跨日后 `locked` 自动解除。
 
 ### 暂停/恢复
 
@@ -266,6 +269,7 @@ leaders:
 | `symbol_blacklist` | 黑名单，匹配 HL 币名（如 `BTC`）或加 `USDT` 后缀（如 `BTCUSDT`） |
 | `late_entry_enabled` | 是否对 `open` 使用延迟限价入场 |
 | `late_entry_offset_pct` | 限价相对交易员入场价的偏移百分比，非负 |
+| `late_entry_ttl_seconds` | 延迟入场限价单的存活时间，默认 60 秒；超时自动撤单 |
 | `position_stop_loss.enabled` | 是否启用单仓止损 |
 | `position_stop_loss.max_loss_usdt` | 单仓最大亏损金额（USDT），必须大于 0 |
 
@@ -510,6 +514,8 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 - `late_entry_offset_pct >= 0`。
 - `position_stop_loss.max_loss_usdt > 0`。
 
+修改 `address` 时，引擎会清空该交易员的旧仓位基线（`previous`）、停止/成交/小单 carry 状态和未成交挂单，然后按启动流程重新拉取新地址的 REST 快照，并让 WebSocket 重新订阅新地址。旧地址的仓位不会被当成 `close` 误平。
+
 `symbol_blacklist` 只能通过 API 修改，控制台表单里没有输入框。
 
 ### API
@@ -616,13 +622,12 @@ tests/                  单元测试
 - **单执行账户**：一个进程只使用第一个启用交易员的 `execution_account` 创建交易所实例。所有启用的交易员应指向同一个账户。
 - **`enabled` 只在启动时生效**：启动时只加载 `enabled: true` 的交易员，控制台也只能看到这些交易员。运行中把某个交易员改成 `enabled: false` 不会停止它继续跟单，需要重启进程；启动时未启用的交易员无法从控制台启用。
 - **反手不处理**：`close_reverse` 永远跳过，旧仓保持不动，需要手动平仓后再等待下一次开仓信号。
-- **延迟入场限价单不会自动撤销**：引擎只管理单仓止损条件单，不跟踪/撤销普通挂单。未成交的限价单可能一直留在交易所，需要人工检查。
 - **关闭单仓止损不会撤销已存在的条件单**：把 `position_stop_loss.enabled` 改成 `false` 只是不再新建/对账，已经挂在交易所的止损单仍然有效，需要手动撤销或等仓位平掉。
-- **暂停状态不持久化**：重启后 `paused` 恢复为 `false`；账户硬止损的 `locked` 会持久化，但重启后不会自动恢复暂停状态。
+- **暂停状态不持久化**：重启后 `paused` 恢复为 `false`；账户硬止损的 `locked` 会持久化，且 `process()` 会同时检查 `locked`，因此重启后当日锁定仍然有效。
 - **控制台保存会重写 YAML**：通过控制台修改交易员参数会重新序列化整个 `config.yaml`，注释和手工排版会丢失；`${ENV}` 占位符会保留。
 - **symbol_map 需要重启**：它不在控制台可编辑字段中，修改后必须重启进程。
 - **控制台无鉴权**：暴露公网前请自行加 Basic Auth、VPN 或 IP 限制。`lead.env` 里的 `CONSOLE_USERNAME` / `CONSOLE_PASSWORD` 当前代码没有使用。
-- **地址修改**：控制台可以改交易员地址，REST 展示会立即使用新地址；WebSocket 订阅列表在下次重连时才会更新。
+- **地址修改**：控制台可以改交易员地址。修改后引擎会重置该交易员的仓位基线、撤销旧挂单、立即用新地址拉取 REST 快照，并触发 WebSocket 重新订阅；不需要重启进程。
 - **未使用字段**：`hyperliquid.addresses`、`leaders[].source`、`console.domain` 当前不影响运行。
 - **启动仓位查询失败会直接退出**：`prepare_startup` 故意让异常向上抛出，避免把未知账户状态当成零仓位处理。
 - **账户硬止损会平掉所有仓位**：包括非引擎建立的手动仓位。

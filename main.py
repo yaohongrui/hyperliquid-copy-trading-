@@ -184,6 +184,7 @@ async def _reconcile_protections(engine, stop, interval=5):
         try:
             await engine.check_hard_stop()
             await engine.reconcile_protections()
+            await engine.expire_pending_orders()
         except Exception:
             log.exception("Protection reconciliation failed")
         try:

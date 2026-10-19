@@ -7,7 +7,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from sources.position_queries import _number, _roi, leader_snapshot
+from sources.position_queries import _address, _number, _roi, leader_snapshot
 from core.symbols import SymbolMap
 
 log = logging.getLogger(__name__)
@@ -352,9 +352,18 @@ class ConsoleService:
         except (TypeError, ValueError) as exc:
             raise web.HTTPBadRequest(text=str(exc))
         self.engine.config_manager.update_leader(name, changes)
-        await self.engine.update_leader_config(name, changes)
-        if self.leader_stream and "address" in changes:
-            self.leader_stream.addresses = [str(item.get("address")) for item in self.engine.leaders.values()]
+        address_changed = await self.engine.update_leader_config(name, changes)
+        if address_changed:
+            if self.leader_stream:
+                await self.leader_stream.set_addresses(
+                    [_address(item.get("address")) for item in self.engine.leaders.values()]
+                )
+            # Seed the new address immediately so the first WS event is diffed
+            # against the new leader's real positions, not an empty baseline.
+            try:
+                await self.engine.process(name, await leader_snapshot(self.engine.leaders[name]))
+            except Exception:
+                log.exception("Initial snapshot after address change failed for %s", name)
         self.store.audit("leader.update", {"leader": name, "fields": list(changes)})
         return web.json_response({"ok": True, "leader": self.engine.leaders[name]})
 
