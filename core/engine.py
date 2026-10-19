@@ -16,6 +16,7 @@ class Engine:
         self.state = account_state
         self.notifier = notifier
         self.previous = {}
+        self.previous_at = {}
         self.paused = False
         self._lock = asyncio.Lock()
         self.state_store = state_store
@@ -64,6 +65,7 @@ class Engine:
             # against the old address's positions would turn every old coin
             # into a false close, so drop the baseline and per-episode state.
             self.previous.pop(leader, None)
+            self.previous_at.pop(leader, None)
             prefix = f'{leader}:'
             for store in (self.stopped, self.entered, self.small_order_carry):
                 for key in [k for k in store if k.startswith(prefix)]:
@@ -392,6 +394,7 @@ class Engine:
             startup = leader not in self.previous
             signals = diff_positions(leader, self.previous.get(leader, {}), positions, ratio)
             self.previous[leader] = positions
+            self.previous_at[leader] = time.time()
             # A stop-out suppression ends once the leader itself is flat; the
             # next open is then a genuinely new episode worth copying.
             for key in [k for k in self.stopped if k.startswith(f'{leader}:')]:

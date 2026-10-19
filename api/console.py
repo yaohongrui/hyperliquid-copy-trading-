@@ -5,6 +5,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
 
 from sources.position_queries import _address, _number, _roi, leader_snapshot
@@ -251,6 +252,9 @@ class ConsoleService:
         self._snapshot = {"updated_at": 0, "leaders": [], "accounts": [], "status": {}}
         self._subscribers = set()
         self._task = None
+        console_config = (config or {}).get("console") or {}
+        self._last_rest = 0.0
+        self._rest_interval = max(10.0, float(console_config.get("leader_rest_seconds", 60)))
 
     def install(self, app):
         app.router.add_get("/api/v1/dashboard", self.dashboard)
@@ -405,6 +409,36 @@ class ConsoleService:
             result.append(annotated)
         return result
 
+    async def _refresh_leader_fallback(self):
+        """Feed a REST leader snapshot to the engine at a low fixed rate.
+
+        The websocket is change-driven and can go silent without disconnecting,
+        so this doubles as a stale-subscription fallback.  It stays far below
+        the 3-second display cadence because Hyperliquid allows 1200 weight per
+        minute per IP and the websocket resync shares that budget.
+        """
+        now = time.time()
+        if now - self._last_rest < self._rest_interval:
+            return
+        self._last_rest = now
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for name, cfg in self.engine.leaders.items():
+                started = time.time()
+                try:
+                    snapshot = await leader_snapshot(cfg, session)
+                except Exception as exc:
+                    log.warning("Leader REST fallback failed for %s: %s", name, exc)
+                    continue
+                # A websocket event may have landed while the REST call was in
+                # flight; processing the older snapshot would diff backwards.
+                if getattr(self.engine, "previous_at", {}).get(name, 0) >= started:
+                    continue
+                try:
+                    await self.engine.process(name, snapshot)
+                except Exception:
+                    log.exception("Leader REST fallback processing failed for %s", name)
+
     async def refresh_loop(self):
         while True:
             try:
@@ -414,13 +448,15 @@ class ConsoleService:
             await asyncio.sleep(3)
 
     async def refresh(self):
+        await self._refresh_leader_fallback()
         leaders = []
+        previous = getattr(self.engine, "previous", {})
         for name, cfg in self.engine.leaders.items():
-            try:
-                positions = await leader_snapshot(cfg)
+            positions = previous.get(name)
+            if positions is None:
+                rows = [{"error": "awaiting leader state"}]
+            else:
                 rows = [self._position_dict(p) for p in positions.values()]
-            except Exception as exc:
-                rows = [{"error": type(exc).__name__}]
             leaders.append({"name": name, "address": str(cfg.get("address", "")), "config": cfg, "positions": rows})
         account_rows, orders, equity, balance, unrealized = [], [], 0.0, 0.0, 0.0
         exchange = self.engine.exchange

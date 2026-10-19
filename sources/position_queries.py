@@ -1,6 +1,15 @@
+import asyncio
+import time
+
 import aiohttp
 import ccxt.async_support as ccxt
 from core.models import Position
+
+# The dex list only changes when a HIP-3 deployment is added, so a per-process
+# cache keeps the 20-weight ``perpDexs`` probe off the hot path.  The console
+# and the websocket resync share one IP quota, so every avoided call matters.
+_PERP_DEX_TTL = 300.0
+_perp_dex_cache = {"at": 0.0, "values": [None]}
 
 
 def _number(value):
@@ -67,11 +76,13 @@ def _table(rows, include_leverage=True):
     lines.extend(" | ".join(row) for row in rows)
     return "\n".join(lines)
 
-async def leader_snapshot(config):
+async def leader_snapshot(config, session=None):
+    if session is None:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as owned:
+            return await leader_snapshot(config, owned)
     address = _address(config.get("address"))
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        states = await _leader_states(session, address)
+    states = await _leader_states(session, address)
     state = {"assetPositions": [row for item in states for row in item.get("assetPositions", [])]}
     result = {}
     for row in state.get("assetPositions") or []:
@@ -83,8 +94,11 @@ async def leader_snapshot(config):
     return result
 
 
-async def _leader_states(session, address):
-    """Fetch the default perp dex and all HIP-3 perp dexes."""
+async def _perp_dexes(session):
+    """Return the default dex plus every HIP-3 dex, cached for five minutes."""
+    now = time.monotonic()
+    if _perp_dex_cache["at"] and now - _perp_dex_cache["at"] < _PERP_DEX_TTL:
+        return _perp_dex_cache["values"]
     dexes = [None]
     try:
         async with session.post("https://api.hyperliquid.xyz/info", json={"type": "perpDexs"}) as response:
@@ -95,16 +109,28 @@ async def _leader_states(session, address):
                     if dex:
                         dexes.append(dex)
     except Exception:
-        pass
-    states = []
-    for dex in dict.fromkeys(dexes):
+        # A transient failure must not hide the last known dex list; retry on
+        # the next call rather than caching the degraded result.
+        return _perp_dex_cache["values"]
+    values = list(dict.fromkeys(dexes))
+    _perp_dex_cache["values"] = values
+    _perp_dex_cache["at"] = now
+    return values
+
+
+async def _leader_states(session, address):
+    """Fetch the default perp dex and all HIP-3 perp dexes."""
+    dexes = await _perp_dexes(session)
+
+    async def fetch(dex):
         payload = {"type": "clearinghouseState", "user": address}
         if dex:
             payload["dex"] = dex
         async with session.post("https://api.hyperliquid.xyz/info", json=payload) as response:
             response.raise_for_status()
-            states.append(await response.json())
-    return states
+            return await response.json()
+
+    return await asyncio.gather(*(fetch(dex) for dex in dexes))
 
 
 async def leader_positions(leaders):
