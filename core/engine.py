@@ -561,13 +561,14 @@ class Engine:
                     carry_amount = float(carry.get('amount') or 0)
                     if reduce:
                         carry_reducing = (carry.get('side') == 'buy' and s.delta < 0) or (carry.get('side') == 'sell' and s.delta > 0)
+                        carry_consumed = 0.0
                         if carry_amount and s.kind == 'decrease' and carry_reducing:
                             remaining = max(0, carry_amount - abs(s.delta))
                             self._set_carry(leader, s.symbol, carry.get('side'), remaining)
                             if abs(s.delta) <= carry_amount:
                                 await self._skip(leader, s, 'reduction absorbed by unfilled small increases')
                                 continue
-                            s = replace(s, delta=(abs(s.delta) - carry_amount) * (1 if s.delta > 0 else -1))
+                            carry_consumed = carry_amount
                         elif carry_amount:
                             self._set_carry(leader, s.symbol)
                         if not live or live * s.delta >= 0:
@@ -582,7 +583,22 @@ class Engine:
                                 await self._release_if_flat(leader, s.symbol)
                             await self._skip(leader, s, 'no matching account position to reduce')
                             continue
-                        amount = abs(live) if s.kind == 'close' else min(abs(live), abs(s.delta))
+                        if s.kind == 'close':
+                            amount = abs(live)
+                        else:
+                            # Reduce the same fraction of our live position
+                            # that the leader closed.  A ratio-scaled absolute
+                            # delta drifts whenever equity (and therefore
+                            # ratio) moved since the position was opened.
+                            old_position = previous.get(s.symbol)
+                            new_position = positions.get(s.symbol)
+                            old_size = abs(old_position.size) if old_position else 0.0
+                            new_size = abs(new_position.size) if new_position else 0.0
+                            if old_size > 1e-12:
+                                amount = abs(live) * max(0.0, old_size - new_size) / old_size
+                            else:
+                                amount = abs(s.delta)
+                            amount = min(abs(live), max(0.0, amount - carry_consumed))
                     else:
                         amount = abs(s.delta)
                     side = 'buy' if s.delta > 0 else 'sell'
