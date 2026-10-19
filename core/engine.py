@@ -19,6 +19,7 @@ class Engine:
         self.previous_at = {}
         self.paused = False
         self._lock = asyncio.Lock()
+        self._protection_lock = asyncio.Lock()
         self.state_store = state_store
         self.symbol_map = symbol_map if isinstance(symbol_map, SymbolMap) else SymbolMap(symbol_map)
         self.config_manager = None
@@ -245,11 +246,12 @@ class Engine:
             self._save_state()
         return True, leader
 
-    async def _release_if_flat(self, leader, symbol):
+    async def _release_if_flat(self, leader, symbol, live=None):
         key = self._owner_key(leader, symbol)
         if self.owners.get(key) != leader:
             return
-        live = await self.exchange.position_size(symbol)
+        if live is None:
+            live = await self.exchange.position_size(symbol)
         if abs(live) <= 1e-12:
             await self._cancel_pending(leader, symbol, 'account position is flat')
             old = self.runtime_state.get('protection', {}).pop(key, None)
@@ -279,11 +281,16 @@ class Engine:
         # State files written by older versions contain the id directly.
         return value.get('id') if isinstance(value, dict) else value
 
-    async def _sync_protection(self, leader, symbol):
+    async def _sync_protection(self, leader, symbol, detail=None):
         cfg = self.leaders[leader].get('position_stop_loss') or {}
         if not cfg.get('enabled') or cfg.get('max_loss_usdt') is None:
             return
-        detail = await self.exchange.fetch_position_detail(symbol)
+        async with self._protection_lock:
+            await self._sync_protection_locked(leader, symbol, cfg, detail)
+
+    async def _sync_protection_locked(self, leader, symbol, cfg, detail):
+        if detail is None:
+            detail = await self.exchange.fetch_position_detail(symbol)
         if not detail:
             return
         contracts = abs(float(detail.get('contracts') or 0))
@@ -311,12 +318,14 @@ class Engine:
         old_id = self._protection_id(old)
         old_contracts = float(old.get('contracts') or 0) if isinstance(old, dict) else 0
         old_trigger = float(old.get('trigger') or 0) if isinstance(old, dict) else 0
-        if hasattr(self.exchange, 'cancel_protection_orders'):
-            await self.exchange.cancel_protection_orders(symbol, old_id)
         # Do not churn orders on every reconciliation tick.  Recreate only
         # when the live position or its loss-based trigger has changed.
         if old_id and old_contracts and old_trigger and abs(old_contracts - contracts) <= 1e-12 and abs(old_trigger - trigger) <= max(abs(trigger), 1) * 1e-10:
             return
+        # Cleaning duplicates costs a full conditional-order listing on Gate, so
+        # only do it when we are about to replace the protection order.
+        if hasattr(self.exchange, 'cancel_protection_orders'):
+            await self.exchange.cancel_protection_orders(symbol, old_id)
         if old_id and hasattr(self.exchange, 'cancel_protection'):
             try:
                 await self.exchange.cancel_protection(old_id, symbol)
@@ -325,11 +334,26 @@ class Engine:
                 # Treat an unknown old id as already removed and continue.
                 log.info('Protection %s for %s is already gone; replacing it', old_id, symbol)
         oid = await self.exchange.set_protection(symbol, 'sell' if side == 'long' else 'buy', contracts, trigger)
-        if self.state_store:
-            self.runtime_state.setdefault('protection', {})[key] = {
-                'id': oid, 'contracts': contracts, 'trigger': trigger,
-            }
-            self._save_state()
+        self.runtime_state.setdefault('protection', {})[key] = {
+            'id': oid, 'contracts': contracts, 'trigger': trigger,
+        }
+        self._save_state()
+
+    @staticmethod
+    def _detail_size(detail):
+        if not detail:
+            return 0.0
+        contracts = abs(float(detail.get('contracts') or 0))
+        size = contracts * abs(float(detail.get('contractSize') or 1))
+        return -size if str(detail.get('side') or '').lower() == 'short' else size
+
+    async def _position_probe(self, symbol):
+        """Return (signed size, detail) with one REST call for open positions."""
+        fetcher = getattr(self.exchange, 'fetch_position_detail', None)
+        detail = await fetcher(symbol) if fetcher else None
+        if detail is not None:
+            return self._detail_size(detail), detail
+        return await self.exchange.position_size(symbol), None
 
     async def reconcile_protections(self):
         """Reconcile exchange positions with locally tracked protection orders.
@@ -338,12 +362,30 @@ class Engine:
         leader signal and therefore never pass through ``process``.
         """
         async with self._lock:
+            items = []
             for key, leader in list(self.owners.items()):
+                symbol = key.split(':', 1)[1]
+                if self.symbol_map.is_skipped(symbol):
+                    continue
+                items.append((key, leader, symbol))
+            # Probe concurrently so reconciliation time does not grow with the
+            # number of owned positions while the signal lock is held.
+            probes = await asyncio.gather(
+                *(self._position_probe(symbol) for _, _, symbol in items),
+                return_exceptions=True,
+            )
+            for (key, leader, symbol), probe in zip(items, probes):
                 try:
-                    symbol = key.split(':', 1)[1]
-                    if self.symbol_map.is_skipped(symbol):
+                    if isinstance(probe, Exception):
+                        if isinstance(probe, ValueError) and str(probe).startswith('No USDT perpetual market'):
+                            self.runtime_state.get('protection', {}).pop(key, None)
+                            self.owners.pop(key, None)
+                            self._save_state()
+                            log.warning('Dropped protection state for unsupported market %s', symbol)
+                        else:
+                            log.warning('Protection reconciliation failed for %s: %s', key, probe)
                         continue
-                    live = await self.exchange.position_size(symbol)
+                    live, detail = probe
                     if abs(live) <= 1e-12:
                         if self.pending_orders.get(self._pending_key(leader, symbol)):
                             # A late-entry limit is still working; a flat
@@ -355,20 +397,12 @@ class Engine:
                             # The account is flat but the leader still holds:
                             # our side was stopped or closed manually.
                             self._mark_stopped(leader, symbol)
-                        await self._release_if_flat(leader, symbol)
+                        await self._release_if_flat(leader, symbol, live=live)
                     else:
                         if not self.entered.get(f'{leader}:{symbol}'):
                             self.entered[f'{leader}:{symbol}'] = True
                             self._save_state()
-                        await self._sync_protection(leader, symbol)
-                except ValueError as exc:
-                    if str(exc).startswith('No USDT perpetual market'):
-                        self.runtime_state.get('protection', {}).pop(key, None)
-                        self.owners.pop(key, None)
-                        self._save_state()
-                        log.warning('Dropped protection state for unsupported market %s', symbol)
-                    else:
-                        log.warning('Protection reconciliation failed for %s', key, exc_info=True)
+                        await self._sync_protection(leader, symbol, detail=detail)
                 except Exception:
                     log.warning('Protection reconciliation failed for %s', key, exc_info=True)
 
@@ -382,14 +416,19 @@ class Engine:
             await self.notifier.notify_skipped(leader, signal, reason)
 
     async def process(self, leader, positions):
+        protect = []
         async with self._lock:
             cfg = self.leaders[leader]
             denominator = float(cfg['total_margin'])
             if denominator <= 0:
                 raise ValueError('total_margin must be positive')
-            equity = await self.exchange.equity()
             budget = self.exchange.config.get('fixed_balance_usdt')
-            budget = equity if budget is None else float(budget)
+            equity = None
+            if budget is None:
+                equity = await self.exchange.equity()
+                budget = equity
+            else:
+                budget = float(budget)
             ratio = budget / denominator * float(cfg.get('coefficient', 1))
             startup = leader not in self.previous
             signals = diff_positions(leader, self.previous.get(leader, {}), positions, ratio)
@@ -408,7 +447,7 @@ class Engine:
                     if key.startswith(f'{leader}:') and key[len(leader) + 1:] not in positions:
                         self.small_order_carry.pop(key)
                         self._save_state()
-                log.info('STARTUP leader=%s equity=%g sizing_balance=%g total_margin=%g ratio=%g positions=%d', leader, equity, budget, denominator, ratio, len(positions))
+                log.info('STARTUP leader=%s equity=%s sizing_balance=%g total_margin=%g ratio=%g positions=%d', leader, 'fixed' if equity is None else f'{equity:g}', budget, denominator, ratio, len(positions))
             for s in signals:
                 try:
                     if self.symbol_map.is_skipped(s.symbol):
@@ -561,9 +600,16 @@ class Engine:
                     if reduce:
                         await self._release_if_flat(leader, s.symbol)
                     elif order.status == 'closed':
-                        await self._sync_protection(leader, s.symbol)
+                        protect.append((leader, s.symbol))
                 except Exception as exc:
                     log.exception('Order processing failed: %s %s', leader, s.symbol)
                     if self.notifier:
                         await self.notifier.notify_failed(leader, s, exc)
-            return signals
+        # Protection setup is several REST calls; run it after releasing the
+        # signal lock so the next leader event is not queued behind it.
+        for protect_leader, protect_symbol in protect:
+            try:
+                await self._sync_protection(protect_leader, protect_symbol)
+            except Exception:
+                log.warning('Protection setup failed for %s %s', protect_leader, protect_symbol, exc_info=True)
+        return signals

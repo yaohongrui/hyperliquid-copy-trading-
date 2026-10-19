@@ -44,6 +44,9 @@ class CcxtExchange:
             },
         })
         self._markets_loaded = False
+        # set_leverage is a signed REST call; the configured leverage is
+        # static, so only send it when the market's cached value changes.
+        self._leverage_set = {}
 
     async def start(self):
         await self.client.load_markets()
@@ -124,10 +127,12 @@ class CcxtExchange:
         if leverage and not reduce_only:
             maximum = self.client.markets[market].get('limits', {}).get('leverage', {}).get('max')
             effective = min(int(leverage), int(maximum)) if maximum else int(leverage)
-            if self.name == 'gate' and self.config.get('margin_mode') in ('cross', 'crossed'):
-                await self.client.set_leverage(0, market, {'cross_leverage_limit': effective})
-            else:
-                await self.client.set_leverage(effective, market)
+            if self._leverage_set.get(market) != effective:
+                if self.name == 'gate' and self.config.get('margin_mode') in ('cross', 'crossed'):
+                    await self.client.set_leverage(0, market, {'cross_leverage_limit': effective})
+                else:
+                    await self.client.set_leverage(effective, market)
+                self._leverage_set[market] = effective
         try:
             result = await self.client.create_order(market, order_type, side, contracts, price, params)
         except ccxt.InvalidOrder as exc:
