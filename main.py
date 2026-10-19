@@ -1,4 +1,4 @@
-import argparse, asyncio, logging
+import argparse, asyncio, logging, time
 from functools import partial
 from aiohttp import web
 from api.app import create_app
@@ -98,7 +98,10 @@ async def main(path):
             log.info("Initial leader snapshot processed for %s", name)
         except Exception:
             log.exception("Initial leader snapshot failed for %s", name)
-    ws_task = asyncio.create_task(_consume_leaders(ws, engine, leaders), name="hyperliquid-ws")
+    ws_task = asyncio.create_task(
+        _consume_leaders(ws, engine, leaders, (c.get("hyperliquid") or {}).get("silence_seconds", 120)),
+        name="hyperliquid-ws",
+    )
     protection_task = asyncio.create_task(_reconcile_protections(engine, stop), name="protection-reconciler")
     api_runner = web.AppRunner(create_app(telegram, console))
     await api_runner.setup()
@@ -131,51 +134,74 @@ def _seed_entered(engine, store):
     engine._save_state()
 
 
-async def _consume_leaders(source, engine, leaders):
-    async for event in source.stream():
-        log.debug("HL event channel=%s", event.get("channel"))
-        if event.get("channel") == "resync":
-            # Websocket (re)connected: closes that fired during an outage are
-            # never replayed, so re-seed every leader from a REST snapshot.
-            for name, cfg in leaders.items():
+async def _consume_leaders(source, engine, leaders, silence_seconds=120):
+    # The subscription is change-driven, so a healthy socket can be quiet for a
+    # long time.  The watchdog only surfaces a silence long enough that a dead
+    # subscription is more likely than idle leaders; the console's low-rate
+    # REST fallback keeps engine state correct either way.
+    watch = {"last_event": time.monotonic()}
+    watchdog = asyncio.create_task(_ws_watchdog(watch, float(silence_seconds)), name="hyperliquid-watchdog")
+    try:
+        async for event in source.stream():
+            watch["last_event"] = time.monotonic()
+            log.debug("HL event channel=%s", event.get("channel"))
+            if event.get("channel") == "resync":
+                # Websocket (re)connected: closes that fired during an outage are
+                # never replayed, so re-seed every leader from a REST snapshot.
+                for name, cfg in leaders.items():
+                    try:
+                        await engine.process(name, await leader_snapshot(cfg))
+                    except Exception:
+                        log.exception("Leader snapshot resync failed for %s", name)
+                continue
+            if event.get("channel") != "allDexsClearinghouseState":
+                continue
+            data = event.get("data") or {}
+            address = str(data.get("user", "")).lower()
+            address_map = {_address(item.get("address")).lower(): name for name, item in leaders.items()}
+            leader = address_map.get(address)
+            if not leader:
+                log.warning("HL event for unknown leader address %s", address)
+                continue
+            positions = {}
+            if "clearinghouseStates" not in data:
+                log.error("Invalid HL snapshot: missing clearinghouseStates")
+                continue
+            for row in [row for _, state in data["clearinghouseStates"] for row in state.get("assetPositions", [])]:
+                position = row.get("position") or row
                 try:
-                    await engine.process(name, await leader_snapshot(cfg))
-                except Exception:
-                    log.exception("Leader snapshot resync failed for %s", name)
-            continue
-        if event.get("channel") != "allDexsClearinghouseState":
-            continue
-        data = event.get("data") or {}
-        address = str(data.get("user", "")).lower()
-        address_map = {_address(item.get("address")).lower(): name for name, item in leaders.items()}
-        leader = address_map.get(address)
-        if not leader:
-            log.warning("HL event for unknown leader address %s", address)
-            continue
-        positions = {}
-        if "clearinghouseStates" not in data:
-            log.error("Invalid HL snapshot: missing clearinghouseStates")
-            continue
-        for row in [row for _, state in data["clearinghouseStates"] for row in state.get("assetPositions", [])]:
-            position = row.get("position") or row
+                    size = float(position.get("szi", 0))
+                except (TypeError, ValueError):
+                    continue
+                if not size:
+                    continue
+                coin = str(position.get("coin", "")).upper()
+                positions[coin] = __import__("core.models", fromlist=["Position"]).Position(
+                    coin, size, float(position.get("entryPx") or 0),
+                    float(position.get("markPx") or float(position.get("positionValue") or 0) / abs(size)), float(position.get("unrealizedPnl") or 0),
+                    float((position.get("leverage") or {}).get("value", 1)) if isinstance(position.get("leverage"), dict) else 1,
+                )
             try:
-                size = float(position.get("szi", 0))
-            except (TypeError, ValueError):
-                continue
-            if not size:
-                continue
-            coin = str(position.get("coin", "")).upper()
-            positions[coin] = __import__("core.models", fromlist=["Position"]).Position(
-                coin, size, float(position.get("entryPx") or 0),
-                float(position.get("markPx") or float(position.get("positionValue") or 0) / abs(size)), float(position.get("unrealizedPnl") or 0),
-                float((position.get("leverage") or {}).get("value", 1)) if isinstance(position.get("leverage"), dict) else 1,
-            )
-        try:
-            signals = await engine.process(leader, positions)
-            if signals:
-                log.info("Leader %s produced %d signal(s): %s", leader, len(signals), ", ".join(f"{s.kind} {s.symbol} {s.delta:g}" for s in signals))
-        except Exception:
-            log.exception("Leader event processing failed for %s", leader)
+                signals = await engine.process(leader, positions)
+                if signals:
+                    log.info("Leader %s produced %d signal(s): %s", leader, len(signals), ", ".join(f"{s.kind} {s.symbol} {s.delta:g}" for s in signals))
+            except Exception:
+                log.exception("Leader event processing failed for %s", leader)
+    finally:
+        watchdog.cancel()
+        await asyncio.gather(watchdog, return_exceptions=True)
+
+
+async def _ws_watchdog(watch, silence_seconds, interval=15):
+    warned = False
+    while True:
+        await asyncio.sleep(interval)
+        silent = time.monotonic() - watch["last_event"]
+        if silent < silence_seconds:
+            warned = False
+        elif not warned:
+            log.warning("HL websocket delivered no events for %.0fs (threshold %.0fs); REST fallback is maintaining leader state", silent, silence_seconds)
+            warned = True
 
 
 async def _reconcile_protections(engine, stop, interval=5):
