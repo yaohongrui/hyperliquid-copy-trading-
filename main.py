@@ -150,7 +150,7 @@ async def _consume_leaders(source, engine, leaders, silence_seconds=120):
                 # never replayed, so re-seed every leader from a REST snapshot.
                 for name, cfg in leaders.items():
                     try:
-                        await engine.process(name, await leader_snapshot(cfg))
+                        await engine.process(name, await leader_snapshot(cfg), resync=True)
                     except Exception:
                         log.exception("Leader snapshot resync failed for %s", name)
                 continue

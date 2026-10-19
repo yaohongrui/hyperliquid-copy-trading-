@@ -419,7 +419,18 @@ class Engine:
         if self.notifier:
             await self.notifier.notify_skipped(leader, signal, reason)
 
-    async def process(self, leader, positions):
+    async def _unfavorable_entry(self, signal, target, positions):
+        """Return a description when the market is worse than the leader entry."""
+        current = await self.exchange.entry_quote(signal.symbol, 'buy' if target > 0 else 'sell')
+        position = positions.get(signal.symbol)
+        entry = position.entry_price if position else 0
+        if entry <= 0 or current <= 0:
+            raise ValueError('entry price unavailable')
+        if (target > 0 and current > entry) or (target < 0 and current < entry):
+            return f'market={current:g}, leader entry={entry:g}, target={target:g}'
+        return None
+
+    async def process(self, leader, positions, resync=False):
         protect = []
         async with self._lock:
             cfg = self.leaders[leader]
@@ -529,12 +540,18 @@ class Engine:
                             await self._skip(leader, s, 'account position already meets target')
                             continue
                         s = replace(s, delta=gap if target > 0 else -gap)
-                        current = await self.exchange.entry_quote(s.symbol, 'buy' if target > 0 else 'sell')
-                        entry = positions[s.symbol].entry_price
-                        if entry <= 0 or current <= 0:
-                            raise ValueError('startup price unavailable')
-                        if (target > 0 and current > entry) or (target < 0 and current < entry):
-                            await self._skip(leader, s, f'startup price unfavorable: market={current:g}, leader entry={entry:g}, target={target:g}, current position={live:g}')
+                        reason = await self._unfavorable_entry(s, target, positions)
+                        if reason:
+                            await self._skip(leader, s, f'startup price unfavorable: {reason}, current position={live:g}')
+                            continue
+                    elif resync and s.kind in ('open', 'increase'):
+                        # A position discovered by the reconnect snapshot was
+                        # not seen as a live signal, so the market may already
+                        # be far past the leader's entry.  Apply the same
+                        # "no worse than entry" rule as the startup sync.
+                        reason = await self._unfavorable_entry(s, s.target_size, positions)
+                        if reason:
+                            await self._skip(leader, s, f'resync price unfavorable: {reason}')
                             continue
                     if s.kind == 'close_reverse':
                         await self._skip(leader, s, 'reversal requires reconciliation; automatic reversal disabled')
