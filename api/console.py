@@ -480,7 +480,7 @@ class ConsoleService:
             try:
                 await self.refresh()
             except Exception:
-                pass
+                log.warning("Console refresh failed", exc_info=True)
             await asyncio.sleep(3)
 
     async def refresh(self):
