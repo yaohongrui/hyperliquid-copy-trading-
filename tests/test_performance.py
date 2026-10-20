@@ -217,3 +217,37 @@ def test_legacy_fee_only_rows_are_purged_on_open(tmp_path):
     ConsoleStore(path)  # re-open runs the purge
     remaining = [row[0] for row in sqlite3.connect(path).execute("SELECT exchange_trade_id FROM trades")]
     assert remaining == ["gate:real"]
+
+
+def test_snapshot_retention_prunes_only_old_rows(tmp_path):
+    store = ConsoleStore(tmp_path / "console.sqlite3")
+    now = time.time()
+    with sqlite3.connect(store.path) as db:
+        db.execute("INSERT INTO equity_snapshots(account,equity,unrealized_pnl,created_at) VALUES(?,?,?,?)",
+                   ("gate", 1, 0, now - 100 * 86400))
+    store.snapshot("gate", 2, 0)
+    assert store.prune(retention_days=90, now=now) == 1
+    assert [row["equity"] for row in store.snapshots("gate")] == [2]
+
+
+def test_gate_ledger_incremental_uses_watermark():
+    import asyncio
+    from exchanges.ccxt_exchange import CcxtExchange
+
+    exchange = CcxtExchange.__new__(CcxtExchange)
+    exchange.config = {"settle": "usdt"}
+    calls = []
+
+    class Client:
+        markets = {"SKHY/USDT:USDT": {"id": "SKHY_USDT", "swap": True}}
+
+        async def privateFuturesGetSettleAccountBook(self, params):
+            calls.append(dict(params))
+            return [{"type": "pnl", "change": "1", "text": "SKHY_USDT:1", "time": 1792272473.98}]
+
+    exchange.client = Client()
+    asyncio.run(exchange._gate_ledger_rows())
+    asyncio.run(exchange._gate_ledger_rows())
+    assert "from" not in calls[0]
+    # Second call only asks for the recent overlap, not the full history.
+    assert calls[1]["from"] == 1792272473 - 300

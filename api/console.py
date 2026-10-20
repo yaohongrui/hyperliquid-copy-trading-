@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -19,7 +20,11 @@ class ConsoleStore:
         self.path = Path(path)
         self.symbol_map = symbol_map if isinstance(symbol_map, SymbolMap) else SymbolMap(symbol_map)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as db:
+        # One connection per worker thread: store calls run through
+        # asyncio.to_thread, and opening a fresh connection per call was
+        # holding the event loop while SQLite touched disk.
+        self._local = threading.local()
+        with self._connection() as db:
             db.executescript("""
             CREATE TABLE IF NOT EXISTS equity_snapshots (
               id INTEGER PRIMARY KEY, account TEXT, equity REAL, unrealized_pnl REAL, created_at REAL
@@ -60,13 +65,25 @@ class ConsoleStore:
             # than double-count them.
             db.execute("DELETE FROM trades WHERE source = 'position_close'")
 
+    def _connection(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, timeout=5.0)
+            # WAL lets the request handlers read while a background write is in
+            # flight; busy_timeout waits out the brief writer serialization.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._local.conn = conn
+        return conn
+
     def snapshot(self, account, equity, unrealized):
-        with sqlite3.connect(self.path) as db:
+        with self._connection() as db:
             db.execute("INSERT INTO equity_snapshots(account,equity,unrealized_pnl,created_at) VALUES(?,?,?,?)",
                        (account, equity, unrealized, time.time()))
 
     def trades(self, account, limit=100):
-        with sqlite3.connect(self.path) as db:
+        with self._connection() as db:
             db.row_factory = sqlite3.Row
             rows = [dict(row) for row in db.execute(
                 "SELECT * FROM trades WHERE account=? ORDER BY timestamp DESC LIMIT ?", (account, limit)
@@ -75,7 +92,7 @@ class ConsoleStore:
 
     def insert_trades(self, account, rows):
         rows = list(rows)
-        with sqlite3.connect(self.path) as db:
+        with self._connection() as db:
             # The ledger supersedes position history: a refresh that falls back
             # to position_close while the ledger endpoint is unavailable must
             # not leave duplicates behind once the ledger recovers.
@@ -96,7 +113,7 @@ class ConsoleStore:
 
     def performance(self, account=None, since=None, until=None):
         """Return flow-adjusted account and trader aggregates for the console."""
-        with sqlite3.connect(self.path) as db:
+        with self._connection() as db:
             db.row_factory = sqlite3.Row
             where, args = [], []
             if account:
@@ -159,27 +176,27 @@ class ConsoleStore:
 
     def latest_open_fill_leaders(self, account):
         """Map symbol -> leader from each symbol's newest non-reduce local fill."""
-        with sqlite3.connect(self.path) as db:
+        with self._connection() as db:
             return {str(row[0]).upper(): row[1] for row in db.execute(
                 "SELECT symbol, leader, MAX(timestamp) FROM local_fills WHERE account=? AND reduce_only=0 GROUP BY symbol",
                 (account,))}
 
     def snapshots(self, account, limit=240):
-        with sqlite3.connect(self.path) as db:
+        with self._connection() as db:
             db.row_factory = sqlite3.Row
             return [dict(row) for row in db.execute(
                 "SELECT * FROM equity_snapshots WHERE account=? ORDER BY created_at DESC LIMIT ?", (account, limit)
             )]
 
     def insert_cash_flows(self, account, rows):
-        with sqlite3.connect(self.path) as db:
+        with self._connection() as db:
             for row in rows:
                 external_id = row.get("id") or f"{row.get('kind')}:{row.get('timestamp')}:{row.get('amount')}"
                 db.execute("INSERT OR IGNORE INTO cash_flows(account,kind,amount,timestamp,external_id) VALUES(?,?,?,?,?)",
                            (account, row.get("kind"), row.get("amount", 0), row.get("timestamp") or time.time(), f"{account}:{external_id}"))
 
     def insert_local_fills(self, rows):
-        with sqlite3.connect(self.path) as db:
+        with self._connection() as db:
             for row in rows:
                 db.execute("""INSERT OR IGNORE INTO local_fills
                     (account,leader,order_id,symbol,side,quantity,price,reduce_only,timestamp)
@@ -193,7 +210,7 @@ class ConsoleStore:
         A fill is used at most once; unmatched rows deliberately stay in the
         unattributed bucket so the UI never invents a trader assignment.
         """
-        with sqlite3.connect(self.path) as db:
+        with self._connection() as db:
             db.row_factory = sqlite3.Row
             trades = [dict(x) for x in db.execute("SELECT * FROM trades WHERE account=? AND (leader IS NULL OR leader='')", (account,))]
             fills = [dict(x) for x in db.execute("SELECT * FROM local_fills WHERE account=? ORDER BY timestamp", (account,))]
@@ -232,9 +249,19 @@ class ConsoleStore:
                                (opener["leader"], trade["id"]))
 
     def audit(self, action, detail):
-        with sqlite3.connect(self.path) as db:
+        with self._connection() as db:
             db.execute("INSERT INTO audit_logs(action,detail,created_at) VALUES(?,?,?)",
                        (action, json.dumps(detail, sort_keys=True), time.time()))
+
+    def prune(self, retention_days=90, now=None):
+        """Drop equity snapshots older than the retention window.
+
+        Snapshots are the only table written on a fixed cadence and grow
+        without bound; trades and cash flows are the PnL record and stay.
+        """
+        cutoff = (now or time.time()) - float(retention_days) * 86400
+        with self._connection() as db:
+            return db.execute("DELETE FROM equity_snapshots WHERE created_at < ?", (cutoff,)).rowcount
 
 
 class ConsoleService:
@@ -255,6 +282,12 @@ class ConsoleService:
         console_config = (config or {}).get("console") or {}
         self._last_rest = 0.0
         self._rest_interval = max(10.0, float(console_config.get("leader_rest_seconds", 60)))
+        # Ledger/trade/equity-curve refreshes paginate REST and scan SQLite;
+        # the dashboard only needs the 3-second account view.
+        self._performance_interval = max(10.0, float(console_config.get("performance_seconds", 60)))
+        self._retention_days = float(console_config.get("snapshot_retention_days", 90))
+        self._last_performance = 0.0
+        self._last_prune = 0.0
 
     def install(self, app):
         app.router.add_get("/api/v1/dashboard", self.dashboard)
@@ -285,31 +318,33 @@ class ConsoleService:
     async def trades(self, request):
         account = self._account_name()
         limit = min(int(request.query.get("limit", 100)), 500)
-        return web.json_response({"items": self.store.trades(account, limit)})
+        return web.json_response({"items": await asyncio.to_thread(self.store.trades, account, limit)})
 
     async def stats(self, request):
         account = self._account_name()
-        snapshots = self.store.snapshots(account)
-        result = self.store.performance(account)
+        snapshots = await asyncio.to_thread(self.store.snapshots, account)
+        result = await asyncio.to_thread(self.store.performance, account)
         return web.json_response({"account": account, "snapshots": snapshots, **result})
 
-    def _performance(self, request):
+    async def _performance(self, request):
         account = request.query.get("account") or self._account_name()
         def number(name):
             value = request.query.get(name)
             return float(value) if value not in (None, "") else None
-        return self.store.performance(account, number("since"), number("until"))
+        return await asyncio.to_thread(self.store.performance, account, number("since"), number("until"))
 
     async def performance_overview(self, request):
-        result = self._performance(request)
-        result["positions"] = self._attributed_positions()
+        result = await self._performance(request)
+        result["positions"] = await self._attributed_positions()
         return web.json_response(result)
 
     async def performance_leaders(self, request):
-        return web.json_response({"items": self._performance(request)["leaders"]})
+        result = await self._performance(request)
+        return web.json_response({"items": result["leaders"]})
 
     async def performance_equity(self, request):
-        return web.json_response({"items": self._performance(request)["curve"]})
+        result = await self._performance(request)
+        return web.json_response({"items": result["curve"]})
 
     async def events(self, request):
         response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive"})
@@ -368,7 +403,7 @@ class ConsoleService:
                 await self.engine.process(name, await leader_snapshot(self.engine.leaders[name]))
             except Exception:
                 log.exception("Initial snapshot after address change failed for %s", name)
-        self.store.audit("leader.update", {"leader": name, "fields": list(changes)})
+        await asyncio.to_thread(self.store.audit, "leader.update", {"leader": name, "fields": list(changes)})
         return web.json_response({"ok": True, "leader": self.engine.leaders[name]})
 
     async def control(self, request):
@@ -376,14 +411,14 @@ class ConsoleService:
         if action not in ("pause", "resume"):
             raise web.HTTPNotFound()
         self.engine.paused = action == "pause"
-        self.store.audit("control." + action, {})
+        await asyncio.to_thread(self.store.audit, "control." + action, {})
         return web.json_response({"ok": True, "paused": self.engine.paused})
 
     def _account_name(self):
         return next((x.get("execution_account") for x in self.engine.leaders.values()
                       if x.get("execution_account")), "default")
 
-    def _attributed_positions(self):
+    async def _attributed_positions(self):
         """Annotate the latest account positions with the owning leader.
 
         Ownership comes from the engine's symbol claims; when a symbol was
@@ -400,7 +435,8 @@ class ConsoleService:
             symbol = key.partition(":")[2]
             if symbol:
                 owners[self.symbol_map.display(symbol)] = leader
-        fills = {self.symbol_map.display(k): v for k, v in self.store.latest_open_fill_leaders(self._account_name()).items()}
+        fill_leaders = await asyncio.to_thread(self.store.latest_open_fill_leaders, self._account_name())
+        fills = {self.symbol_map.display(k): v for k, v in fill_leaders.items()}
         result = []
         for row in rows:
             symbol = self.symbol_map.display(row.get("symbol"))
@@ -459,17 +495,22 @@ class ConsoleService:
                 rows = [self._position_dict(p) for p in positions.values()]
             leaders.append({"name": name, "address": str(cfg.get("address", "")), "config": cfg, "positions": rows})
         account_rows, orders, equity, balance, unrealized = [], [], 0.0, 0.0, 0.0
+        account_ok = False
         exchange = self.engine.exchange
+        if self.engine.fill_events:
+            events = list(self.engine.fill_events)
+            try:
+                await asyncio.to_thread(self.store.insert_local_fills, events)
+                del self.engine.fill_events[:len(events)]
+            except Exception:
+                log.exception("Console local fill refresh failed")
         try:
-            if self.engine.fill_events:
-                self.store.insert_local_fills(self.engine.fill_events)
-                self.engine.fill_events.clear()
             raw = await exchange.fetch_positions()
             account_rows = [self._account_position(p) for p in raw if _number(p.get("contracts"))]
             equity = await exchange.equity()
             unrealized = sum(_number(x.get("unrealizedPnl")) for x in raw)
             balance = await exchange.wallet_balance() if hasattr(exchange, "wallet_balance") else equity - unrealized
-            self.store.snapshot(self._account_name(), equity, unrealized)
+            account_ok = True
         except Exception:
             log.exception("Console account refresh failed")
         try:
@@ -478,14 +519,9 @@ class ConsoleService:
         except Exception as exc:
             log.warning("Console open orders refresh failed: %s", exc)
             orders = [{"error": type(exc).__name__}]
-        try:
-            if hasattr(exchange, "fetch_realized_pnl"):
-                self.store.insert_trades(self._account_name(), await exchange.fetch_realized_pnl())
-                self.store.attribute_trades(self._account_name())
-            if hasattr(exchange, "fetch_cash_flows"):
-                self.store.insert_cash_flows(self._account_name(), await exchange.fetch_cash_flows())
-        except Exception:
-            log.exception("Console performance refresh failed")
+        if time.monotonic() - self._last_performance >= self._performance_interval:
+            self._last_performance = time.monotonic()
+            await self._refresh_performance(equity if account_ok else None, unrealized)
         self._snapshot = {"updated_at": time.time(), "leaders": leaders,
                           "accounts": [{"name": self._account_name(), "balance": balance, "equity": equity, "unrealized_pnl": unrealized,
                                         "positions": account_rows, "orders": orders}],
@@ -499,6 +535,40 @@ class ConsoleService:
                 await response.write(message)
             except Exception:
                 self._subscribers.discard(response)
+
+    async def _refresh_performance(self, equity, unrealized):
+        """Slow path: equity curve, ledger trades and cash flows.
+
+        Kept off the 3-second display loop because the Gate ledger paginates
+        REST and attribution scans the whole local-fill table.
+        """
+        account = self._account_name()
+        exchange = self.engine.exchange
+        try:
+            if equity is not None:
+                await asyncio.to_thread(self.store.snapshot, account, equity, unrealized)
+            if hasattr(exchange, "fetch_realized_pnl"):
+                rows = await exchange.fetch_realized_pnl()
+                await asyncio.to_thread(self.store.insert_trades, account, rows)
+                await asyncio.to_thread(self.store.attribute_trades, account)
+            if hasattr(exchange, "fetch_cash_flows"):
+                rows = await exchange.fetch_cash_flows()
+                await asyncio.to_thread(self.store.insert_cash_flows, account, rows)
+        except Exception:
+            log.exception("Console performance refresh failed")
+        await self._maybe_prune()
+
+    async def _maybe_prune(self):
+        now = time.time()
+        if now - self._last_prune < 3600:
+            return
+        self._last_prune = now
+        try:
+            removed = await asyncio.to_thread(self.store.prune, self._retention_days)
+            if removed:
+                log.info("Pruned %d equity snapshots older than %g days", removed, self._retention_days)
+        except Exception:
+            log.exception("Console retention prune failed")
 
     def _position_dict(self, p):
         margin = abs(p.size * p.entry_price / (p.leverage or 1))

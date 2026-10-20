@@ -47,6 +47,7 @@ class CcxtExchange:
         # set_leverage is a signed REST call; the configured leverage is
         # static, so only send it when the market's cached value changes.
         self._leverage_set = {}
+        self._ledger_since = None
 
     async def start(self):
         await self.client.load_markets()
@@ -306,12 +307,19 @@ class CcxtExchange:
         same text, so they fold into the same console row.  The dedupe key is
         stable, which lets repeated refreshes insert idempotently.  Pagination
         walks backwards with ``to`` until a page comes back short.
+
+        Once a watermark exists, only the recent overlap window is fetched;
+        the full backward walk is reserved for startup or a backlog.
         """
         settle = self.config.get('settle', 'usdt')
+        since = getattr(self, '_ledger_since', None)
+        newest = since
         rows = {}
         until = None
         for _ in range(10):
             params = {'settle': settle, 'limit': 100}
+            if since is not None:
+                params['from'] = max(0, int(since) - 300)
             if until is not None:
                 params['to'] = until
             try:
@@ -325,6 +333,8 @@ class CcxtExchange:
                 stamp = _float(entry.get('time'))
                 if stamp and (oldest is None or stamp < oldest):
                     oldest = stamp
+                if stamp and (newest is None or stamp > newest):
+                    newest = stamp
                 kind = str(entry.get('type') or '').lower()
                 if kind not in ('pnl', 'fee'):
                     continue
@@ -350,6 +360,8 @@ class CcxtExchange:
             if len(book) < 100 or oldest is None:
                 break
             until = int(oldest) - 1
+        if newest is not None:
+            self._ledger_since = newest
         return self._ledger_rows_result(rows)
 
     @staticmethod
