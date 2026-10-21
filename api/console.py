@@ -298,6 +298,7 @@ class ConsoleService:
         app.router.add_get("/api/v1/performance/equity", self.performance_equity)
         app.router.add_get("/api/v1/events", self.events)
         app.router.add_patch("/api/v1/leaders/{name}", self.update_leader)
+        app.router.add_post("/api/v1/positions/breakeven", self.breakeven)
         app.router.add_post("/api/v1/control/{action}", self.control)
         app.on_startup.append(self.start)
         app.on_cleanup.append(self.stop)
@@ -414,6 +415,65 @@ class ConsoleService:
         await asyncio.to_thread(self.store.audit, "control." + action, {})
         return web.json_response({"ok": True, "paused": self.engine.paused})
 
+    async def breakeven(self, request):
+        """Move one account position's stop to its entry price, or revert it."""
+        try:
+            payload = await request.json()
+        except Exception:
+            raise web.HTTPBadRequest(text="invalid JSON body")
+        symbol = str(payload.get("symbol") or "").strip()
+        if not symbol:
+            raise web.HTTPBadRequest(text="symbol is required")
+        enabled = payload.get("enabled", True)
+        if not isinstance(enabled, bool):
+            enabled = str(enabled).strip().lower() not in ("false", "0", "no", "")
+        key, leader, engine_symbol = self._owner_for_display(symbol)
+        try:
+            if enabled:
+                trigger = (await self.engine.set_breakeven(leader, engine_symbol) if key
+                           else await self._place_breakeven(symbol))
+            else:
+                if not key:
+                    raise ValueError("position is not managed by the engine")
+                await self.engine.clear_breakeven(leader, engine_symbol)
+                trigger = None
+        except (KeyError, ValueError) as exc:
+            raise web.HTTPBadRequest(text=str(exc).strip("'"))
+        except Exception:
+            log.exception("Breakeven request failed for %s", symbol)
+            raise web.HTTPInternalServerError(text="breakeven request failed")
+        await asyncio.to_thread(self.store.audit, "position.breakeven", {"symbol": symbol, "enabled": enabled})
+        return web.json_response({"ok": True, "symbol": symbol, "breakeven": enabled, "trigger": trigger})
+
+    def _owner_for_display(self, display):
+        """Find the engine owner key behind a position's displayed symbol."""
+        for key, leader in getattr(self.engine, "owners", {}).items():
+            _, _, symbol = key.partition(":")
+            if self.symbol_map.display(symbol) == display:
+                return key, leader, symbol
+        return None, None, None
+
+    async def _place_breakeven(self, display):
+        """Place a native stop at entry for a position the engine does not own."""
+        rows = await self.engine.exchange.fetch_positions()
+        row = next((p for p in rows if _number(p.get("contracts"))
+                    and self.symbol_map.display(p.get("symbol")) == display), None)
+        if row is None:
+            raise ValueError("open position not found")
+        contracts = abs(_number(row.get("contracts")))
+        entry = _number(row.get("entryPrice"))
+        mark = _number(row.get("markPrice"))
+        side = str(row.get("side") or "").lower()
+        if contracts <= 0 or entry <= 0:
+            raise ValueError("position size or entry price unavailable")
+        if mark > 0 and ((side == "long" and entry >= mark) or (side == "short" and entry <= mark)):
+            raise ValueError("position is not in profit; a breakeven stop would trigger immediately")
+        # set_protection talks to ccxt directly, where a contract market's
+        # amount is a number of contracts rather than base-asset quantity.
+        await self.engine.exchange.set_protection(
+            row.get("symbol"), "sell" if side == "long" else "buy", contracts, entry)
+        return entry
+
     def _account_name(self):
         return next((x.get("execution_account") for x in self.engine.leaders.values()
                       if x.get("execution_account")), "default")
@@ -507,6 +567,9 @@ class ConsoleService:
         try:
             raw = await exchange.fetch_positions()
             account_rows = [self._account_position(p) for p in raw if _number(p.get("contracts"))]
+            for row in account_rows:
+                key, _, _ = self._owner_for_display(row.get("symbol"))
+                row["breakeven"] = bool(key and (getattr(self.engine, "breakeven", None) or {}).get(key))
             equity = await exchange.equity()
             unrealized = sum(_number(x.get("unrealizedPnl")) for x in raw)
             balance = await exchange.wallet_balance() if hasattr(exchange, "wallet_balance") else equity - unrealized

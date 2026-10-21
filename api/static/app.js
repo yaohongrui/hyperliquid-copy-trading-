@@ -5,9 +5,10 @@ function money(value) { return `${Number(value || 0).toFixed(2)} USDT`; }
 function cls(value) { return Number(value) >= 0 ? 'positive' : 'negative'; }
 function td(label, value, klass = '') { return `<td data-label="${label}"${klass ? ` class="${klass}"` : ''}>${value}</td>`; }
 
-function table(rows) {
+function table(rows, options = {}) {
   if (!rows?.length) return '<p class="muted">No open positions.</p>';
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Leverage</th><th>Entry</th><th>Mark</th><th>PnL</th><th>ROI</th></tr></thead><tbody>${rows.map((p) => `<tr>${td('Symbol', p.symbol || '--')}${td('Side', p.side || '--')}${td('Size', Number(p.size || 0).toFixed(5))}${td('Leverage', `${Number(p.leverage || 0).toFixed(1)}x`)}${td('Entry', Number(p.entry_price || 0).toFixed(5))}${td('Mark', Number(p.mark_price || 0).toFixed(5))}${td('PnL', money(p.unrealized_pnl), cls(p.unrealized_pnl))}${td('ROI', `${Number(p.roi || 0).toFixed(2)}%`, cls(p.roi))}</tr>`).join('')}</tbody></table></div>`;
+  const action = options.breakeven ? '<th>Action</th>' : '';
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Leverage</th><th>Entry</th><th>Mark</th><th>PnL</th><th>ROI</th>${action}</tr></thead><tbody>${rows.map((p) => `<tr>${td('Symbol', p.symbol || '--')}${td('Side', p.side || '--')}${td('Size', Number(p.size || 0).toFixed(5))}${td('Leverage', `${Number(p.leverage || 0).toFixed(1)}x`)}${td('Entry', Number(p.entry_price || 0).toFixed(5))}${td('Mark', Number(p.mark_price || 0).toFixed(5))}${td('PnL', money(p.unrealized_pnl), cls(p.unrealized_pnl))}${td('ROI', `${Number(p.roi || 0).toFixed(2)}%`, cls(p.roi))}${options.breakeven ? td('Action', `<button class="table-action${p.breakeven ? ' active' : ''}" data-breakeven="${esc(p.symbol || '')}" data-enabled="${p.breakeven ? 'false' : 'true'}">${p.breakeven ? 'Cancel breakeven' : 'Breakeven'}</button>`) : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function orders(rows) {
@@ -37,7 +38,7 @@ function render(data) {
   const stopText = hardStop.max_daily_loss_usdt != null ? `Daily ${hardStop.max_daily_loss_usdt} USDT` : hardStop.max_daily_drawdown_pct != null ? `Daily ${hardStop.max_daily_drawdown_pct}%` : stops.length ? `Position ${stops[0].max_loss_usdt ?? 'configured'} USDT` : 'Off';
   $('#stop-loss').textContent = stopText;
   $('#status').textContent = `Live · ${new Date(data.updated_at * 1000).toLocaleTimeString()}`;
-  $('#account').innerHTML = `<p class="muted">${account.name || 'Account'} · ${account.positions?.length || 0} open positions</p>${table(account.positions)}`;
+  $('#account').innerHTML = `<p class="muted">${account.name || 'Account'} · ${account.positions?.length || 0} open positions</p>${table(account.positions, { breakeven: true })}`;
   $('#orders').innerHTML = orders(account.orders);
   $('#leaders').innerHTML = (data.leaders || []).map((leader) => `<article class="panel leader"><div class="toolbar"><div><strong>${leader.name}</strong> <span class="muted">${leader.address} · ${leader.positions?.length || 0} open positions</span></div></div>${table(leader.positions)}</article>`).join('') || '<p class="muted">No leaders configured.</p>';
   $('#configs').innerHTML = (data.leaders || []).map(configForm).join('') || '<p class="muted">No leaders configured.</p>';
@@ -196,6 +197,24 @@ document.addEventListener('click', async (event) => {
     tab.classList.add('active');
     document.querySelectorAll('#monitor-page,#performance-page,#config-page').forEach((page) => { page.hidden = page.id !== tab.dataset.page; });
     if (tab.dataset.page === 'performance-page') loadPerformance(true);
+    return;
+  }
+  const breakeven = event.target.closest('[data-breakeven]');
+  if (breakeven) {
+    const symbol = breakeven.dataset.breakeven;
+    const enabled = breakeven.dataset.enabled === 'true';
+    breakeven.disabled = true;
+    try {
+      const response = await fetch('/api/v1/positions/breakeven', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol, enabled }),
+      });
+      if (!response.ok) throw Error((await response.text()).trim() || `request failed: ${response.status}`);
+      await load();
+    } catch (error) {
+      breakeven.disabled = false;
+      alert(`Breakeven failed for ${symbol}: ${error.message}`);
+    }
     return;
   }
   const button = event.target.closest('[data-save]');

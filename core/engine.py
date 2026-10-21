@@ -43,6 +43,10 @@ class Engine:
         # ``leader:symbol``.  Without this a fill can arrive after the leader
         # has already closed and leave an orphan position behind.
         self.pending_orders = self.runtime_state.get('pending_orders', {})
+        # Owner keys whose native stop was moved to the entry price from the
+        # console.  Persisted so a restart keeps the tighter stop instead of
+        # silently restoring the configured loss-based one.
+        self.breakeven = self.runtime_state.get('breakeven') or {}
         # Symbols whose first snapshot failed before an order was placed.  The
         # next event must still treat them as startup so the initial entry
         # price check is not lost with the failed signal.
@@ -75,6 +79,9 @@ class Engine:
             for store in (self.stopped, self.entered, self.small_order_carry):
                 for key in [k for k in store if k.startswith(prefix)]:
                     store.pop(key, None)
+            # Breakeven is keyed by owner (account:symbol), not by leader.
+            for key in [k for k, owner in self.owners.items() if owner == leader]:
+                self.breakeven.pop(key, None)
             await self.cancel_pending_orders(leader=leader, reason='leader address changed')
             self._save_state()
             return True
@@ -92,6 +99,7 @@ class Engine:
             self.runtime_state['entered'] = self.entered
             self.runtime_state['small_order_carry'] = self.small_order_carry
             self.runtime_state['pending_orders'] = self.pending_orders
+            self.runtime_state['breakeven'] = self.breakeven
             self.runtime_state['risk'] = self.risk.state()
             self.state_store.save(self.runtime_state)
 
@@ -278,6 +286,7 @@ class Engine:
                         log.warning('Failed to clean residual protection orders for %s', symbol, exc_info=True)
             self.owners.pop(key, None)
             self.entered.pop(f'{leader}:{symbol}', None)
+            self.breakeven.pop(key, None)
             self._save_state()
 
     @staticmethod
@@ -285,9 +294,69 @@ class Engine:
         # State files written by older versions contain the id directly.
         return value.get('id') if isinstance(value, dict) else value
 
+    async def set_breakeven(self, leader, symbol):
+        """Move this position's native stop to its entry price.
+
+        Returns the trigger price.  A position that is not in profit is
+        rejected: the stop would sit on the wrong side of the mark and fire
+        immediately, turning "breakeven" into a market close at a loss.
+        """
+        key = self._owner_key(leader, symbol)
+        if self.owners.get(key) != leader:
+            raise KeyError(f'{symbol} is not owned by {leader}')
+        detail = await self.exchange.fetch_position_detail(symbol)
+        if not detail:
+            raise ValueError(f'no open position for {symbol}')
+        trigger = self._breakeven_trigger(detail)
+        cfg = self.leaders[leader].get('position_stop_loss') or {}
+        async with self._protection_lock:
+            self.breakeven[key] = True
+            self._save_state()
+            try:
+                await self._sync_protection_locked(leader, symbol, cfg, detail)
+            except Exception:
+                self.breakeven.pop(key, None)
+                self._save_state()
+                raise
+        return trigger
+
+    async def clear_breakeven(self, leader, symbol):
+        """Revert a breakeven stop to the configured stop loss, if any."""
+        key = self._owner_key(leader, symbol)
+        if self.owners.get(key) != leader:
+            raise KeyError(f'{symbol} is not owned by {leader}')
+        cfg = self.leaders[leader].get('position_stop_loss') or {}
+        async with self._protection_lock:
+            if not self.breakeven.pop(key, None):
+                return False
+            self._save_state()
+            if cfg.get('enabled') and cfg.get('max_loss_usdt') is not None:
+                await self._sync_protection_locked(leader, symbol, cfg, None)
+                return True
+            old = self.runtime_state.get('protection', {}).pop(key, None)
+            if old:
+                try:
+                    await self.exchange.cancel_protection(self._protection_id(old), symbol)
+                except Exception:
+                    log.info('Breakeven protection %s for %s is already gone', self._protection_id(old), symbol)
+                self._save_state()
+        return True
+
+    @staticmethod
+    def _breakeven_trigger(detail):
+        entry = float(detail.get('entryPrice') or 0)
+        mark = float(detail.get('markPrice') or detail.get('markPx') or 0)
+        side = str(detail.get('side') or '').lower()
+        if entry <= 0:
+            raise ValueError('entry price unavailable')
+        if mark > 0 and ((side == 'long' and entry >= mark) or (side == 'short' and entry <= mark)):
+            raise ValueError('position is not in profit; a breakeven stop would trigger immediately')
+        return entry
+
     async def _sync_protection(self, leader, symbol, detail=None):
         cfg = self.leaders[leader].get('position_stop_loss') or {}
-        if not cfg.get('enabled') or cfg.get('max_loss_usdt') is None:
+        key = self._owner_key(leader, symbol)
+        if not self.breakeven.get(key) and (not cfg.get('enabled') or cfg.get('max_loss_usdt') is None):
             return
         async with self._protection_lock:
             await self._sync_protection_locked(leader, symbol, cfg, detail)
@@ -304,11 +373,16 @@ class Engine:
         if not position_amount or entry <= 0:
             return
         side = str(detail.get('side') or '').lower()
-        loss = float(cfg['max_loss_usdt'])
-        # Gate and other contract venues report ``contracts`` rather than
-        # base-asset quantity.  Convert before translating a dollar loss into
-        # a price distance, otherwise non-unit contract sizes trigger early.
-        trigger = entry - loss / position_amount if side == 'long' else entry + loss / position_amount
+        key = self._owner_key(leader, symbol)
+        if self.breakeven.get(key):
+            trigger = entry
+        else:
+            loss = float(cfg['max_loss_usdt'])
+            # Gate and other contract venues report ``contracts`` rather than
+            # base-asset quantity.  Convert before translating a dollar loss
+            # into a price distance, otherwise non-unit contract sizes trigger
+            # early.
+            trigger = entry - loss / position_amount if side == 'long' else entry + loss / position_amount
         mark = float(detail.get('markPrice') or detail.get('markPx') or 0)
         if trigger <= 0 or (mark > 0 and ((side == 'long' and trigger >= mark) or (side == 'short' and trigger <= mark))):
             log.warning('Protection price invalid for %s: side=%s entry=%g mark=%g trigger=%g; no order created', symbol, side, entry, mark, trigger)
@@ -317,13 +391,12 @@ class Engine:
             return
         # Native stop orders are intentionally owned by the exchange; this demo
         # records the latest id for later replacement/cancellation.
-        key = self._owner_key(leader, symbol)
         old = self.runtime_state.get('protection', {}).get(key)
         old_id = self._protection_id(old)
         old_contracts = float(old.get('contracts') or 0) if isinstance(old, dict) else 0
         old_trigger = float(old.get('trigger') or 0) if isinstance(old, dict) else 0
         # Do not churn orders on every reconciliation tick.  Recreate only
-        # when the live position or its loss-based trigger has changed.
+        # when the live position or its trigger has changed.
         if old_id and old_contracts and old_trigger and abs(old_contracts - contracts) <= 1e-12 and abs(old_trigger - trigger) <= max(abs(trigger), 1) * 1e-10:
             return
         # Cleaning duplicates costs a full conditional-order listing on Gate, so

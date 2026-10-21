@@ -488,6 +488,7 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
   - 账户余额、未实现盈亏、权益、系统状态、止损配置。
   - 暂停/恢复按钮。
   - 当前挂单、执行账户持仓、各交易员实时仓位。
+  - 执行账户每个持仓行提供「一键保本」按钮：把该仓位的原生止损移到开仓价，仅浮盈时可用；再次点击可恢复配置的止损。
   - 交易员配置表单。
 - **Performance**
   - 时间范围：Today / 30D / All / 自定义 `since`–`until`（Unix 秒）。
@@ -530,6 +531,7 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 | GET | `/api/v1/performance/equity` | 权益曲线 |
 | GET | `/api/v1/events` | SSE 快照流，3 秒推送，30 秒心跳 |
 | PATCH | `/api/v1/leaders/{name}` | 修改交易员配置 |
+| POST | `/api/v1/positions/breakeven` | 单个仓位一键保本/恢复止损，body：`{"symbol":"BTC","enabled":true}` |
 | POST | `/api/v1/control/{pause\|resume}` | 暂停/恢复 |
 | POST | `/command` | 与 Telegram 命令等价的文本接口 |
 
