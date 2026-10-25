@@ -22,20 +22,23 @@ def _address(value):
 
 async def main(path):
     c = load(path)
-    leaders = {x["name"]: x for x in c.get("leaders", []) if x.get("enabled", True)}
-    enabled = list(leaders.values())
+    # Keep disabled leaders in the engine so the console can list and
+    # re-enable them; ``enabled`` gates signals in Engine.process.
+    leaders = {x["name"]: x for x in c.get("leaders", [])}
+    enabled = [x for x in leaders.values() if x.get("enabled", True)]
+    active = {x["name"]: x for x in enabled}
     accounts = c.get("execution_accounts") or {}
-    account_name = enabled[0].get("execution_account") if enabled else None
+    account_name = (enabled or list(leaders.values()) or [{}])[0].get("execution_account")
     account = accounts.get(account_name) if account_name else None
     if not account:
-        raise RuntimeError("No execution account is configured for an enabled leader")
+        raise RuntimeError("No execution account is configured for a leader")
     dry_run = bool(account.get("dry_run", False))
     symbol_map = SymbolMap(c.get("symbol_map"))
     exchange = DryRunExchange(account, symbol_map) if dry_run else CcxtExchange(account, symbol_map)
     engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')), symbol_map=symbol_map)
     engine.config_manager = ConfigManager(path)
     mode = "dry-run" if dry_run else "LIVE"
-    log.info("HL copytrade started in %s mode; leaders=%s account=%s", mode, ",".join(leaders) or "none", account_name)
+    log.info("HL copytrade started in %s mode; leaders=%s account=%s", mode, ",".join(active) or "none", account_name)
     stop = asyncio.Event()
     telegram = None
     telegram_task = None
@@ -50,8 +53,8 @@ async def main(path):
                 token,
                 chat_id,
                 telegram_config.get("polling_timeout", 25),
-                fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, leaders, symbol_map),
-                fetch_leader_positions=partial(leader_positions, leaders),
+                fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, active, symbol_map),
+                fetch_leader_positions=partial(leader_positions, active),
                 fetch_equity=exchange.equity,
                 account_name=account_name,
                 account_config=account,
@@ -65,8 +68,8 @@ async def main(path):
     else:
         telegram = TelegramManager(
             engine, "", None,
-            fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, leaders, symbol_map),
-            fetch_leader_positions=partial(leader_positions, leaders),
+            fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, active, symbol_map),
+            fetch_leader_positions=partial(leader_positions, active),
             fetch_equity=getattr(exchange, "equity", None),
             account_name=account_name,
             account_config=account,
@@ -93,6 +96,8 @@ async def main(path):
     # WebSocket updates are change-driven and may not send a restart snapshot.
     # Seed the engine from the official REST state so startup sync is evaluated.
     for name, leader_cfg in leaders.items():
+        if not leader_cfg.get("enabled", True):
+            continue
         try:
             await engine.process(name, await leader_snapshot(leader_cfg))
             log.info("Initial leader snapshot processed for %s", name)
@@ -128,7 +133,9 @@ async def main(path):
 def _seed_entered(engine, store):
     if not engine.leaders:
         return
-    account_key = engine._account_key(next(iter(engine.leaders)))
+    names = list(engine.leaders)
+    primary = next((name for name in names if engine.leaders[name].get("enabled", True)), names[0])
+    account_key = engine._account_key(primary)
     for symbol, leader in store.latest_open_fill_leaders(account_key).items():
         engine.entered.setdefault(f"{leader}:{symbol}", True)
     engine._save_state()
@@ -149,6 +156,8 @@ async def _consume_leaders(source, engine, leaders, silence_seconds=120):
                 # Websocket (re)connected: closes that fired during an outage are
                 # never replayed, so re-seed every leader from a REST snapshot.
                 for name, cfg in leaders.items():
+                    if not cfg.get("enabled", True):
+                        continue
                     try:
                         await engine.process(name, await leader_snapshot(cfg), resync=True)
                     except Exception:

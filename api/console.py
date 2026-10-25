@@ -389,21 +389,34 @@ class ConsoleService:
                     raise ValueError("position_stop_loss must be an object")
                 if "max_loss_usdt" in stop and float(stop["max_loss_usdt"]) <= 0:
                     raise ValueError("position stop loss must be positive")
+            if "enabled" in changes:
+                value = changes["enabled"]
+                if isinstance(value, bool):
+                    pass
+                elif isinstance(value, (int, str)):
+                    changes["enabled"] = str(value).strip().lower() not in ("false", "0", "no", "")
+                else:
+                    raise ValueError("enabled must be a boolean")
         except (TypeError, ValueError) as exc:
             raise web.HTTPBadRequest(text=str(exc))
         self.engine.config_manager.update_leader(name, changes)
         address_changed = await self.engine.update_leader_config(name, changes)
-        if address_changed:
+        config = self.engine.leaders[name]
+        if address_changed or "enabled" in changes:
             if self.leader_stream:
+                # Only enabled leaders are streamed, so toggling one on adds
+                # its subscription without waiting for a restart.
                 await self.leader_stream.set_addresses(
-                    [_address(item.get("address")) for item in self.engine.leaders.values()]
+                    [_address(item.get("address")) for item in self.engine.leaders.values()
+                     if item.get("enabled", True)]
                 )
-            # Seed the new address immediately so the first WS event is diffed
-            # against the new leader's real positions, not an empty baseline.
+        if config.get("enabled", True) and (address_changed or "enabled" in changes):
+            # Seed the new baseline immediately so the first diff is against
+            # the leader's real positions, not an empty one.
             try:
-                await self.engine.process(name, await leader_snapshot(self.engine.leaders[name]))
+                await self.engine.process(name, await leader_snapshot(config))
             except Exception:
-                log.exception("Initial snapshot after address change failed for %s", name)
+                log.exception("Initial snapshot after leader update failed for %s", name)
         await asyncio.to_thread(self.store.audit, "leader.update", {"leader": name, "fields": list(changes)})
         return web.json_response({"ok": True, "leader": self.engine.leaders[name]})
 
@@ -475,8 +488,10 @@ class ConsoleService:
         return entry
 
     def _account_name(self):
-        return next((x.get("execution_account") for x in self.engine.leaders.values()
-                      if x.get("execution_account")), "default")
+        return (next((x.get("execution_account") for x in self.engine.leaders.values()
+                      if x.get("enabled", True) and x.get("execution_account")), None)
+                or next((x.get("execution_account") for x in self.engine.leaders.values()
+                         if x.get("execution_account")), "default"))
 
     async def _attributed_positions(self):
         """Annotate the latest account positions with the owning leader.
@@ -520,6 +535,8 @@ class ConsoleService:
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for name, cfg in self.engine.leaders.items():
+                if not cfg.get("enabled", True):
+                    continue
                 started = time.time()
                 try:
                     snapshot = await leader_snapshot(cfg, session)
@@ -553,7 +570,9 @@ class ConsoleService:
                 rows = [{"error": "awaiting leader state"}]
             else:
                 rows = [self._position_dict(p) for p in positions.values()]
-            leaders.append({"name": name, "address": str(cfg.get("address", "")), "config": cfg, "positions": rows})
+            leaders.append({"name": name, "address": str(cfg.get("address", "")),
+                            "enabled": bool(cfg.get("enabled", True)),
+                            "config": cfg, "positions": rows})
         account_rows, orders, equity, balance, unrealized = [], [], 0.0, 0.0, 0.0
         account_ok = False
         exchange = self.engine.exchange

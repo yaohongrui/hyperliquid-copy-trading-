@@ -8,7 +8,7 @@ function td(label, value, klass = '') { return `<td data-label="${label}"${klass
 function table(rows, options = {}) {
   if (!rows?.length) return '<p class="muted">No open positions.</p>';
   const action = options.breakeven ? '<th>Action</th>' : '';
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Leverage</th><th>Entry</th><th>Mark</th><th>PnL</th><th>ROI</th>${action}</tr></thead><tbody>${rows.map((p) => `<tr>${td('Symbol', p.symbol || '--')}${td('Side', p.side || '--')}${td('Size', Number(p.size || 0).toFixed(5))}${td('Leverage', `${Number(p.leverage || 0).toFixed(1)}x`)}${td('Entry', Number(p.entry_price || 0).toFixed(5))}${td('Mark', Number(p.mark_price || 0).toFixed(5))}${td('PnL', money(p.unrealized_pnl), cls(p.unrealized_pnl))}${td('ROI', `${Number(p.roi || 0).toFixed(2)}%`, cls(p.roi))}${options.breakeven ? td('Action', `<button class="table-action${p.breakeven ? ' active' : ''}" data-breakeven="${esc(p.symbol || '')}" data-enabled="${p.breakeven ? 'false' : 'true'}">${p.breakeven ? 'Cancel breakeven' : 'Breakeven'}</button>`) : ''}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>ROI</th>${action}</tr></thead><tbody>${rows.map((p) => `<tr>${td('Symbol', p.symbol || '--')}${td('Side', p.side || '--')}${td('Size', Number(p.size || 0).toFixed(5))}${td('Entry', Number(p.entry_price || 0).toFixed(5))}${td('Mark', Number(p.mark_price || 0).toFixed(5))}${td('PnL', money(p.unrealized_pnl), cls(p.unrealized_pnl))}${td('ROI', `${Number(p.roi || 0).toFixed(2)}%`, cls(p.roi))}${options.breakeven ? td('Action', `<button class="table-action${p.breakeven ? ' active' : ''}" data-breakeven="${esc(p.symbol || '')}" data-enabled="${p.breakeven ? 'false' : 'true'}">${p.breakeven ? 'Cancel breakeven' : 'Breakeven'}</button>`) : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function orders(rows) {
@@ -21,8 +21,22 @@ function configForm(leader) {
   const config = leader.config || {};
   const stop = config.position_stop_loss || {};
   const name = leader.name;
-  return `<article class="panel leader"><div class="toolbar"><div><strong>${name}</strong><span class="muted"> ${config.execution_account || 'default'}</span></div><button data-save="${name}">Save changes</button></div><div class="config"><label>Copy address<input data-k="address" data-name="${name}" value="${config.address ?? ''}"></label><label>Coefficient<input type="number" min="0" step="any" data-k="coefficient" data-name="${name}" value="${config.coefficient ?? ''}"></label><label>Total margin<input type="number" min="0" step="any" data-k="total_margin" data-name="${name}" value="${config.total_margin ?? ''}"></label><label>Late entry %<input type="number" min="0" step="any" data-k="late_entry_offset_pct" data-name="${name}" value="${config.late_entry_offset_pct ?? ''}"></label><label class="check"><input type="checkbox" data-k="enabled" data-name="${name}" ${config.enabled ? 'checked' : ''}> Enabled</label><label class="check"><input type="checkbox" data-k="late_entry_enabled" data-name="${name}" ${config.late_entry_enabled ? 'checked' : ''}> Late entries</label><label class="check"><input type="checkbox" data-k="position_stop_loss.enabled" data-name="${name}" ${stop.enabled ? 'checked' : ''}> Position stop loss</label><label>Max loss USDT<input type="number" min="0" step="any" data-k="position_stop_loss.max_loss_usdt" data-name="${name}" value="${stop.max_loss_usdt ?? ''}"></label></div><p class="config-message muted" data-message="${name}" aria-live="polite"></p></article>`;
+  return `<article class="panel leader"><div class="toolbar"><div><strong>${name}</strong><span class="muted"> ${config.execution_account || 'default'}${config.enabled === false ? ' · disabled' : ''}</span></div><button data-save="${name}">Save changes</button></div><div class="config"><label>Copy address<input data-k="address" data-name="${name}" value="${config.address ?? ''}"></label><label>Coefficient<input type="number" min="0" step="any" data-k="coefficient" data-name="${name}" value="${config.coefficient ?? ''}"></label><label>Total margin<input type="number" min="0" step="any" data-k="total_margin" data-name="${name}" value="${config.total_margin ?? ''}"></label><label>Late entry %<input type="number" min="0" step="any" data-k="late_entry_offset_pct" data-name="${name}" value="${config.late_entry_offset_pct ?? ''}"></label><label class="check"><input type="checkbox" data-k="enabled" data-name="${name}" ${config.enabled ? 'checked' : ''}> Enabled</label><label class="check"><input type="checkbox" data-k="late_entry_enabled" data-name="${name}" ${config.late_entry_enabled ? 'checked' : ''}> Late entries</label><label class="check"><input type="checkbox" data-k="position_stop_loss.enabled" data-name="${name}" ${stop.enabled ? 'checked' : ''}> Position stop loss</label><label>Max loss USDT<input type="number" min="0" step="any" data-k="position_stop_loss.max_loss_usdt" data-name="${name}" value="${stop.max_loss_usdt ?? ''}"></label></div><p class="config-message muted" data-message="${name}" aria-live="polite"></p></article>`;
 }
+
+let configsSignature;
+
+// Rebuilding the form on every SSE tick would drop values the user is still
+// typing (most visible on mobile), so only replace it when the server-side
+// configuration actually changed.
+function renderConfigs(leaders) {
+  const signature = JSON.stringify(leaders.map((leader) => [leader.name, leader.config]));
+  if (signature === configsSignature) return;
+  configsSignature = signature;
+  $('#configs').innerHTML = leaders.map(configForm).join('') || '<p class="muted">No leaders configured.</p>';
+}
+
+function leaderEnabled(leader) { return leader?.enabled !== false && leader?.config?.enabled !== false; }
 
 function render(data) {
   const account = data.accounts?.[0] || {};
@@ -40,8 +54,8 @@ function render(data) {
   $('#status').textContent = `Live · ${new Date(data.updated_at * 1000).toLocaleTimeString()}`;
   $('#account').innerHTML = `<p class="muted">${account.name || 'Account'} · ${account.positions?.length || 0} open positions</p>${table(account.positions, { breakeven: true })}`;
   $('#orders').innerHTML = orders(account.orders);
-  $('#leaders').innerHTML = (data.leaders || []).map((leader) => `<article class="panel leader"><div class="toolbar"><div><strong>${leader.name}</strong> <span class="muted">${leader.address} · ${leader.positions?.length || 0} open positions</span></div></div>${table(leader.positions)}</article>`).join('') || '<p class="muted">No leaders configured.</p>';
-  $('#configs').innerHTML = (data.leaders || []).map(configForm).join('') || '<p class="muted">No leaders configured.</p>';
+  $('#leaders').innerHTML = (data.leaders || []).filter(leaderEnabled).map((leader) => `<article class="panel leader"><div class="toolbar"><div><strong>${leader.name}</strong> <span class="muted">${leader.address} · ${leader.positions?.length || 0} open positions</span></div></div>${table(leader.positions)}</article>`).join('') || '<p class="muted">No leaders configured.</p>';
+  renderConfigs(data.leaders || []);
   $('#toggle').textContent = status.paused ? 'Resume entries' : 'Pause entries';
   if (!$('#performance-page')?.hidden) loadPerformance();
 }

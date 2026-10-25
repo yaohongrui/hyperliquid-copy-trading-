@@ -64,10 +64,22 @@ class Engine:
         async with self._lock:
             if leader not in self.leaders:
                 raise KeyError(leader)
-            old_address = str(self.leaders[leader].get('address') or '').lower()
+            cfg = self.leaders[leader]
+            was_enabled = bool(cfg.get('enabled', True))
+            old_address = str(cfg.get('address') or '').lower()
             new_address = str(changes.get('address') or '').lower()
             address_changed = 'address' in changes and new_address != old_address
-            self.leaders[leader].update(changes)
+            cfg.update(changes)
+            enabled = bool(cfg.get('enabled', True))
+            if 'enabled' in changes and enabled != was_enabled:
+                # A disabled leader must stop seeing signals.  Dropping the
+                # diff baseline makes a later re-enable start from a fresh
+                # startup snapshot instead of closing positions the leader
+                # changed while it was not being followed.
+                self.previous.pop(leader, None)
+                self.previous_at.pop(leader, None)
+                if not enabled:
+                    await self.cancel_pending_orders(leader=leader, reason='leader disabled')
             if not address_changed:
                 return False
             # A new address is a new leader episode.  Diffing the first event
@@ -507,6 +519,8 @@ class Engine:
         protect = []
         async with self._lock:
             cfg = self.leaders[leader]
+            if not cfg.get('enabled', True):
+                return []
             denominator = float(cfg['total_margin'])
             if denominator <= 0:
                 raise ValueError('total_margin must be positive')

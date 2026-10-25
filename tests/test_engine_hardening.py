@@ -228,6 +228,51 @@ class CloseAllPositionsTests(unittest.IsolatedAsyncioTestCase):
             await instance.close_all_positions(attempts=1)
 
 
+class LeaderEnabledTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_leader_produces_no_signals(self):
+        exchange = RecordingExchange()
+        engine = Engine(exchange, {"L": {"total_margin": 100, "coefficient": 1, "enabled": False}})
+
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        self.assertEqual(exchange.orders, [])
+        self.assertNotIn("L", engine.previous)
+
+    async def test_toggling_enabled_resets_baseline(self):
+        exchange = RecordingExchange()
+        engine = Engine(exchange, {"L": {"total_margin": 100, "coefficient": 1, "enabled": True}})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+        self.assertIn("L", engine.previous)
+
+        await engine.update_leader_config("L", {"enabled": False})
+        self.assertNotIn("L", engine.previous)
+        await engine.process("L", {"S": Position("S", 100, 1)})
+        self.assertEqual(len(exchange.orders), 1)
+        self.assertNotIn("L", engine.previous)
+
+        await engine.update_leader_config("L", {"enabled": True})
+        self.assertNotIn("L", engine.previous)
+        # Re-enabling starts from a fresh snapshot: the leader's current
+        # position is mirrored instead of being diffed against stale state.
+        exchange.live = 0
+        await engine.process("L", {"T": Position("T", 50, 1)})
+        self.assertEqual(exchange.orders[-1], ("T", "buy", 50, "market", False))
+
+    async def test_disabling_cancels_pending_limit_entries(self):
+        exchange = RecordingExchange()
+        config = {"total_margin": 100, "coefficient": 1, "enabled": True,
+                  "late_entry_enabled": True, "late_entry_offset_pct": 1}
+        engine = Engine(exchange, {"L": config})
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+        self.assertIn("L:S", engine.pending_orders)
+
+        await engine.update_leader_config("L", {"enabled": False})
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [("o1", "S")])
+
+
 class AddressChangeTests(unittest.IsolatedAsyncioTestCase):
     async def test_address_change_resets_baseline_and_pending_orders(self):
         exchange = RecordingExchange()

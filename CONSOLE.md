@@ -9,7 +9,9 @@ trades in `data/console.sqlite3`. It refreshes every three seconds and sends
 updates over SSE. The web controls can pause/resume new entries, update
 leader sizing, blacklist, delayed-entry, and position-stop-loss settings, and
 move an individual account position's native stop to its entry price
-("Breakeven") or revert it.
+("Breakeven") or revert it. Disabled leaders stay listed on the Configuration
+page (and are marked as disabled) so they can be re-enabled without a restart;
+they produce no signals until enabled and are hidden from the Monitor page.
 The console has no login; access to the public hostname grants control of the
 running engine.
 API keys, exchange selection, and manual orders are intentionally unavailable
