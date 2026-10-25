@@ -1,7 +1,90 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Copytrade Console</title><script>try{var t=localStorage.getItem('theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(_){}</script><link rel="stylesheet" href="/static/app.css?v=7">
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Copytrade Console · YHR.LOL</title>
+<script>try{var t=localStorage.getItem('theme');if(t==='light'||t==='dark')document.documentElement.dataset.theme=t}catch(_){}</script>
+<link rel="stylesheet" href="/static/app.css?v=8">
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js" defer></script>
 </head>
-<body><main id="app"><header><div><small>YHR.LOL</small><h1>Copytrade Console</h1></div><div class="head-right"><div id="status" class="pill">Connecting</div><button id="theme" type="button" title="Toggle theme" aria-label="Toggle theme">☀️</button></div></header>
-<section id="dashboard"><nav class="tabs"><button class="tab active" data-page="monitor-page">Monitor</button><button class="tab" data-page="performance-page">Performance</button><button class="tab" data-page="config-page">Configuration</button></nav><section id="monitor-page"><div class="metrics"><div><small>Balance</small><strong id="equity">--</strong></div><div><small>Unrealized PnL</small><strong id="unrealized">--</strong></div><div><small>System status</small><strong id="mode">--</strong></div><div><small>Stop loss</small><strong id="stop-loss">--</strong></div></div><div class="toolbar"><h2>Execution account</h2><button id="toggle">Pause entries</button></div><div id="account" class="panel"></div><h2>Open orders</h2><div id="orders" class="panel"></div><h2>Leaders</h2><div id="leaders"></div></section><section id="performance-page" hidden><h2>Performance analysis</h2><div class="filters"><div class="chips" id="perf-presets"><button class="chip" data-preset="today">Today</button><button class="chip" data-preset="7d">7D</button><button class="chip" data-preset="30d">30D</button><button class="chip active" data-preset="all">All</button></div><div class="range"><label>From <input type="date" id="perf-since"></label><label>To <input type="date" id="perf-until"></label><button id="perf-apply">Apply</button></div></div><div id="performance"><p class="muted">Loading performance...</p></div></section><section id="config-page" hidden><h2>Trader configuration</h2><p class="muted">Changes apply to the running copytrade engine after validation.</p><div id="configs"></div></section></section></main><script src="/static/app.js?v=9"></script></body></html>
+<body>
+<main id="app">
+  <header>
+    <div class="brand-lockup">
+      <h1>Copytrade Console</h1>
+      <span class="wordmark">YHR.LOL</span>
+    </div>
+    <div class="head-right">
+      <div id="status" class="pill" data-state="connecting" role="status" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span>
+        <span id="status-text">Connecting</span>
+      </div>
+      <button id="theme" class="icon-button" type="button" title="Switch to light mode" aria-label="Switch to light mode">
+        <svg class="icon icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.2"/>
+          <path d="M12 2.5v2.2M12 19.3v2.2M4.7 4.7l1.6 1.6M17.7 17.7l1.6 1.6M2.5 12h2.2M19.3 12h2.2M4.7 19.3l1.6-1.6M17.7 6.3l1.6-1.6"/>
+        </svg>
+        <svg class="icon icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M20.2 13.6A8.4 8.4 0 0 1 10.4 3.8a8.4 8.4 0 1 0 9.8 9.8Z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <section id="dashboard">
+    <nav class="tabs" role="tablist" aria-label="Console sections">
+      <button class="tab active" type="button" role="tab" aria-selected="true" aria-controls="monitor-page" data-page="monitor-page">Monitor</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="performance-page" data-page="performance-page">Performance</button>
+      <button class="tab" type="button" role="tab" aria-selected="false" aria-controls="config-page" data-page="config-page">Configuration</button>
+    </nav>
+
+    <section id="monitor-page" role="tabpanel" aria-label="Monitor">
+      <div class="metrics">
+        <div><small>Balance</small><strong id="equity">--</strong></div>
+        <div><small>Unrealized PnL</small><strong id="unrealized">--</strong></div>
+        <div><small>System status</small><strong id="mode">--</strong></div>
+        <div><small>Stop loss</small><strong id="stop-loss">--</strong></div>
+      </div>
+      <div class="toolbar">
+        <h2>Execution account</h2>
+        <button id="toggle" type="button">Pause entries</button>
+      </div>
+      <div id="account" class="panel"></div>
+      <h2>Open orders</h2>
+      <div id="orders" class="panel"></div>
+      <h2>Leaders</h2>
+      <div id="leaders"></div>
+    </section>
+
+    <section id="performance-page" role="tabpanel" aria-label="Performance" hidden>
+      <h2>Performance analysis</h2>
+      <div class="filters">
+        <div class="chips" id="perf-presets">
+          <button class="chip" type="button" data-preset="today">Today</button>
+          <button class="chip" type="button" data-preset="7d">7D</button>
+          <button class="chip" type="button" data-preset="30d">30D</button>
+          <button class="chip active" type="button" data-preset="all">All</button>
+        </div>
+        <div class="range">
+          <label>From <input type="date" id="perf-since"></label>
+          <label>To <input type="date" id="perf-until"></label>
+          <button id="perf-apply" type="button">Apply</button>
+        </div>
+      </div>
+      <div id="performance"><p class="muted">Loading performance...</p></div>
+    </section>
+
+    <section id="config-page" role="tabpanel" aria-label="Configuration" hidden>
+      <h2>Trader configuration</h2>
+      <p class="muted">Changes apply to the running copytrade engine after validation.</p>
+      <div id="configs"></div>
+    </section>
+  </section>
+</main>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<noscript><p style="padding:24px;font-family:system-ui,sans-serif">This console needs JavaScript to connect to the copytrade engine.</p></noscript>
+<script src="/static/app.js?v=10"></script>
+</body>
+</html>
