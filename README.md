@@ -192,7 +192,6 @@ hard_stop:
 - 支持 `${ENV_VAR}` 占位符。
 - 启动时自动加载配置文件同目录下的 `lead.env`（只填充尚未存在的环境变量，真实环境变量优先）。
 - `lead.env` 已在 `.gitignore` 中，不要提交。
-- `config/config.yaml.save` 不会被读取，只是手工备份。
 
 ### 顶层字段
 
