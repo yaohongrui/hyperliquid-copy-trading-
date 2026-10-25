@@ -3,25 +3,39 @@ let source;
 
 function money(value) { return `${Number(value || 0).toFixed(2)} USDT`; }
 function cls(value) { return Number(value) >= 0 ? 'positive' : 'negative'; }
-function td(label, value, klass = '') { return `<td data-label="${label}"${klass ? ` class="${klass}"` : ''}>${value}</td>`; }
+function td(label, value, klass = '', align = '') {
+  const classes = [align, klass].filter(Boolean).join(' ');
+  return `<td data-label="${label}"${classes ? ` class="${classes}"` : ''}>${value}</td>`;
+}
+
+function sideChip(side) {
+  const value = String(side || '').toUpperCase();
+  const kind = ['SHORT', 'SELL'].includes(value) ? 'short' : ['LONG', 'BUY'].includes(value) ? 'long' : 'flat';
+  return `<span class="side ${kind}">${esc(value || '--')}</span>`;
+}
+
+function symbol(name) { return `<span class="sym">${esc(name || '--')}</span>`; }
+function empty(text) { return `<p class="empty">${text}</p>`; }
 
 function table(rows, options = {}) {
-  if (!rows?.length) return '<p class="muted">No open positions.</p>';
-  const action = options.breakeven ? '<th>Action</th>' : '';
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>ROI</th>${action}</tr></thead><tbody>${rows.map((p) => `<tr>${td('Symbol', p.symbol || '--')}${td('Side', p.side || '--')}${td('Size', Number(p.size || 0).toFixed(5))}${td('Entry', Number(p.entry_price || 0).toFixed(5))}${td('Mark', Number(p.mark_price || 0).toFixed(5))}${td('PnL', money(p.unrealized_pnl), cls(p.unrealized_pnl))}${td('ROI', `${Number(p.roi || 0).toFixed(2)}%`, cls(p.roi))}${options.breakeven ? td('Action', `<button class="table-action${p.breakeven ? ' active' : ''}" data-breakeven="${esc(p.symbol || '')}" data-enabled="${p.breakeven ? 'false' : 'true'}">${p.breakeven ? 'Cancel breakeven' : 'Breakeven'}</button>`) : ''}</tr>`).join('')}</tbody></table></div>`;
+  if (rows?.length && rows[0]?.error) return `<p class="error">Positions unavailable: ${esc(rows[0].error)}</p>`;
+  if (!rows?.length) return empty('No open positions.');
+  const action = options.breakeven ? '<th class="act">Action</th>' : '';
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th class="num">Size</th><th class="num">Entry</th><th class="num">Mark</th><th class="num">PnL</th><th class="num">ROI</th>${action}</tr></thead><tbody>${rows.map((p) => `<tr>${td('Symbol', symbol(p.symbol))}${td('Side', sideChip(p.side))}${td('Size', Number(p.size || 0).toFixed(5), '', 'num')}${td('Entry', Number(p.entry_price || 0).toFixed(5), '', 'num')}${td('Mark', Number(p.mark_price || 0).toFixed(5), '', 'num')}${td('PnL', money(p.unrealized_pnl), cls(p.unrealized_pnl), 'num')}${td('ROI', `${Number(p.roi || 0).toFixed(2)}%`, cls(p.roi), 'num')}${options.breakeven ? td('Action', `<button class="table-action${p.breakeven ? ' active' : ''}" data-breakeven="${esc(p.symbol || '')}" data-enabled="${p.breakeven ? 'false' : 'true'}">${p.breakeven ? 'Cancel breakeven' : 'Breakeven'}</button>`, '', 'act') : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function orders(rows) {
-  if (!rows?.length) return '<p class="muted">No open orders.</p>';
-  if (rows[0]?.error) return `<p class="error">Orders unavailable: ${rows[0].error}</p>`;
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th>Amount</th><th>Price</th><th>Status</th></tr></thead><tbody>${rows.map((o) => `<tr>${td('Symbol', o.symbol || '--')}${td('Side', String(o.side || '--').toUpperCase())}${td('Type', String(o.type || '--').toUpperCase())}${td('Amount', Number(o.amount || o.remaining || 0).toFixed(5))}${td('Price', Number(o.price || 0).toFixed(5))}${td('Status', o.status || 'open')}</tr>`).join('')}</tbody></table></div>`;
+  if (!rows?.length) return empty('No open orders.');
+  if (rows[0]?.error) return `<p class="error">Orders unavailable: ${esc(rows[0].error)}</p>`;
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th class="num">Amount</th><th class="num">Price</th><th>Status</th></tr></thead><tbody>${rows.map((o) => `<tr>${td('Symbol', symbol(o.symbol))}${td('Side', sideChip(o.side))}${td('Type', esc(String(o.type || '--').toUpperCase()))}${td('Amount', Number(o.amount || o.remaining || 0).toFixed(5), '', 'num')}${td('Price', Number(o.price || 0).toFixed(5), '', 'num')}${td('Status', esc(o.status || 'open'))}</tr>`).join('')}</tbody></table></div>`;
 }
 
 function configForm(leader) {
   const config = leader.config || {};
   const stop = config.position_stop_loss || {};
   const name = leader.name;
-  return `<article class="panel leader"><div class="toolbar"><div><strong>${name}</strong><span class="muted"> ${config.execution_account || 'default'}${config.enabled === false ? ' · disabled' : ''}</span></div><button data-save="${name}">Save changes</button></div><div class="config"><label>Copy address<input data-k="address" data-name="${name}" value="${config.address ?? ''}"></label><label>Coefficient<input type="number" min="0" step="any" data-k="coefficient" data-name="${name}" value="${config.coefficient ?? ''}"></label><label>Total margin<input type="number" min="0" step="any" data-k="total_margin" data-name="${name}" value="${config.total_margin ?? ''}"></label><label>Late entry %<input type="number" min="0" step="any" data-k="late_entry_offset_pct" data-name="${name}" value="${config.late_entry_offset_pct ?? ''}"></label><label class="check"><input type="checkbox" data-k="enabled" data-name="${name}" ${config.enabled ? 'checked' : ''}> Enabled</label><label class="check"><input type="checkbox" data-k="late_entry_enabled" data-name="${name}" ${config.late_entry_enabled ? 'checked' : ''}> Late entries</label><label class="check"><input type="checkbox" data-k="position_stop_loss.enabled" data-name="${name}" ${stop.enabled ? 'checked' : ''}> Position stop loss</label><label>Max loss USDT<input type="number" min="0" step="any" data-k="position_stop_loss.max_loss_usdt" data-name="${name}" value="${stop.max_loss_usdt ?? ''}"></label></div><p class="config-message muted" data-message="${name}" aria-live="polite"></p></article>`;
+  const disabled = config.enabled === false;
+  return `<article class="panel leader config-card${disabled ? ' is-disabled' : ''}"><div class="toolbar"><div class="leader-id"><span class="leader-tag">${esc(name)}</span><span class="meta">${esc(config.execution_account || 'default')}</span>${disabled ? '<span class="badge">Disabled</span>' : ''}</div><button data-save="${esc(name)}">Save changes</button></div><div class="config"><label>Copy address<input data-k="address" data-name="${esc(name)}" value="${esc(config.address ?? '')}"></label><label>Coefficient<input type="number" min="0" step="any" data-k="coefficient" data-name="${esc(name)}" value="${config.coefficient ?? ''}"></label><label>Total margin<input type="number" min="0" step="any" data-k="total_margin" data-name="${esc(name)}" value="${config.total_margin ?? ''}"></label><label>Late entry %<input type="number" min="0" step="any" data-k="late_entry_offset_pct" data-name="${esc(name)}" value="${config.late_entry_offset_pct ?? ''}"></label><label class="check"><input type="checkbox" data-k="enabled" data-name="${esc(name)}" ${config.enabled ? 'checked' : ''}><span>Enabled</span></label><label class="check"><input type="checkbox" data-k="late_entry_enabled" data-name="${esc(name)}" ${config.late_entry_enabled ? 'checked' : ''}><span>Late entries</span></label><label class="check"><input type="checkbox" data-k="position_stop_loss.enabled" data-name="${esc(name)}" ${stop.enabled ? 'checked' : ''}><span>Position stop loss</span></label><label>Max loss USDT<input type="number" min="0" step="any" data-k="position_stop_loss.max_loss_usdt" data-name="${esc(name)}" value="${stop.max_loss_usdt ?? ''}"></label></div><p class="config-message muted" data-message="${esc(name)}" aria-live="polite"></p></article>`;
 }
 
 let configsSignature;
@@ -33,7 +47,7 @@ function renderConfigs(leaders) {
   const signature = JSON.stringify(leaders.map((leader) => [leader.name, leader.config]));
   if (signature === configsSignature) return;
   configsSignature = signature;
-  $('#configs').innerHTML = leaders.map(configForm).join('') || '<p class="muted">No leaders configured.</p>';
+  $('#configs').innerHTML = leaders.map(configForm).join('') || empty('No leaders configured.');
 }
 
 function leaderEnabled(leader) { return leader?.enabled !== false && leader?.config?.enabled !== false; }
@@ -47,23 +61,31 @@ function render(data) {
   const positionCount = $('#position-count');
   if (positionCount) positionCount.textContent = (account.positions || []).length;
   $('#mode').textContent = status.risk_locked ? 'Risk locked' : status.paused ? 'Paused' : 'Running';
+  $('#mode').dataset.state = status.risk_locked ? 'locked' : status.paused ? 'paused' : 'running';
   const hardStop = status.hard_stop || {};
   const stops = status.position_stop_loss || [];
   const stopText = hardStop.max_daily_loss_usdt != null ? `Daily ${hardStop.max_daily_loss_usdt} USDT` : hardStop.max_daily_drawdown_pct != null ? `Daily ${hardStop.max_daily_drawdown_pct}%` : stops.length ? `Position ${stops[0].max_loss_usdt ?? 'configured'} USDT` : 'Off';
   $('#stop-loss').textContent = stopText;
-  $('#status').textContent = `Live · ${new Date(data.updated_at * 1000).toLocaleTimeString()}`;
-  $('#account').innerHTML = `<p class="muted">${account.name || 'Account'} · ${account.positions?.length || 0} open positions</p>${table(account.positions, { breakeven: true })}`;
+  setLinkState('live', `Live · ${new Date(data.updated_at * 1000).toLocaleTimeString()}`);
+  $('#account').innerHTML = `<div class="panel-meta"><strong>${esc(account.name || 'Account')}</strong><span class="sep">·</span><span>${account.positions?.length || 0} open positions</span></div>${table(account.positions, { breakeven: true })}`;
   $('#orders').innerHTML = orders(account.orders);
-  $('#leaders').innerHTML = (data.leaders || []).filter(leaderEnabled).map((leader) => `<article class="panel leader"><div class="toolbar"><div><strong>${leader.name}</strong> <span class="muted">${leader.address} · ${leader.positions?.length || 0} open positions</span></div></div>${table(leader.positions)}</article>`).join('') || '<p class="muted">No leaders configured.</p>';
+  $('#leaders').innerHTML = (data.leaders || []).filter(leaderEnabled).map((leader) => `<article class="panel leader"><div class="leader-head"><div class="leader-id"><span class="leader-tag">${esc(leader.name)}</span><span class="addr" title="${esc(leader.address || '')}">${esc(leader.address)}</span><span class="sep">·</span><span class="meta">${leader.positions?.length || 0} open positions</span></div></div>${table(leader.positions)}</article>`).join('') || empty('No leaders configured.');
   renderConfigs(data.leaders || []);
   $('#toggle').textContent = status.paused ? 'Resume entries' : 'Pause entries';
   if (!$('#performance-page')?.hidden) loadPerformance();
 }
 
 const perf = { preset: 'all', since: null, until: null, charts: {}, last: 0 };
+const CHART_FONT = 'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 const PALETTES = {
-  dark: { line: '#3987e5', up: '#48d597', down: '#ff7373', grid: '#2b3748', ink: '#e8edf5', muted: '#91a0b5', surface: '#171e29' },
-  light: { line: '#2f6fd0', up: '#0b7d50', down: '#c83838', grid: '#d5dde7', ink: '#1b2430', muted: '#5f7085', surface: '#ffffff' },
+  dark: {
+    line: '#78a9ee', areaTop: 'rgba(120,169,238,.18)', areaBottom: 'rgba(120,169,238,0)',
+    up: '#4ad79b', down: '#ff7a7a', grid: '#202c3b', ink: '#e9eff7', muted: '#93a2b5', surface: '#151e2a',
+  },
+  light: {
+    line: '#2b64bd', areaTop: 'rgba(43,100,189,.13)', areaBottom: 'rgba(43,100,189,0)',
+    up: '#0b7d50', down: '#bd3030', grid: '#dae2ec', ink: '#121c28', muted: '#5b6b7d', surface: '#ffffff',
+  },
 };
 let themeName = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
 const CHART = { ...PALETTES[themeName] };
@@ -75,8 +97,9 @@ function setTheme(name) {
   Object.assign(CHART, PALETTES[themeName]);
   const button = $('#theme');
   if (button) {
-    button.textContent = themeName === 'dark' ? '☀️' : '🌙';
-    button.title = themeName === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
+    const next = themeName === 'dark' ? 'light' : 'dark';
+    button.title = `Switch to ${next} mode`;
+    button.setAttribute('aria-label', `Switch to ${next} mode`);
   }
   if (!$('#performance-page')?.hidden) loadPerformance(true);
 }
@@ -139,7 +162,14 @@ function disposeCharts() {
 }
 
 function tooltipShell() {
-  return { backgroundColor: CHART.surface, borderColor: CHART.grid, textStyle: { color: CHART.ink } };
+  return {
+    backgroundColor: CHART.surface,
+    borderColor: CHART.grid,
+    borderWidth: 1,
+    padding: [8, 10],
+    textStyle: { color: CHART.ink, fontSize: 12, fontFamily: CHART_FONT },
+    extraCssText: 'border-radius:8px;box-shadow:0 12px 32px -12px rgba(0,0,0,.45);',
+  };
 }
 
 function renderEquity(node, curve) {
@@ -148,12 +178,23 @@ function renderEquity(node, curve) {
   const rows = curve || [];
   chart.setOption({
     backgroundColor: 'transparent',
+    animationDuration: 280,
+    animationEasing: 'cubicOut',
+    aria: { enabled: true },
+    textStyle: { fontFamily: CHART_FONT },
     grid: { left: 8, right: 16, top: 16, bottom: 8, containLabel: true },
     tooltip: { trigger: 'axis', ...tooltipShell(), axisPointer: { type: 'line', lineStyle: { color: CHART.grid } },
       formatter: (items) => { const row = rows[items[0]?.dataIndex] || {}; return `<strong>${money(row.adjusted_equity)}</strong> adjusted equity<br><span class="muted">equity</span> ${money(row.equity)} · <span class="muted">drawdown</span> ${money(row.drawdown)}<br><span class="muted">${new Date((row.timestamp || 0) * 1000).toLocaleString()}</span>`; } },
-    xAxis: { type: 'time', axisLine: { lineStyle: { color: CHART.grid } }, axisLabel: { color: CHART.muted }, splitLine: { show: false } },
-    yAxis: { type: 'value', scale: true, axisLabel: { color: CHART.muted }, splitLine: { lineStyle: { color: CHART.grid, type: 'solid' } } },
-    series: [{ type: 'line', data: rows.map((x) => [Number(x.timestamp) * 1000, Number(x.adjusted_equity)]), showSymbol: false, lineStyle: { color: CHART.line, width: 2 }, itemStyle: { color: CHART.line }, areaStyle: { color: 'rgba(57,135,229,0.10)' } }],
+    xAxis: { type: 'time', axisLine: { lineStyle: { color: CHART.grid } }, axisTick: { show: false }, axisLabel: { color: CHART.muted, fontSize: 11 }, splitLine: { show: false } },
+    yAxis: { type: 'value', scale: true, axisLabel: { color: CHART.muted, fontSize: 11 }, splitLine: { lineStyle: { color: CHART.grid, type: 'dashed' } } },
+    series: [{
+      type: 'line',
+      data: rows.map((x) => [Number(x.timestamp) * 1000, Number(x.adjusted_equity)]),
+      showSymbol: false,
+      lineStyle: { color: CHART.line, width: 2 },
+      itemStyle: { color: CHART.line },
+      areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: CHART.areaTop }, { offset: 1, color: CHART.areaBottom }]) },
+    }],
   }, true);
   chart.resize();
 }
@@ -168,11 +209,15 @@ function renderLeaderBars(node, leaders) {
   });
   chart.setOption({
     backgroundColor: 'transparent',
+    animationDuration: 280,
+    animationEasing: 'cubicOut',
+    aria: { enabled: true },
+    textStyle: { fontFamily: CHART_FONT },
     grid: { left: 8, right: 64, top: 8, bottom: 8, containLabel: true },
     tooltip: { trigger: 'item', ...tooltipShell(), formatter: (item) => `<strong>${money(item.value)}</strong> · ${esc(rows[item.dataIndex]?.leader)}` },
-    xAxis: { type: 'value', splitNumber: 3, axisLabel: { color: CHART.muted, formatter: compact }, splitLine: { lineStyle: { color: CHART.grid, type: 'solid' } } },
-    yAxis: { type: 'category', data: rows.map((x) => x.leader), axisLine: { lineStyle: { color: CHART.grid } }, axisLabel: { color: CHART.muted }, axisTick: { show: false } },
-    series: [{ type: 'bar', data, barMaxWidth: 24, label: { show: true, color: CHART.ink, formatter: (item) => signed(item.value) } }],
+    xAxis: { type: 'value', splitNumber: 3, axisLabel: { color: CHART.muted, fontSize: 11, formatter: compact }, splitLine: { lineStyle: { color: CHART.grid, type: 'dashed' } } },
+    yAxis: { type: 'category', data: rows.map((x) => x.leader), axisLine: { lineStyle: { color: CHART.grid } }, axisLabel: { color: CHART.muted, fontSize: 11 }, axisTick: { show: false } },
+    series: [{ type: 'bar', data, barMaxWidth: 22, label: { show: true, color: CHART.ink, fontSize: 11, formatter: (item) => signed(item.value) } }],
   }, true);
   chart.resize();
 }
@@ -209,24 +254,55 @@ async function load() {
   render(await response.json());
 }
 
+function setLinkState(state, text) {
+  const pill = $('#status');
+  if (pill) pill.dataset.state = state;
+  const label = $('#status-text');
+  if (label) label.textContent = text;
+}
+
+let toastTimer;
+function toast(message, tone = 'error') {
+  const node = $('#toast');
+  if (!node) return;
+  node.textContent = message;
+  node.dataset.tone = tone;
+  node.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { node.hidden = true; }, 6000);
+}
+
 function connect() {
   if (source) source.close();
   source = new EventSource('/api/v1/events');
+  source.onopen = () => setLinkState('live', 'Live');
   source.onmessage = (event) => render(JSON.parse(event.data));
-  source.onerror = () => { $('#status').textContent = 'Reconnecting'; };
+  source.onerror = () => setLinkState('reconnecting', 'Reconnecting');
 }
 
 $('#toggle').onclick = async () => {
-  const paused = $('#toggle').textContent.startsWith('Pause');
-  await fetch(`/api/v1/control/${paused ? 'pause' : 'resume'}`, { method: 'POST' });
-  await load();
+  const button = $('#toggle');
+  const paused = button.textContent.startsWith('Pause');
+  button.disabled = true;
+  try {
+    const response = await fetch(`/api/v1/control/${paused ? 'pause' : 'resume'}`, { method: 'POST' });
+    if (!response.ok) throw Error((await response.text()).trim() || `request failed: ${response.status}`);
+    await load();
+  } catch (error) {
+    toast(`Could not ${paused ? 'pause' : 'resume'} entries: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
 };
 
 document.addEventListener('click', async (event) => {
   const tab = event.target.closest('[data-page]');
   if (tab) {
-    document.querySelectorAll('.tab').forEach((item) => item.classList.remove('active'));
-    tab.classList.add('active');
+    document.querySelectorAll('.tab').forEach((item) => {
+      const selected = item === tab;
+      item.classList.toggle('active', selected);
+      item.setAttribute('aria-selected', String(selected));
+    });
     document.querySelectorAll('#monitor-page,#performance-page,#config-page').forEach((page) => { page.hidden = page.id !== tab.dataset.page; });
     if (tab.dataset.page === 'performance-page') loadPerformance(true);
     return;
@@ -245,7 +321,7 @@ document.addEventListener('click', async (event) => {
       await load();
     } catch (error) {
       breakeven.disabled = false;
-      alert(`Breakeven failed for ${symbol}: ${error.message}`);
+      toast(`Breakeven failed for ${symbol}: ${error.message}`);
     }
     return;
   }
@@ -261,13 +337,32 @@ document.addEventListener('click', async (event) => {
       payload.position_stop_loss[key.split('.')[1]] = value;
     } else payload[key] = value;
   });
-  const message = document.querySelector(`[data-message="${name}"]`);
-  const response = await fetch(`/api/v1/leaders/${encodeURIComponent(name)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-  if (!response.ok) { message.textContent = await response.text(); message.className = 'config-message error'; return; }
-  await load();
-  const updatedMessage = document.querySelector(`[data-message="${name}"]`);
-  updatedMessage.textContent = 'Saved and applied to the running engine.';
-  updatedMessage.className = 'config-message positive';
+  button.disabled = true;
+  try {
+    const message = document.querySelector(`[data-message="${name}"]`);
+    const response = await fetch(`/api/v1/leaders/${encodeURIComponent(name)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (!response.ok) { message.textContent = await response.text(); message.className = 'config-message error'; return; }
+    await load();
+    const updatedMessage = document.querySelector(`[data-message="${name}"]`);
+    updatedMessage.textContent = 'Saved and applied to the running engine.';
+    updatedMessage.className = 'config-message positive';
+  } catch (error) {
+    toast(`Could not save ${name}: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+const tablist = document.querySelector('.tabs');
+if (tablist) tablist.addEventListener('keydown', (event) => {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+  const tabs = [...tablist.querySelectorAll('.tab')];
+  const index = tabs.indexOf(document.activeElement);
+  if (index < 0) return;
+  event.preventDefault();
+  const next = tabs[(index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
+  next.focus();
+  next.click();
 });
 
 document.querySelectorAll('#perf-presets .chip').forEach((chip) => { chip.onclick = () => setPreset(chip.dataset.preset); });
@@ -287,4 +382,4 @@ const themeButton = $('#theme');
 if (themeButton) themeButton.onclick = () => setTheme(themeName === 'dark' ? 'light' : 'dark');
 setTheme(themeName);
 
-load().then(connect).catch(() => { $('#status').textContent = 'Dashboard unavailable'; });
+load().then(connect).catch(() => { setLinkState('offline', 'Dashboard unavailable'); });
