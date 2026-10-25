@@ -16,8 +16,9 @@ API keys, exchange selection, and manual orders are intentionally unavailable
 from the web UI. Account positions, open orders, trades, and performance rows
 show the Hyperliquid symbol name when `symbol_map` maps the venue instrument.
 
-The Performance page and `/api/v1/performance/overview` expose realized gross
-PnL, fees, funding, cash-flow-adjusted return, drawdown, and trader aggregates.
+The Performance page shows realized gross PnL, fees, cash-flow-adjusted
+return, drawdown, and trader aggregates; `/api/v1/performance/overview` also
+exposes funding and trade counts.
 Exchange deposits, withdrawals, and funding history are normalized when the
 configured CCXT adapter supports them. Existing databases are upgraded in
 place when the console starts; records that cannot be matched to local fills

@@ -47,7 +47,25 @@ function render(data) {
 }
 
 const perf = { preset: 'all', since: null, until: null, charts: {}, last: 0 };
-const CHART = { line: '#3987e5', up: '#48d597', down: '#ff7373', grid: '#2b3748', ink: '#e8edf5', muted: '#91a0b5', surface: '#171e29' };
+const PALETTES = {
+  dark: { line: '#3987e5', up: '#48d597', down: '#ff7373', grid: '#2b3748', ink: '#e8edf5', muted: '#91a0b5', surface: '#171e29' },
+  light: { line: '#2f6fd0', up: '#0b7d50', down: '#c83838', grid: '#d5dde7', ink: '#1b2430', muted: '#5f7085', surface: '#ffffff' },
+};
+let themeName = document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
+const CHART = { ...PALETTES[themeName] };
+
+function setTheme(name) {
+  themeName = name === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = themeName;
+  try { localStorage.setItem('theme', themeName); } catch (_) { /* storage unavailable */ }
+  Object.assign(CHART, PALETTES[themeName]);
+  const button = $('#theme');
+  if (button) {
+    button.textContent = themeName === 'dark' ? '☀️' : '🌙';
+    button.title = themeName === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
+  }
+  if (!$('#performance-page')?.hidden) loadPerformance(true);
+}
 
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 function signed(value) { const n = Number(value || 0); return `${n >= 0 ? '+' : ''}${n.toFixed(2)}`; }
@@ -86,13 +104,13 @@ function setPreset(name) {
 
 function perfMetrics(p) {
   const tile = (label, value, klass = '') => `<div><small>${label}</small><strong class="${klass}">${value}</strong></div>`;
-  return `<div class="kpis">${tile('Net PnL', money(p.net_pnl), cls(p.net_pnl))}${tile('Return', `${Number(p.return_pct || 0).toFixed(2)}%`, cls(p.return_pct))}${tile('Max drawdown', `${money(p.max_drawdown)} (${Number(p.max_drawdown_pct || 0).toFixed(2)}%)`, 'negative')}${tile('Gross / fees', `${money(p.gross_pnl)} / ${money(p.fees)}`)}${tile('Funding', money(p.funding), cls(p.funding))}${tile('Realized trades', String(p.trades || 0))}</div>`;
+  return `<div class="kpis">${tile('Net PnL', money(p.net_pnl), cls(p.net_pnl))}${tile('Return', `${Number(p.return_pct || 0).toFixed(2)}%`, cls(p.return_pct))}${tile('Max drawdown', `${money(p.max_drawdown)} (${Number(p.max_drawdown_pct || 0).toFixed(2)}%)`, 'negative')}${tile('Gross / fees', `${money(p.gross_pnl)} / ${money(p.fees)}`)}</div>`;
 }
 
 function leaderTable(leaders) {
   if (!leaders?.length) return '<p class="muted">No realized trades in this period.</p>';
-  const rows = leaders.map((x) => `<tr class="${x.leader === 'unattributed' ? 'muted' : ''}">${td('Trader', esc(x.leader))}${td('Net PnL', money(x.net_pnl), cls(x.net_pnl))}${td('Gross', money(x.gross_pnl))}${td('Fees', money(x.fees))}${td('Funding', money(x.funding), cls(x.funding))}${td('Win rate', `${(Number(x.win_rate) * 100).toFixed(1)}%`)}${td('Trades', x.trades)}${td('Contribution', `${Number(x.contribution_pct).toFixed(2)}%`)}</tr>`).join('');
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>Trader</th><th>Net PnL</th><th>Gross</th><th>Fees</th><th>Funding</th><th>Win rate</th><th>Trades</th><th>Contribution</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+  const rows = leaders.map((x) => `<tr class="${x.leader === 'unattributed' ? 'muted' : ''}">${td('Trader', esc(x.leader))}${td('Net PnL', money(x.net_pnl), cls(x.net_pnl))}${td('Gross', money(x.gross_pnl))}${td('Fees', money(x.fees))}${td('Contribution', `${Number(x.contribution_pct).toFixed(2)}%`)}</tr>`).join('');
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>Trader</th><th>Net PnL</th><th>Gross</th><th>Fees</th><th>Contribution</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function positionTable(rows) {
@@ -250,5 +268,9 @@ if (perfApply) perfApply.onclick = () => {
 };
 
 window.addEventListener('resize', () => Object.values(perf.charts).forEach((chart) => chart.resize()));
+
+const themeButton = $('#theme');
+if (themeButton) themeButton.onclick = () => setTheme(themeName === 'dark' ? 'light' : 'dark');
+setTheme(themeName);
 
 load().then(connect).catch(() => { $('#status').textContent = 'Dashboard unavailable'; });
