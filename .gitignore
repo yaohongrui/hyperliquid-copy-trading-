@@ -24,3 +24,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Impeccable engine binary (downloaded per machine on first run)
+.claude/skills/impeccable/scripts/bin/
