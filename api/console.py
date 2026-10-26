@@ -663,7 +663,11 @@ class ConsoleService:
     def _account_position(self, p):
         contracts = _number(p.get("contracts")); size = contracts * (_number(p.get("contractSize")) or 1)
         entry = _number(p.get("entryPrice")); pnl = _number(p.get("unrealizedPnl"))
-        notional = _number(p.get("notional")); leverage = _number(p.get("leverage")) or 1
+        notional = _number(p.get("notional")); leverage = _number(p.get("leverage"))
+        if not leverage:
+            # binanceusdm omits the leverage field; recover it from the margin.
+            margin = _number(p.get("initialMargin")) or _number(p.get("marginUsed"))
+            leverage = round(notional / margin, 2) if notional and margin else 1
         return {"symbol": self.symbol_map.display(p.get("symbol")), "side": str(p.get("side") or "").upper(),
                 "size": abs(size), "entry_price": entry, "mark_price": _number(p.get("markPrice")),
                 "unrealized_pnl": pnl, "leverage": leverage,

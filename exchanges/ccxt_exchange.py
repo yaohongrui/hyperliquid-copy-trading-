@@ -47,6 +47,9 @@ class CcxtExchange:
         # set_leverage is a signed REST call; the configured leverage is
         # static, so only send it when the market's cached value changes.
         self._leverage_set = {}
+        # binanceusdm leaves market.limits.leverage.max empty, so the per-symbol
+        # cap is resolved from the leverage brackets once and cached.
+        self._leverage_max = {}
         self._ledger_since = None
 
     async def start(self):
@@ -55,6 +58,18 @@ class CcxtExchange:
 
     async def stop(self):
         await self.client.close()
+
+    async def _binance_max_leverage(self, market):
+        """Highest leverage Binance accepts for ``market`` (tier-1 bracket)."""
+        if market not in self._leverage_max:
+            try:
+                tiers = await self.client.fetch_leverage_tiers([market])
+            except (NotImplementedError, AttributeError, ccxt.NotSupported, ccxt.ExchangeError):
+                tiers = {}
+            values = tiers.get(market) if isinstance(tiers, dict) else tiers
+            self._leverage_max[market] = max(
+                (_float(row.get('maxLeverage')) for row in values or []), default=0.0) or None
+        return self._leverage_max[market]
 
     def _symbol(self, symbol):
         raw = str(symbol or "").strip().upper().replace("_", "/")
@@ -127,6 +142,8 @@ class CcxtExchange:
         leverage = self.config.get("leverage")
         if leverage and not reduce_only:
             maximum = self.client.markets[market].get('limits', {}).get('leverage', {}).get('max')
+            if not maximum and self.name == 'binance':
+                maximum = await self._binance_max_leverage(market)
             effective = min(int(leverage), int(maximum)) if maximum else int(leverage)
             if self._leverage_set.get(market) != effective:
                 if self.name == 'gate' and self.config.get('margin_mode') in ('cross', 'crossed'):
@@ -250,6 +267,41 @@ class CcxtExchange:
             rows = await self._gate_ledger_rows()
             if rows is not None:
                 return rows
+        if self.name == 'binance' and self.client.has.get('fetchLedger'):
+            # binanceusdm exposes neither fetchIncome nor an account-wide
+            # fetchMyTrades, but its account book (the income endpoint) carries
+            # every REALIZED_PNL row.  Commission rows share the trade id, so
+            # fold them into the same console row instead of losing the fee.
+            try:
+                ledger = await self.client.fetch_ledger(limit=1000)
+            except (NotImplementedError, AttributeError, ccxt.NotSupported):
+                ledger = None
+            if ledger is not None:
+                rows, fees = {}, {}
+                for entry in ledger:
+                    info = entry.get('info') or {}
+                    kind = str(info.get('incomeType') or '').upper()
+                    trade_id = str(info.get('tradeId') or '')
+                    if kind == 'COMMISSION':
+                        if trade_id:
+                            fees[trade_id] = fees.get(trade_id, 0.0) + abs(_float(entry.get('amount')))
+                        continue
+                    if kind != 'REALIZED_PNL':
+                        continue
+                    timestamp = entry.get('timestamp')
+                    if timestamp and timestamp > 10_000_000_000:
+                        timestamp /= 1000
+                    raw_symbol = info.get('symbol')
+                    rows[trade_id or entry.get('id')] = {
+                        'id': trade_id or entry.get('id'), 'source': 'income',
+                        'symbol': self._unified_symbol(raw_symbol) if raw_symbol else None,
+                        'side': None, 'amount': 0.0, 'price': 0.0,
+                        'realizedPnl': _float(entry.get('amount')), 'fee': 0.0,
+                        'timestamp': timestamp,
+                    }
+                for key, row in rows.items():
+                    row['fee'] = fees.get(key, 0.0)
+                return list(rows.values())
         if self.client.has.get('fetchIncome'):
             try:
                 income = await self.client.fetch_income(limit=100)
@@ -284,7 +336,11 @@ class CcxtExchange:
                 return rows
         if not self.client.has.get('fetchMyTrades'):
             return []
-        rows = await self.client.fetch_my_trades(limit=100)
+        try:
+            rows = await self.client.fetch_my_trades(limit=100)
+        except ccxt.ArgumentsRequired:
+            # Some venues (binanceusdm) cannot list account-wide trades.
+            return []
         result = []
         for row in rows or []:
             info = row.get('info') or {}
