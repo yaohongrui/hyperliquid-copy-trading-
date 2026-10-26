@@ -6,6 +6,7 @@ config/lead.env
 
 # Runtime state, logs, and temporary files
 data/
+archive/
 *.log
 *.pid
 *.tmp
