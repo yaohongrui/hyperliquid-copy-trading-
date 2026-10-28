@@ -132,6 +132,7 @@ class Engine:
             'ORDER_NOT_FOUND', 'ORDER NOT FOUND', 'NOT_FOUND', 'NOT FOUND',
             'UNKNOWN_ORDER', 'UNKNOWN ORDER', 'ALREADY FILLED', 'ALREADY CLOSED',
             'NOT OPEN', 'DOES NOT EXIST', 'NO SUCH ORDER',
+            'INVALID ALGO', 'BEEN COMPLETED',
         ))
 
     def _track_pending(self, leader, symbol, order):
@@ -398,6 +399,11 @@ class Engine:
         mark = float(detail.get('markPrice') or detail.get('markPx') or 0)
         if trigger <= 0 or (mark > 0 and ((side == 'long' and trigger >= mark) or (side == 'short' and trigger <= mark))):
             log.warning('Protection price invalid for %s: side=%s entry=%g mark=%g trigger=%g; no order created', symbol, side, entry, mark, trigger)
+            # The tracked stop no longer exists or was never accepted; drop the
+            # record so a later reconciliation can place a valid one instead
+            # of trusting a dead id.
+            self.runtime_state.get('protection', {}).pop(key, None)
+            self._save_state()
             if hasattr(self.exchange, 'cancel_protection_orders'):
                 await self.exchange.cancel_protection_orders(symbol)
             return

@@ -27,7 +27,7 @@ function table(rows, options = {}) {
 function orders(rows) {
   if (!rows?.length) return empty('No open orders.');
   if (rows[0]?.error) return `<p class="error">Orders unavailable: ${esc(rows[0].error)}</p>`;
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th class="num">Amount</th><th class="num">Price</th><th>Status</th></tr></thead><tbody>${rows.map((o) => `<tr>${td('Symbol', symbol(o.symbol))}${td('Side', sideChip(o.side))}${td('Type', esc(String(o.type || '--').toUpperCase()))}${td('Amount', Number(o.amount || o.remaining || 0).toFixed(5), '', 'num')}${td('Price', Number(o.price || 0).toFixed(5), '', 'num')}${td('Status', esc(o.status || 'open'))}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table class="table"><thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th class="num">Amount</th><th class="num">Price</th><th>Status</th></tr></thead><tbody>${rows.map((o) => { const price = o.triggerPrice ?? o.stopPrice ?? o.price; return `<tr>${td('Symbol', symbol(o.symbol))}${td('Side', sideChip(o.side))}${td('Type', esc(String(o.info?.orderType || o.type || '--').toUpperCase()))}${td('Amount', Number(o.amount || o.remaining || 0).toFixed(5), '', 'num')}${td('Price', Number(price || 0).toFixed(5), '', 'num')}${td('Status', esc(o.status || 'open'))}</tr>`; }).join('')}</tbody></table></div>`;
 }
 
 function configForm(leader) {

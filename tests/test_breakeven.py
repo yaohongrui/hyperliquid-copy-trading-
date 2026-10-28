@@ -103,6 +103,25 @@ class BreakevenTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(exchange.set_calls[-1], ("BTC", "sell", 1.0, 100.0))
 
+    async def test_configured_stop_follows_add_and_reduce(self):
+        exchange = BreakevenExchange(entry=100, mark=101, contracts=2)
+        engine = self.engine(exchange, {"enabled": True, "max_loss_usdt": 10})
+
+        await engine.reconcile_protections()
+        self.assertEqual(exchange.set_calls[-1], ("BTC", "sell", 2.0, 95.0))
+
+        # The leader adds: the same dollar cap is spread over more contracts,
+        # so the stop moves closer to entry and must be replaced.
+        exchange.contracts = 4
+        exchange.entry = 101
+        await engine.reconcile_protections()
+        self.assertEqual(exchange.set_calls[-1], ("BTC", "sell", 4.0, 98.5))
+
+        # A partial close widens the per-contract distance again.
+        exchange.contracts = 1
+        await engine.reconcile_protections()
+        self.assertEqual(exchange.set_calls[-1], ("BTC", "sell", 1.0, 91.0))
+
     async def test_clear_restores_the_configured_stop_loss(self):
         exchange = BreakevenExchange()
         engine = self.engine(exchange, {"enabled": True, "max_loss_usdt": 10})

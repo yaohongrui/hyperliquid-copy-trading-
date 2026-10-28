@@ -199,7 +199,17 @@ class CcxtExchange:
         trigger = float(self.client.price_to_precision(market, trigger_price))
         if self.name == 'binance':
             params = {'stopPrice': trigger, 'closePosition': True}
-            result = await self.client.create_order(market, 'STOP_MARKET', side, None, None, params)
+            try:
+                result = await self.client.create_order(market, 'STOP_MARKET', side, None, None, params)
+            except ccxt.ExchangeError as exc:
+                if '-4130' not in str(exc):
+                    raise
+                # Binance allows only one closePosition stop per direction.
+                # The existing one may be untracked locally (earlier process
+                # or a state-file reset), so clear the market's conditional
+                # orders and retry instead of leaving the position unprotected.
+                await self.cancel_protection_orders(symbol)
+                result = await self.client.create_order(market, 'STOP_MARKET', side, None, None, params)
         elif self.name == 'gate':
             # Gate's futures API exposes trigger orders through CCXT's
             # unified triggerPrice parameter.  reduceOnly keeps the order
@@ -217,6 +227,11 @@ class CcxtExchange:
                 'settle': self.config.get('settle', 'usdt'),
                 'order_id': str(order_id),
             })
+        if self.name == 'binance':
+            # Stops are algo orders on Binance; the regular order endpoint
+            # answers "unknown order" for their id.
+            return await self.client.cancel_order(
+                order_id, self._symbol(symbol), {'stop': True})
         return await self.cancel_order(order_id, symbol)
 
     async def cancel_protection_orders(self, symbol, keep_id=None):
@@ -236,6 +251,29 @@ class CcxtExchange:
                     await self.cancel_protection(oid, symbol)
             return
         market = self._symbol(symbol)
+        if self.name == 'binance':
+            # Conditional STOP/TAKE_PROFIT orders are algo orders: they are
+            # absent from /openOrders and every cancel/replace must target the
+            # algo endpoint, otherwise duplicates pile up and Binance rejects
+            # the replacement with -4130.
+            for order in await self.client.fetch_open_orders(
+                    market, None, None, {'stop': True}) or []:
+                oid = str(order.get('id') or '')
+                if not oid or (keep_id and oid == str(keep_id)):
+                    continue
+                info = order.get('info') or {}
+                close_position = str(info.get('closePosition', '')).lower() == 'true'
+                reduce_only = order.get('reduceOnly')
+                if reduce_only is None:
+                    reduce_only = info.get('reduceOnly', False)
+                if not close_position and str(reduce_only).lower() != 'true':
+                    continue
+                try:
+                    await self.cancel_order(oid, symbol, {'stop': True})
+                except Exception as exc:
+                    if not self._order_gone(exc):
+                        raise
+            return
         for order in await self.client.fetch_open_orders(market):
             oid = str(order.get('id') or '')
             if keep_id and oid == str(keep_id):
@@ -250,7 +288,16 @@ class CcxtExchange:
                 await self.cancel_order(oid, symbol)
 
     async def fetch_open_orders(self):
-        return await self.client.fetch_open_orders()
+        orders = list(await self.client.fetch_open_orders())
+        if self.name == 'binance':
+            # Conditional (algo) stops are invisible to /openOrders, but the
+            # console and reports must show the live protection order.
+            try:
+                orders += list(await self.client.fetch_open_orders(
+                    None, None, None, {'stop': True}))
+            except Exception:
+                log.warning('Failed to fetch Binance conditional orders', exc_info=True)
+        return orders
 
     async def fetch_realized_pnl(self):
         """Return recent exchange realized-PnL rows in the console schema.
@@ -540,6 +587,7 @@ class CcxtExchange:
             'ORDER_NOT_FOUND', 'ORDER NOT FOUND', 'NOT_FOUND', 'NOT FOUND',
             'UNKNOWN_ORDER', 'UNKNOWN ORDER', 'ALREADY FILLED', 'ALREADY CLOSED',
             'NOT OPEN', 'DOES NOT EXIST', 'NO SUCH ORDER',
+            'INVALID ALGO', 'BEEN COMPLETED',
         ))
 
     async def cancel_all_orders(self):
@@ -578,6 +626,24 @@ class CcxtExchange:
                     continue
                 try:
                     await self.cancel_protection(order_id, None)
+                    canceled += 1
+                except Exception as exc:
+                    if not self._order_gone(exc):
+                        errors.append(exc)
+        elif self.name == 'binance':
+            # Stops are algo orders and stay invisible to openOrders; a stale
+            # one must not survive a flatten or it could close the next trade.
+            try:
+                rows = await self.client.fetch_open_orders(None, None, None, {'stop': True})
+            except Exception as exc:
+                rows = []
+                errors.append(exc)
+            for row in rows or []:
+                order_id = str(row.get('id') or '')
+                if not order_id:
+                    continue
+                try:
+                    await self.client.cancel_order(order_id, row.get('symbol'), {'stop': True})
                     canceled += 1
                 except Exception as exc:
                     if not self._order_gone(exc):
@@ -643,5 +709,6 @@ class CcxtExchange:
         await self.cancel_all_orders()
         return closed
 
-    async def cancel_order(self, order_id, symbol=None):
-        return await self.client.cancel_order(order_id, self._symbol(symbol) if symbol else None)
+    async def cancel_order(self, order_id, symbol=None, params=None):
+        return await self.client.cancel_order(
+            order_id, self._symbol(symbol) if symbol else None, params or {})

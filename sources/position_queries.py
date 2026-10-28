@@ -249,7 +249,8 @@ async def account_positions(accounts, leaders, symbol_map=None):
                 lines.append(
                     f"    {_display(order.get('symbol', '?'), symbol_map)} {str(order.get('side') or '?').upper()} "
                     f"{_number(order.get('amount') or order.get('remaining')):g} @ "
-                    f"{_number(order.get('price')):g} | {str(order.get('type') or '?').upper()} "
+                    f"{_number(order.get('triggerPrice') or order.get('stopPrice') or order.get('price')):g} | "
+                    f"{str((info.get('orderType') or order.get('type')) or '?').upper()} "
                     f"| reduce-only {bool(reduce_only)} | id {order.get('id', '?')}"
                 )
         finally:
