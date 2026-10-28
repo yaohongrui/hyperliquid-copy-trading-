@@ -106,9 +106,18 @@ class ConsoleStore:
                 timestamp = row.get("timestamp") or time.time()
                 if timestamp > 1e10:
                     timestamp = timestamp / 1000.0
-                db.execute("""INSERT OR IGNORE INTO trades
+                # Upsert so a corrected feed value replaces a row written by an
+                # older parser (e.g. Binance income sign) instead of being
+                # ignored forever by INSERT OR IGNORE.
+                db.execute("""INSERT INTO trades
                     (account,exchange_trade_id,symbol,side,quantity,price,realized_pnl,fee,funding,source,timestamp)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (account, f"{account}:{external_id}", row.get("symbol"), row.get("side"),
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(exchange_trade_id) DO UPDATE SET
+                      symbol=excluded.symbol, realized_pnl=excluded.realized_pnl,
+                      fee=excluded.fee, funding=excluded.funding, source=excluded.source
+                    WHERE trades.realized_pnl IS NOT excluded.realized_pnl
+                       OR trades.fee IS NOT excluded.fee
+                       OR trades.funding IS NOT excluded.funding""", (account, f"{account}:{external_id}", row.get("symbol"), row.get("side"),
                     row.get("amount"), row.get("price"), row.get("realizedPnl", row.get("realized_pnl", 0)),
                     row.get("fee", 0), row.get("funding", 0), row.get("source"), timestamp))
 

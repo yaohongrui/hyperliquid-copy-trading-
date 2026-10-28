@@ -296,7 +296,7 @@ class CcxtExchange:
                         'id': trade_id or entry.get('id'), 'source': 'income',
                         'symbol': self._unified_symbol(raw_symbol) if raw_symbol else None,
                         'side': None, 'amount': 0.0, 'price': 0.0,
-                        'realizedPnl': _float(entry.get('amount')), 'fee': 0.0,
+                        'realizedPnl': self._signed_ledger_amount(entry), 'fee': 0.0,
                         'timestamp': timestamp,
                     }
                 for key, row in rows.items():
@@ -430,6 +430,21 @@ class CcxtExchange:
             if row.pop('has_pnl', False):
                 result.append(row)
         return result
+
+    @staticmethod
+    def _signed_ledger_amount(entry):
+        """Signed income amount.
+
+        CCXT normalizes ledger amounts to a positive magnitude and moves the
+        sign into ``direction`` ("out" for a loss or fee).  Reading the raw
+        income keeps losses negative; the fee leg is normalized separately.
+        """
+        info = entry.get('info') or {}
+        raw = info.get('income', info.get('amount'))
+        if raw not in (None, ''):
+            return _float(raw)
+        amount = _float(entry.get('amount'))
+        return -amount if str(entry.get('direction') or '').lower() == 'out' else amount
 
     @staticmethod
     def _closed_position_row(row):

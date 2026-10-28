@@ -251,3 +251,57 @@ def test_gate_ledger_incremental_uses_watermark():
     assert "from" not in calls[0]
     # Second call only asks for the recent overlap, not the full history.
     assert calls[1]["from"] == 1792272473 - 300
+
+
+def test_binance_realized_pnl_keeps_the_loss_sign():
+    """CCXT turns a negative income into a positive amount + direction='out'."""
+    from exchanges.ccxt_exchange import CcxtExchange
+
+    class Client:
+        has = {"fetchLedger": True}
+        markets = {}
+
+        async def fetch_ledger(self, limit=1000):
+            return [
+                {"id": "1", "amount": 2.5, "direction": "out", "timestamp": 1000,
+                 "info": {"incomeType": "REALIZED_PNL", "income": "-2.5",
+                          "tradeId": "1", "symbol": "BTCUSDT"}},
+                {"id": "2", "amount": 0.1, "direction": "out", "timestamp": 1000,
+                 "info": {"incomeType": "COMMISSION", "income": "-0.1",
+                          "tradeId": "1", "symbol": "BTCUSDT"}},
+                {"id": "3", "amount": 4.0, "direction": "in", "timestamp": 1001,
+                 "info": {"incomeType": "REALIZED_PNL", "income": "4.0",
+                          "tradeId": "3", "symbol": "BTCUSDT"}},
+            ]
+
+    exchange = CcxtExchange.__new__(CcxtExchange)
+    exchange.name = "binance"
+    exchange.config = {}
+    exchange.client = Client()
+
+    import asyncio
+    rows = asyncio.run(exchange.fetch_realized_pnl())
+
+    by_id = {row["id"]: row for row in rows}
+    assert by_id["1"]["realizedPnl"] == -2.5
+    assert by_id["1"]["fee"] == 0.1
+    assert by_id["3"]["realizedPnl"] == 4.0
+
+
+def test_corrected_realized_pnl_updates_an_existing_row(tmp_path):
+    store = ConsoleStore(tmp_path / "console.sqlite3")
+    now = time.time()
+    store.insert_trades("binance_primary", [{
+        "id": "1", "symbol": "BTC/USDT:USDT", "realizedPnl": 2.5,
+        "fee": 0.1, "source": "income", "timestamp": now,
+    }])
+    # A later refresh from the fixed parser reports the same trade as a loss.
+    store.insert_trades("binance_primary", [{
+        "id": "1", "symbol": "BTC/USDT:USDT", "realizedPnl": -2.5,
+        "fee": 0.1, "source": "income", "timestamp": now,
+    }])
+
+    row = sqlite3.connect(store.path).execute(
+        "SELECT realized_pnl FROM trades WHERE exchange_trade_id='binance_primary:1'").fetchone()
+    assert row[0] == -2.5
+    assert store.performance("binance_primary")["net_pnl"] == -2.6
