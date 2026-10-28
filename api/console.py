@@ -10,6 +10,7 @@ import aiohttp
 from aiohttp import web
 
 from sources.position_queries import _address, _number, _roi, leader_snapshot
+from sources.routing import is_hyperliquid, leader_source
 from core.symbols import SymbolMap
 
 log = logging.getLogger(__name__)
@@ -366,12 +367,15 @@ class ConsoleService:
         name = request.match_info["name"]
         if name not in self.engine.leaders:
             raise web.HTTPNotFound(text="Unknown leader")
+        # The source is fixed by config; decide before applying the changes so
+        # an address never leaks into a Binance leader's update.
+        source = leader_source(self.engine.leaders[name])
         payload = await request.json()
         changes = {k: v for k, v in payload.items() if k in self.editable}
         if not changes:
             raise web.HTTPBadRequest(text="No editable fields")
         try:
-            if "address" in changes:
+            if "address" in changes and source == "hyperliquid":
                 address = str(changes["address"]).strip()
                 if not (address.startswith("0x") and len(address) == 42):
                     raise ValueError("address must be a 42-character 0x address")
@@ -399,20 +403,27 @@ class ConsoleService:
                     raise ValueError("enabled must be a boolean")
         except (TypeError, ValueError) as exc:
             raise web.HTTPBadRequest(text=str(exc))
+        # Binance leaders are identified by portfolio_id; the console does not
+        # expose it as editable, so drop any stray address before it persists.
+        if source != "hyperliquid":
+            changes.pop("address", None)
+        if not changes:
+            raise web.HTTPBadRequest(text="No editable fields")
         self.engine.config_manager.update_leader(name, changes)
         address_changed = await self.engine.update_leader_config(name, changes)
         config = self.engine.leaders[name]
-        if address_changed or "enabled" in changes:
+        if source == "hyperliquid" and (address_changed or "enabled" in changes):
             if self.leader_stream:
-                # Only enabled leaders are streamed, so toggling one on adds
-                # its subscription without waiting for a restart.
+                # Only enabled Hyperliquid leaders are streamed, so toggling
+                # one on adds its subscription without waiting for a restart.
                 await self.leader_stream.set_addresses(
                     [_address(item.get("address")) for item in self.engine.leaders.values()
-                     if item.get("enabled", True)]
+                     if item.get("enabled", True) and is_hyperliquid(item)]
                 )
-        if config.get("enabled", True) and (address_changed or "enabled" in changes):
+        if source == "hyperliquid" and config.get("enabled", True) and (address_changed or "enabled" in changes):
             # Seed the new baseline immediately so the first diff is against
-            # the leader's real positions, not an empty one.
+            # the leader's real positions, not an empty one.  Binance leaders
+            # are seeded by the poller's next cycle instead.
             try:
                 await self.engine.process(name, await leader_snapshot(config))
             except Exception:
@@ -537,6 +548,10 @@ class ConsoleService:
             for name, cfg in self.engine.leaders.items():
                 if not cfg.get("enabled", True):
                     continue
+                # Binance leaders are fed by the Binance poller, not this
+                # Hyperliquid REST fallback.
+                if not is_hyperliquid(cfg):
+                    continue
                 started = time.time()
                 try:
                     snapshot = await leader_snapshot(cfg, session)
@@ -570,7 +585,9 @@ class ConsoleService:
                 rows = [{"error": "awaiting leader state"}]
             else:
                 rows = [self._position_dict(p) for p in positions.values()]
-            leaders.append({"name": name, "address": str(cfg.get("address", "")),
+            leaders.append({"name": name,
+                            "address": str(cfg.get("address") or cfg.get("portfolio_id") or ""),
+                            "source": leader_source(cfg),
                             "enabled": bool(cfg.get("enabled", True)),
                             "config": cfg, "positions": rows})
         account_rows, orders, equity, balance, unrealized = [], [], 0.0, 0.0, 0.0

@@ -238,6 +238,9 @@ class TelegramManager:
     async def notify_skipped(self, leader, signal, reason):
         await self.send(self._event_message("⏭️ ORDER SKIPPED", self._trade_fields(leader, signal), reason=reason))
 
+    async def notify_source_failed(self, leader, exc):
+        await self.send(self._event_message("⚠️ SOURCE FAILED", [("Leader", leader)], reason=exc))
+
     async def notify_hard_stop(self, equity, baseline, loss):
         await self.send(self._event_message("🛑 HARD STOP TRIGGERED", [
             ("Account", self.account_name),

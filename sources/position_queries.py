@@ -4,6 +4,7 @@ import time
 import aiohttp
 import ccxt.async_support as ccxt
 from core.models import Position
+from sources.routing import is_hyperliquid
 
 # The dex list only changes when a HIP-3 deployment is added, so a per-process
 # cache keeps the 20-weight ``perpDexs`` probe off the hot path.  The console
@@ -170,6 +171,22 @@ async def leader_positions(leaders):
             elif rows:
                 lines.append(_table(rows))
     return "\n".join(lines) if lines else "No leaders configured."
+
+
+async def combined_leader_positions(leaders, binance_report=None):
+    """Return the Telegram leader-position report across both sources.
+
+    binance_report is a zero-arg callable (sync) returning text, usually
+    LeaderPoller.format_positions().
+    """
+    hyperliquid = {name: cfg for name, cfg in leaders.items() if is_hyperliquid(cfg)}
+    binance = {name: cfg for name, cfg in leaders.items() if not is_hyperliquid(cfg)}
+    parts = []
+    if hyperliquid:
+        parts.append(await leader_positions(hyperliquid))
+    if binance:
+        parts.append(binance_report() if binance_report else "Binance leader positions unavailable")
+    return "\n\n".join(parts) if parts else "No leaders configured."
 
 
 async def account_positions(accounts, leaders, symbol_map=None):
