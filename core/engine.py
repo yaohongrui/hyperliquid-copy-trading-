@@ -363,6 +363,7 @@ class Engine:
         # An explicit manual action overrides an earlier manual cancel.
         self.auto_breakeven_skip.pop(key, None)
         self._auto_be_retry_at.pop(key, None)
+        self._auto_be_warned.pop(key, None)
         self._save_state()
         return result['trigger']
 
@@ -528,6 +529,40 @@ class Engine:
             trigger = entry - loss / position_amount if side == 'long' else entry + loss / position_amount
         mark = float(detail.get('markPrice') or detail.get('markPx') or 0)
         if trigger <= 0 or (mark > 0 and ((side == 'long' and trigger >= mark) or (side == 'short' and trigger <= mark))):
+            old = self.runtime_state.get('protection', {}).get(key)
+            old_id = self._protection_id(old)
+            old_contracts = float(old.get('contracts') or 0) if isinstance(old, dict) else 0
+            old_trigger = float(old.get('trigger') or 0) if isinstance(old, dict) else 0
+            old_valid = (old_id and old_trigger > 0 and mark > 0 and (
+                (side == 'long' and old_trigger < mark)
+                or (side == 'short' and old_trigger > mark)))
+            # After a leader add, a breakeven trigger (the new average entry)
+            # can fall on the wrong side of the mark.  The previous stop is
+            # still protective; cancelling it would leave the position naked.
+            if self.breakeven.get(key) and old_valid:
+                if old_contracts and abs(old_contracts - contracts) > 1e-12:
+                    # Gate stops carry a contract count, so a larger position
+                    # needs a replacement at the old trigger for full cover.
+                    if hasattr(self.exchange, 'cancel_protection_orders'):
+                        await self.exchange.cancel_protection_orders(symbol, old_id)
+                    if hasattr(self.exchange, 'cancel_protection'):
+                        try:
+                            await self.exchange.cancel_protection(old_id, symbol)
+                        except Exception:
+                            log.info('Protection %s for %s is already gone; replacing it', old_id, symbol)
+                    oid = await self.exchange.set_protection(
+                        symbol, 'sell' if side == 'long' else 'buy', contracts, old_trigger)
+                    self.runtime_state.setdefault('protection', {})[key] = {
+                        'id': oid, 'contracts': contracts, 'trigger': old_trigger,
+                    }
+                    self._save_state()
+                    return 'placed'
+                if not self._auto_be_warned.get(key):
+                    self._auto_be_warned[key] = True
+                    log.warning(
+                        'Keeping existing protection for %s: new trigger %g is on the wrong side of mark %g',
+                        symbol, trigger, mark)
+                return 'kept'
             log.warning('Protection price invalid for %s: side=%s entry=%g mark=%g trigger=%g; no order created', symbol, side, entry, mark, trigger)
             # The tracked stop no longer exists or was never accepted; drop the
             # record so a later reconciliation can place a valid one instead
@@ -563,6 +598,7 @@ class Engine:
             'id': oid, 'contracts': contracts, 'trigger': trigger,
         }
         self._save_state()
+        self._auto_be_warned.pop(key, None)
         return 'placed'
 
     @staticmethod

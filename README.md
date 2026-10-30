@@ -175,7 +175,7 @@ leaders:
 
 - 每 5 秒对账时用 `markPrice` 计算未实现盈利：多头 `(mark - entry) × 持仓数量`，空头反向。达到 `trigger_usdt` 就把止损触发价设为 `entryPrice`。
 - 不要求 `position_stop_loss.enabled`；没有配置止损时直接创建成本价止损。
-- 触发后止损固定在均价。leader 加仓抬高均价时，如果新触发价仍有效会随之上移。
+- 触发后止损固定在均价。leader 加仓抬高均价时，如果新触发价仍有效会随之上移；新触发价落到标记价错误一侧时保留原止损单（数量变了就按原触发价重建），不会撤销后裸奔。
 - 控制台手动取消保本会写入 `auto_breakeven_skip`，下一轮不会自动重新武装；仓位平掉或手动重新保本后清除。
 - 保本止损被打掉后仍沿用“止损后抑制再入场”：leader 平仓前不会重新进场。
 - 顶层 `auto_breakeven` 修改需要重启；单个 leader 的 `auto_breakeven` 可通过控制台 `PATCH /api/v1/leaders/{name}` 热改（前端暂无输入框）。

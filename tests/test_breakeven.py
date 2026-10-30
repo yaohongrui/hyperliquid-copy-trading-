@@ -153,6 +153,55 @@ class BreakevenTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(restarted.breakeven["__default__:BTC"])
 
+    async def test_invalid_replacement_keeps_the_existing_breakeven_stop(self):
+        exchange = BreakevenExchange(entry=100, mark=110, contracts=2)
+        engine = self.engine(exchange)
+        await engine.set_breakeven("L", "BTC")
+        exchange.cancel_calls.clear()
+        exchange.cancel_orders_calls.clear()
+        # The leader adds at a higher price: the new average entry (112) is
+        # above the mark (109), so an entry-priced stop would fire instantly.
+        exchange.entry = 112
+        exchange.mark = 109
+        await engine.reconcile_protections()
+
+        self.assertEqual(exchange.set_calls, [("BTC", "sell", 2.0, 100.0)])
+        self.assertEqual(exchange.cancel_calls, [])
+        self.assertEqual(exchange.cancel_orders_calls, [])
+        self.assertEqual(
+            engine.runtime_state["protection"]["__default__:BTC"]["trigger"], 100.0)
+
+    async def test_invalid_replacement_rebuilds_old_trigger_at_new_size(self):
+        exchange = BreakevenExchange(entry=100, mark=110, contracts=2)
+        engine = self.engine(exchange)
+        await engine.set_breakeven("L", "BTC")
+
+        exchange.entry = 112
+        exchange.mark = 109
+        exchange.contracts = 4
+        await engine.reconcile_protections()
+
+        # Gate stops carry a contract count; the old trigger must be re-placed
+        # with the new size so the add stays covered.
+        self.assertEqual(exchange.set_calls[-1], ("BTC", "sell", 4.0, 100.0))
+        self.assertEqual(
+            engine.runtime_state["protection"]["__default__:BTC"],
+            {"id": "p1", "contracts": 4.0, "trigger": 100.0},
+        )
+
+    async def test_clear_breakeven_still_cancels_an_invalid_replacement(self):
+        exchange = BreakevenExchange(entry=100, mark=110, contracts=2)
+        engine = self.engine(exchange, {"enabled": True, "max_loss_usdt": 10})
+        await engine.set_breakeven("L", "BTC")
+
+        exchange.entry = 112
+        exchange.mark = 109
+        exchange.contracts = 4
+        await engine.clear_breakeven("L", "BTC")
+
+        self.assertNotIn("__default__:BTC", engine.breakeven)
+        self.assertIn("BTC", [call[0] for call in exchange.cancel_orders_calls])
+
 
 class ConsoleEngine:
     def __init__(self):
