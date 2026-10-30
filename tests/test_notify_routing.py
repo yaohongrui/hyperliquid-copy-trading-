@@ -1,6 +1,6 @@
 import unittest
 
-from telegram.bot import RoutingNotifier
+from telegram.bot import RoutingNotifier, TelegramManager
 
 
 class Recorder:
@@ -105,6 +105,49 @@ class RoutingNotifierTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(await router.notify_filled("L", "signal", "order"))
         self.assertFalse(await router.notify_hard_stop(1.0, 2.0, 3.0))
+
+
+class FakeResponse:
+    def raise_for_status(self):
+        return None
+
+    async def json(self):
+        return {"ok": True, "result": []}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class FakeSession:
+    def __init__(self):
+        self.calls = []
+
+    def post(self, url, data=None, timeout=None):
+        self.calls.append({"url": url, "data": data, "timeout": timeout})
+        return FakeResponse()
+
+
+class TelegramRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_updates_timeout_is_sent_to_the_api_not_the_http_client(self):
+        manager = TelegramManager(None, "token", "chat")
+        session = FakeSession()
+
+        await manager._request(session, "getUpdates", timeout=25, limit=100)
+
+        self.assertEqual(session.calls[0]["data"], {"timeout": 25, "limit": 100})
+        self.assertIsNone(session.calls[0]["timeout"])
+
+    async def test_send_uses_a_short_http_deadline(self):
+        manager = TelegramManager(None, "token", "chat")
+        session = FakeSession()
+        manager.session = session
+
+        self.assertTrue(await manager.send("hello"))
+
+        self.assertIsNotNone(session.calls[0]["timeout"])
 
 
 if __name__ == "__main__":

@@ -154,10 +154,10 @@ class TelegramManager:
             return await self.send_photo("LEADER POSITIONS", body)
         return False
 
-    async def _request(self, session, method, data=None, timeout=None, **params):
+    async def _request(self, session, method, data=None, request_timeout=None, **params):
         request_data = data if data is not None else params
         async with session.post(
-                f"{self._api_url}/{method}", data=request_data, timeout=timeout) as response:
+                f"{self._api_url}/{method}", data=request_data, timeout=request_timeout) as response:
             response.raise_for_status()
             payload = await response.json()
             if not payload.get("ok"):
@@ -170,7 +170,7 @@ class TelegramManager:
             return False
         try:
             await self._request(self.session, "sendMessage", chat_id=self.chat_id,
-                                text=text, parse_mode="HTML", timeout=_SEND_TIMEOUT)
+                                text=text, parse_mode="HTML", request_timeout=_SEND_TIMEOUT)
             return True
         except asyncio.CancelledError:
             raise
@@ -186,7 +186,7 @@ class TelegramManager:
             form.add_field("chat_id", self.chat_id)
             form.add_field("photo", render_report(title, body), filename="report.png", content_type="image/png")
             form.add_field("caption", title)
-            await self._request(self.session, "sendPhoto", data=form, timeout=_SEND_TIMEOUT)
+            await self._request(self.session, "sendPhoto", data=form, request_timeout=_SEND_TIMEOUT)
             return True
         except asyncio.CancelledError:
             raise
