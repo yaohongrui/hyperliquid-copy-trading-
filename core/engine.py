@@ -51,6 +51,9 @@ class Engine:
         # next event must still treat them as startup so the initial entry
         # price check is not lost with the failed signal.
         self.startup_pending = {}
+        # Send the hard-stop flatten failure alert once per lock episode, not
+        # every five-second retry.
+        self._flatten_alerted = False
         # Console consumes these immutable fill events to attribute exchange
         # realized PnL back to the leader that generated the order.
         self.fill_events = []
@@ -197,9 +200,12 @@ class Engine:
             self._save_state()
             self._risk_state_saved = self.risk.state()
         if not hit:
+            self._flatten_alerted = False
             return False
         self.paused = True
         first_trigger = not locked_before
+        flatten_error = None
+        flatten_recovered = False
         try:
             # Serialize flattening with signal processing so an in-flight open
             # order cannot land between cancellation and the close.
@@ -224,21 +230,41 @@ class Engine:
                     log.exception('HARD STOP order cancellation incomplete; flattening anyway')
                 try:
                     await self.exchange.close_all_positions()
-                except Exception:
+                except Exception as exc:
                     # Keep ``flattened`` false so the next cycle retries.
                     self.risk.flattened = False
                     self._save_state()
                     log.exception('HARD STOP flatten incomplete; retrying next cycle')
+                    if not self._flatten_alerted:
+                        self._flatten_alerted = True
+                        flatten_error = exc
                 else:
                     self.risk.flattened = True
                     self._save_state()
                     log.critical('HARD STOP flatten complete equity=%g', equity)
+                    if self._flatten_alerted:
+                        self._flatten_alerted = False
+                        flatten_recovered = True
         finally:
             if first_trigger and self.notifier:
                 await self.notifier.notify_hard_stop(
                     equity, self.risk.baseline,
                     float(self.risk.baseline) - float(equity),
                 )
+            if flatten_error is not None:
+                handler = getattr(self.notifier, 'notify_hard_stop_error', None) if self.notifier else None
+                if handler:
+                    try:
+                        await handler(equity, flatten_error)
+                    except Exception:
+                        log.warning('HARD STOP failure notification failed', exc_info=True)
+            elif flatten_recovered:
+                handler = getattr(self.notifier, 'notify_hard_stop_recovered', None) if self.notifier else None
+                if handler:
+                    try:
+                        await handler(equity)
+                    except Exception:
+                        log.warning('HARD STOP recovery notification failed', exc_info=True)
         return True
 
     async def unlock_hard_stop(self):
@@ -247,6 +273,7 @@ class Engine:
         was_locked = self.risk.locked
         self.risk.unlock(equity)
         self.paused = False
+        self._flatten_alerted = False
         if self.state_store:
             self._save_state()
             self._risk_state_saved = self.risk.state()

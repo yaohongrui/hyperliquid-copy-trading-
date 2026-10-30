@@ -13,7 +13,7 @@ from sources.routing import binance_leaders, hyperliquid_leaders, leader_source
 from sources.binance.config import build_sources
 from sources.binance.factory import create_source
 from sources.binance.leaders import LeaderPoller as BinanceLeaderPoller
-from telegram.bot import TelegramManager
+from telegram.bot import RoutingNotifier, TelegramManager
 from state.store import StateStore
 from api.console import ConsoleService
 from config.manager import ConfigManager
@@ -59,6 +59,8 @@ async def main(path):
     stop = asyncio.Event()
     telegram = None
     telegram_task = None
+    alerts = None
+    alerts_task = None
     binance_poller = None
     binance_retry_task = None
     ws_task = None
@@ -74,30 +76,12 @@ async def main(path):
         report = (lambda: binance_poller.format_positions()) if binance_poller is not None else None
         return await combined_leader_positions(current, report)
 
-    if telegram_config.get("enabled", False):
-        token = telegram_config.get("bot_token")
-        chat_id = telegram_config.get("chat_id")
-        if token and chat_id and not str(token).startswith("${") and not str(chat_id).startswith("${"):
-            telegram = TelegramManager(
-                engine,
-                token,
-                chat_id,
-                telegram_config.get("polling_timeout", 25),
-                fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, active, symbol_map),
-                fetch_leader_positions=_leader_report,
-                fetch_equity=exchange.equity,
-                account_name=account_name,
-                account_config=account,
-                mode=mode,
-                report_format=telegram_config.get("report_format", "image"),
-            )
-            engine.notifier = telegram
-            telegram_task = asyncio.create_task(telegram.run(), name="telegram-bot")
-        else:
-            log.warning("Telegram is enabled but bot_token/chat_id are not configured")
-    else:
-        telegram = TelegramManager(
-            engine, "", None,
+    def _telegram_manager(token, chat_id):
+        return TelegramManager(
+            engine,
+            token,
+            chat_id,
+            telegram_config.get("polling_timeout", 25),
             fetch_account_positions=partial(account_positions, c.get("execution_accounts") or {}, active, symbol_map),
             fetch_leader_positions=_leader_report,
             fetch_equity=getattr(exchange, "equity", None),
@@ -106,6 +90,46 @@ async def main(path):
             mode=mode,
             report_format=telegram_config.get("report_format", "image"),
         )
+
+    if telegram_config.get("enabled", False):
+        token = telegram_config.get("bot_token")
+        chat_id = telegram_config.get("chat_id")
+        if token and chat_id and not str(token).startswith("${") and not str(chat_id).startswith("${"):
+            telegram = _telegram_manager(token, chat_id)
+            telegram_task = asyncio.create_task(telegram.run(), name="telegram-bot")
+        else:
+            log.warning("Telegram is enabled but bot_token/chat_id are not configured")
+    if telegram is None:
+        # Keep a manager for HTTP /command and for normal-channel fallback; it
+        # has no session, so its sends are best-effort no-ops.
+        telegram = _telegram_manager("", None)
+
+    alerts_config = telegram_config.get("alerts") or {}
+    if alerts_config.get("enabled", False):
+        alert_token = alerts_config.get("bot_token")
+        alert_chat_id = alerts_config.get("chat_id")
+        if (alert_token and alert_chat_id
+                and not str(alert_token).startswith("${")
+                and not str(alert_chat_id).startswith("${")):
+            alerts = TelegramManager(
+                engine,
+                alert_token,
+                alert_chat_id,
+                telegram_config.get("polling_timeout", 25),
+                account_name=account_name,
+                account_config=account,
+                mode=mode,
+            )
+            alerts_task = asyncio.create_task(
+                alerts.run_sender(
+                    "🛡️ <b>ALERTS ONLINE</b>\nHigh-priority alerts are routed to this channel."),
+                name="telegram-alerts",
+            )
+        else:
+            log.warning("Telegram alerts are enabled but bot_token/chat_id are not configured")
+
+    notifier = RoutingNotifier(telegram, alerts)
+    engine.notifier = notifier
     try:
         if not dry_run:
             await exchange.start()
@@ -126,7 +150,7 @@ async def main(path):
                     _retry_sources(sources, failed, stop), name="binance-source-retry",
                 )
             binance_poller = BinanceLeaderPoller(
-                engine, sources, bn_leaders, c.get("polling") or {}, notifier=telegram,
+                engine, sources, bn_leaders, c.get("polling") or {}, notifier=notifier,
             )
             await binance_poller.start()
         ws = HyperliquidWS(
@@ -175,6 +199,11 @@ async def main(path):
         if telegram_task:
             telegram_task.cancel()
             await asyncio.gather(telegram_task, return_exceptions=True)
+        if alerts:
+            alerts.stop()
+        if alerts_task:
+            alerts_task.cancel()
+            await asyncio.gather(alerts_task, return_exceptions=True)
         if api_runner:
             await api_runner.cleanup()
         log.info("HL copytrade stopped")

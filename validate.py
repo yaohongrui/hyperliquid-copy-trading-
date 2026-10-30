@@ -58,6 +58,29 @@ def _validate_position_sources(value):
             )
 
 
+def _validate_telegram(value):
+    if value is None:
+        return
+    assert isinstance(value, dict), "telegram must be a mapping"
+    enabled = value.get("enabled", False)
+    if enabled:
+        for key in ("bot_token", "chat_id"):
+            item = str(value.get(key) or "").strip()
+            assert item and not _PLACEHOLDER.search(item), (
+                f"telegram.{key} is required when telegram is enabled"
+            )
+    alerts = value.get("alerts")
+    if alerts is None:
+        return
+    assert isinstance(alerts, dict), "telegram.alerts must be a mapping"
+    if alerts.get("enabled", False):
+        for key in ("bot_token", "chat_id"):
+            item = str(alerts.get(key) or "").strip()
+            assert item and not _PLACEHOLDER.search(item), (
+                f"telegram.alerts.{key} is required when alerts are enabled"
+            )
+
+
 def _leader_address(leader, label):
     address = leader.get("address")
     if isinstance(address, int):
@@ -108,6 +131,7 @@ def validate(path):
     assert c.get('execution_accounts') is not None
     _validate_symbol_map(c.get('symbol_map'))
     _validate_position_sources(c.get('position_sources'))
+    _validate_telegram(c.get('telegram'))
     _validate_leaders(c, set(c.get('position_sources') or {}), set(c['execution_accounts']))
     return True
 

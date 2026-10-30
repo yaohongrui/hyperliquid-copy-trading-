@@ -71,9 +71,17 @@ class HardStopExchange(RecordingExchange):
 class Notifier:
     def __init__(self):
         self.stops = 0
+        self.errors = []
+        self.recoveries = 0
 
     async def notify_hard_stop(self, equity, baseline, loss):
         self.stops += 1
+
+    async def notify_hard_stop_error(self, equity, exc):
+        self.errors.append((equity, str(exc)))
+
+    async def notify_hard_stop_recovered(self, equity):
+        self.recoveries += 1
 
 
 class PendingOrderTests(unittest.IsolatedAsyncioTestCase):
@@ -136,14 +144,37 @@ class HardStopTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(engine.risk.flattened)
         self.assertEqual(exchange.close_calls, 1)
         self.assertEqual(notifier.stops, 1)
+        self.assertEqual(len(notifier.errors), 1)
+        self.assertEqual(notifier.recoveries, 0)
 
         self.assertTrue(await engine.check_hard_stop())
         self.assertTrue(engine.risk.flattened)
         self.assertEqual(exchange.close_calls, 2)
         self.assertEqual(notifier.stops, 1)
+        self.assertEqual(len(notifier.errors), 1)
+        self.assertEqual(notifier.recoveries, 1)
 
         self.assertTrue(await engine.check_hard_stop())
         self.assertEqual(exchange.close_calls, 2)
+        self.assertEqual(notifier.recoveries, 1)
+
+    async def test_flatten_failure_alert_is_sent_once_per_episode(self):
+        exchange = HardStopExchange()
+        notifier = Notifier()
+        engine = Engine(exchange, {"L": {"total_margin": 100}}, notifier=notifier)
+        self.assertFalse(await engine.check_hard_stop())  # establishes baseline
+
+        exchange.equity_value = 80
+        exchange.fail_closes = 3
+        await engine.check_hard_stop()
+        await engine.check_hard_stop()
+        await engine.check_hard_stop()
+        self.assertEqual(len(notifier.errors), 1)
+        self.assertEqual(notifier.recoveries, 0)
+
+        await engine.check_hard_stop()  # fourth close attempt succeeds
+        self.assertEqual(len(notifier.errors), 1)
+        self.assertEqual(notifier.recoveries, 1)
 
     async def test_locked_state_blocks_new_exposure_without_paused(self):
         exchange = RecordingExchange()

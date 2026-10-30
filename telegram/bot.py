@@ -10,6 +10,11 @@ from .report_image import render_report
 
 log = logging.getLogger(__name__)
 
+# Notification sends must never stall the trading hot path.  The session keeps
+# its longer timeout for getUpdates long polling, while a single send gets a
+# short, independent deadline.
+_SEND_TIMEOUT = aiohttp.ClientTimeout(total=5)
+
 
 class TelegramManager:
     """Small Telegram Bot API long-polling client for the control commands."""
@@ -149,9 +154,10 @@ class TelegramManager:
             return await self.send_photo("LEADER POSITIONS", body)
         return False
 
-    async def _request(self, session, method, data=None, **params):
+    async def _request(self, session, method, data=None, timeout=None, **params):
         request_data = data if data is not None else params
-        async with session.post(f"{self._api_url}/{method}", data=request_data) as response:
+        async with session.post(
+                f"{self._api_url}/{method}", data=request_data, timeout=timeout) as response:
             response.raise_for_status()
             payload = await response.json()
             if not payload.get("ok"):
@@ -164,7 +170,7 @@ class TelegramManager:
             return False
         try:
             await self._request(self.session, "sendMessage", chat_id=self.chat_id,
-                                text=text, parse_mode="HTML")
+                                text=text, parse_mode="HTML", timeout=_SEND_TIMEOUT)
             return True
         except asyncio.CancelledError:
             raise
@@ -180,7 +186,7 @@ class TelegramManager:
             form.add_field("chat_id", self.chat_id)
             form.add_field("photo", render_report(title, body), filename="report.png", content_type="image/png")
             form.add_field("caption", title)
-            await self._request(self.session, "sendPhoto", data=form)
+            await self._request(self.session, "sendPhoto", data=form, timeout=_SEND_TIMEOUT)
             return True
         except asyncio.CancelledError:
             raise
@@ -230,19 +236,19 @@ class TelegramManager:
         fields.append(("Filled qty", abs(order.amount)))
         if price is not None:
             fields.append(("Avg price", price))
-        await self.send(self._event_message("✅ ORDER FILLED", fields))
+        return await self.send(self._event_message("✅ ORDER FILLED", fields))
 
     async def notify_failed(self, leader, signal, exc):
-        await self.send(self._event_message("❌ ORDER FAILED", self._trade_fields(leader, signal), reason=exc))
+        return await self.send(self._event_message("❌ ORDER FAILED", self._trade_fields(leader, signal), reason=exc))
 
     async def notify_skipped(self, leader, signal, reason):
-        await self.send(self._event_message("⏭️ ORDER SKIPPED", self._trade_fields(leader, signal), reason=reason))
+        return await self.send(self._event_message("⏭️ ORDER SKIPPED", self._trade_fields(leader, signal), reason=reason))
 
     async def notify_source_failed(self, leader, exc):
-        await self.send(self._event_message("⚠️ SOURCE FAILED", [("Leader", leader)], reason=exc))
+        return await self.send(self._event_message("⚠️ SOURCE FAILED", [("Leader", leader)], reason=exc))
 
     async def notify_hard_stop(self, equity, baseline, loss):
-        await self.send(self._event_message("🛑 HARD STOP TRIGGERED", [
+        return await self.send(self._event_message("🛑 HARD STOP TRIGGERED", [
             ("Account", self.account_name),
             ("Mode", self.mode),
             ("Account equity", f"{self._value(float(equity))} USDT"),
@@ -250,13 +256,36 @@ class TelegramManager:
             ("Daily loss", f"{self._value(float(loss))} USDT"),
             ("Limit", self._stop_loss_text()),
             ("Action", "All positions closed; new entries paused"),
-        ], reason="Send /unlock_hard_stop to reset the daily baseline and resume entries."))
+        ], reason="Send /unlock_hard_stop in the main control chat to reset the daily baseline and resume entries."))
 
     async def notify_accepted(self, leader, signal, order):
         """Notify when an exchange accepts an order that is not filled yet."""
-        await self.send(self._event_message("🕒 ORDER ACCEPTED", self._trade_fields(leader, signal, order) + [
+        return await self.send(self._event_message("🕒 ORDER ACCEPTED", self._trade_fields(leader, signal, order) + [
             ("Order", order.id),
             ("Status", order.status.upper()),
+        ]))
+
+    async def notify_breakeven(self, leader, symbol, profit, trigger):
+        return await self.send(self._event_message("🛡️ AUTO BREAKEVEN", [
+            ("Leader", leader),
+            ("Symbol", symbol),
+            ("Unrealized profit", f"{self._value(float(profit))} USDT"),
+            ("Stop moved to", self._value(float(trigger))),
+        ], reason="Native stop moved to the position entry price."))
+
+    async def notify_hard_stop_error(self, equity, exc):
+        return await self.send(self._event_message("❌ HARD STOP FLATTEN FAILED", [
+            ("Account", self.account_name),
+            ("Mode", self.mode),
+            ("Account equity", f"{self._value(float(equity))} USDT"),
+            ("Action", "Retrying every 5 seconds"),
+        ], reason=exc))
+
+    async def notify_hard_stop_recovered(self, equity):
+        return await self.send(self._event_message("✅ HARD STOP FLATTEN RECOVERED", [
+            ("Account", self.account_name),
+            ("Mode", self.mode),
+            ("Account equity", f"{self._value(float(equity))} USDT"),
         ]))
 
     async def run(self):
@@ -346,3 +375,100 @@ class TelegramManager:
                         pass
             await self.send("<b>SYSTEM STOPPED</b>")
             self.session = None
+
+    async def run_sender(self, probe_text=None):
+        """Run an outbound-only bot for high-priority alerts.
+
+        No ``getUpdates`` polling: the alert channel is write-only and must
+        never compete with the control bot for commands.
+        """
+        if not self.token or not self.chat_id:
+            raise ValueError("Telegram bot token and chat id are required")
+
+        timeout = aiohttp.ClientTimeout(total=self.polling_timeout + 10)
+        while not self._stop.is_set():
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    self.session = session
+                    try:
+                        if probe_text:
+                            await self.send(probe_text)
+                        await self._stop.wait()
+                    finally:
+                        self.session = None
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "Telegram alert sender failed (%s); retrying in 5 seconds",
+                    type(exc).__name__,
+                )
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
+
+
+class RoutingNotifier:
+    """Split notifications between the trading chat and a critical-alert bot.
+
+    Fills and skips are noise the operator can mute; hard stops and failures
+    must reach the high-priority channel.  If the alert channel cannot be
+    reached, critical messages fall back to the normal chat instead of being
+    lost.
+    """
+
+    def __init__(self, normal=None, alerts=None):
+        self.normal = normal
+        self.alerts = alerts
+
+    @staticmethod
+    async def _call(target, method, args):
+        handler = getattr(target, method, None) if target is not None else None
+        if handler is None:
+            return False
+        result = await handler(*args)
+        # Existing notifiers return nothing on success; treat that as delivered.
+        return True if result is None else bool(result)
+
+    async def _normal_call(self, method, *args):
+        return await self._call(self.normal, method, args)
+
+    async def _alert_call(self, method, *args):
+        if await self._call(self.alerts, method, args):
+            return True
+        return await self._call(self.normal, method, args)
+
+    async def notify_filled(self, *args):
+        return await self._normal_call("notify_filled", *args)
+
+    async def notify_accepted(self, *args):
+        return await self._normal_call("notify_accepted", *args)
+
+    async def notify_skipped(self, *args):
+        return await self._normal_call("notify_skipped", *args)
+
+    async def notify_breakeven(self, *args):
+        return await self._normal_call("notify_breakeven", *args)
+
+    async def notify_failed(self, *args):
+        return await self._alert_call("notify_failed", *args)
+
+    async def notify_source_failed(self, *args):
+        return await self._alert_call("notify_source_failed", *args)
+
+    async def notify_hard_stop(self, *args):
+        return await self._alert_call("notify_hard_stop", *args)
+
+    async def notify_hard_stop_error(self, *args):
+        return await self._alert_call("notify_hard_stop_error", *args)
+
+    async def notify_hard_stop_recovered(self, *args):
+        return await self._alert_call("notify_hard_stop_recovered", *args)
+
+    def __getattr__(self, name):
+        for target in (self.__dict__.get("normal"), self.__dict__.get("alerts")):
+            if target is not None and hasattr(target, name):
+                return getattr(target, name)
+        raise AttributeError(name)

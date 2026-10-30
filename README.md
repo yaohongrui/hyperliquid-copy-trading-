@@ -343,6 +343,10 @@ telegram:
   chat_id: ${TELEGRAM_GATE_CHAT_ID}
   polling_timeout: 25
   report_format: image
+  alerts:                       # 可选：高优先级告警走独立 bot
+    enabled: true
+    bot_token: ${TELEGRAM_ALERTS_BOT_TOKEN}
+    chat_id: ${TELEGRAM_ALERTS_CHAT_ID}
 ```
 
 | 字段 | 说明 |
@@ -352,8 +356,11 @@ telegram:
 | `chat_id` | 唯一允许控制的会话；其他会话的消息会被忽略 |
 | `polling_timeout` | 长轮询秒数，默认 25 |
 | `report_format` | `image`（默认）或 `text`；除 `text` 外都按图片处理 |
+| `alerts.enabled` | 开启后，hard stop / 下单失败 / 数据源失败发到独立 bot；不配置或发送失败时回退到主会话 |
+| `alerts.bot_token` | 告警 bot 的 token（可以是另一个 BotFather bot） |
+| `alerts.chat_id` | 告警频道/群 id；该 bot 需要是频道管理员且有发帖权限 |
 
-`enabled: true` 但 token/chat_id 缺失或仍是未展开的 `${...}` 时，只打印警告，不会启动机器人。
+告警 bot 只发送、不轮询 `getUpdates`，因此不会和主 bot 抢控制命令。`enabled: true` 但 token/chat_id 缺失或仍是未展开的 `${...}` 时，只打印警告，不会启动机器人。
 
 ### symbol_map
 
@@ -504,13 +511,23 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 
 ### 通知
 
+默认主会话（适合静音，只看运行状态）：
+
 - `ORDER FILLED`：成交方向、仓位方向、动作、成交数量、均价。
 - `ORDER ACCEPTED`：订单已被交易所接受但尚未成交（例如延迟入场的限价单）。
-- `ORDER FAILED`：下单异常及原因。
 - `ORDER SKIPPED`：跳过原因，包括暂停、黑名单、symbol skip、所有权冲突、启动价格不利、小单累计、无可减仓位、反手跳过等。
-- `HARD STOP TRIGGERED`：账户硬止损触发，包含权益、当日基线、当日亏损和限额；同时提示可用 `/unlock_hard_stop` 解除。
+- `AUTO BREAKEVEN`：自动保本触发，通知盈利金额和新的止损价。
 - 启动/停止时分别发送 `SYSTEM STARTED` / `SYSTEM STOPPED`。
-- 启动时会先消费掉历史 update，避免重启后重放旧命令。
+
+配置 `telegram.alerts` 后，以下高优先级事件发到独立告警频道；告警频道发送失败时回退到主会话：
+
+- `ORDER FAILED`：下单异常及原因。
+- `SOURCE FAILED`：Binance 数据源连续 3 次失败。
+- `HARD STOP TRIGGERED`：账户硬止损触发，包含权益、当日基线、当日亏损和限额。
+- `HARD STOP FLATTEN FAILED` / `HARD STOP FLATTEN RECOVERED`：平仓失败只告警一次，后续重试成功再发恢复通知。
+- 解除锁定要在**主控制会话**发送 `/unlock_hard_stop`；告警频道只出不进。
+
+启动时会先消费掉历史 update，避免重启后重放旧命令。
 
 `report_format: image` 时，`/positions` 和 `/leader_positions` 会渲染成深色 PNG 报告卡片；渲染或发送失败会自动回退为文本消息。
 
