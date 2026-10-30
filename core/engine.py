@@ -447,6 +447,8 @@ class Engine:
         except (TypeError, ValueError):
             return None
         side = str(detail.get('side') or '').lower()
+        if side not in ('long', 'short'):
+            return None
         if entry <= 0 or mark <= 0 or contracts <= 0:
             return None
         amount = contracts * contract_size
