@@ -110,6 +110,65 @@ class BrowserLiveSourceTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(PollAuthError):
                     await source.fetch_positions("leader-1")
 
+            self.assertIsNone(source._auth)
+            self.assertGreater(source._next_start_at, 0)
+
+    async def test_a_later_poll_restarts_the_dead_browser(self):
+        with patch("sources.binance.session.BinanceBrowserAuth", FakeAuth):
+            source = self.source()
+            await source.start()
+            FakeAuth.instances[0].fetch_positions_live.side_effect = RuntimeError("dead")
+
+            class BrokenAuth(FakeAuth):
+                def __init__(self, config):
+                    super().__init__(config)
+                    self.start.side_effect = RuntimeError("cannot restart")
+
+            with patch("sources.binance.session.BinanceBrowserAuth", BrokenAuth):
+                with self.assertRaises(PollAuthError):
+                    await source.fetch_positions("leader-1")
+
+            # The cooldown has elapsed: the next poll must bring the browser
+            # back instead of failing with "not started" forever.
+            source._next_start_at = 0
+            result = await source.fetch_positions("leader-1")
+
+            self.assertEqual(len(result), 1)
+            self.assertIsNotNone(source._auth)
+            self.assertEqual(len(FakeAuth.instances), 3)  # original + broken + recovered
+            await source.stop()
+
+    async def test_failed_restart_is_throttled_until_the_cooldown_ends(self):
+        with patch("sources.binance.session.BinanceBrowserAuth", FakeAuth):
+            source = self.source()
+            await source.start()
+            FakeAuth.instances[0].fetch_positions_live.side_effect = RuntimeError("dead")
+
+            class BrokenAuth(FakeAuth):
+                def __init__(self, config):
+                    super().__init__(config)
+                    self.start.side_effect = RuntimeError("cannot restart")
+
+            with patch("sources.binance.session.BinanceBrowserAuth", BrokenAuth):
+                with self.assertRaises(PollAuthError):
+                    await source.fetch_positions("leader-1")
+                attempts = len(FakeAuth.instances)
+                with self.assertRaises(PollAuthError):
+                    await source.fetch_positions("leader-1")
+                self.assertEqual(len(FakeAuth.instances), attempts)
+
+    async def test_poll_starts_a_browser_that_was_never_running(self):
+        with patch("sources.binance.session.BinanceBrowserAuth", FakeAuth):
+            source = self.source()
+            self.assertIsNone(source._auth)
+
+            result = await source.fetch_positions("leader-1")
+
+            self.assertEqual(len(result), 1)
+            auth = FakeAuth.instances[0]
+            auth.open_live_session.assert_awaited_once_with("protected")
+            await source.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

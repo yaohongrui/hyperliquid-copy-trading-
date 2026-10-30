@@ -37,6 +37,10 @@ class HybridBinancePositionSource:
         self._auth: BinanceBrowserAuth | None = None
         self._lock = asyncio.Lock()
         self._next_refresh_at = 0.0
+        # A failed browser restart leaves ``_auth`` empty.  Polls must keep
+        # trying to bring it back, with a cooldown so a logged-out profile does
+        # not spawn Chromium on every 2.5-second poll.
+        self._next_start_at = 0.0
         self._request_count = 0
 
     def set_notifier(self, notifier) -> None:
@@ -79,11 +83,24 @@ class HybridBinancePositionSource:
             await auth.stop()
             raise
         self._auth = auth
+        self._next_start_at = 0.0
         self._schedule_refresh()
         logger.info(
             "[BrowserLive] persistent session started probe=%s profile=%s",
             self._probe_portfolio_id, self._browser_config.profile_dir,
         )
+
+    async def _ensure_browser(self) -> None:
+        """Start a browser that a previous recovery attempt left dead."""
+        if self._auth is not None:
+            return
+        if monotonic() < self._next_start_at:
+            raise PollAuthError("persistent browser is not started")
+        try:
+            await self._start_browser()
+        except Exception as exc:
+            self._next_start_at = monotonic() + 60
+            raise PollAuthError(f"persistent browser restart failed: {exc}") from exc
 
     async def stop(self) -> None:
         async with self._lock:
@@ -113,15 +130,21 @@ class HybridBinancePositionSource:
 
     async def _restart_browser(self, reason: str) -> None:
         logger.warning("[BrowserLive] restarting browser reason=%s", reason)
-        if self._auth is not None:
-            await self._auth.stop()
-            self._auth = None
-        await self._start_browser()
+        auth, self._auth = self._auth, None
+        if auth is not None:
+            try:
+                await auth.stop()
+            except Exception:
+                logger.warning("[BrowserLive] failed to stop dead browser", exc_info=True)
+        try:
+            await self._start_browser()
+        except Exception:
+            self._next_start_at = monotonic() + 60
+            raise
 
     async def fetch_positions(self, portfolio_id: str):
         async with self._lock:
-            if self._auth is None:
-                raise PollAuthError("persistent browser is not started")
+            await self._ensure_browser()
             if monotonic() >= self._next_refresh_at:
                 try:
                     await self._refresh_page("scheduled")
