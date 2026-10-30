@@ -81,6 +81,36 @@ def _validate_telegram(value):
             )
 
 
+def _validate_auto_breakeven(value, label):
+    if value is None:
+        return
+    assert isinstance(value, dict), f"{label} must be a mapping"
+    if "enabled" in value:
+        assert isinstance(value["enabled"], bool), f"{label}.enabled must be a boolean"
+    if "trigger_usdt" in value:
+        trigger = value["trigger_usdt"]
+        assert isinstance(trigger, (int, float)) and not isinstance(trigger, bool), (
+            f"{label}.trigger_usdt must be a number"
+        )
+        assert trigger > 0, f"{label}.trigger_usdt must be positive"
+
+
+def _validate_auto_breakeven_effective(c):
+    base = c.get("auto_breakeven")
+    _validate_auto_breakeven(base, "auto_breakeven")
+    base = base or {}
+    for index, leader in enumerate(c.get("leaders") or []):
+        override = leader.get("auto_breakeven")
+        label = f"leaders[{index}].auto_breakeven"
+        _validate_auto_breakeven(override, label)
+        merged = {**base, **(override or {})}
+        if merged.get("enabled", False):
+            trigger = merged.get("trigger_usdt")
+            assert isinstance(trigger, (int, float)) and not isinstance(trigger, bool) and trigger > 0, (
+                f"{label}: trigger_usdt must be positive when auto breakeven is enabled"
+            )
+
+
 def _leader_address(leader, label):
     address = leader.get("address")
     if isinstance(address, int):
@@ -133,6 +163,7 @@ def validate(path):
     _validate_position_sources(c.get('position_sources'))
     _validate_telegram(c.get('telegram'))
     _validate_leaders(c, set(c.get('position_sources') or {}), set(c['execution_accounts']))
+    _validate_auto_breakeven_effective(c)
     return True
 
 

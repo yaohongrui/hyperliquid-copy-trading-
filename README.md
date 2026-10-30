@@ -157,6 +157,30 @@ position_stop_loss:
 - 状态文件里保存 `{id, contracts, trigger}`，重启后可以继续对账。
 - 单仓止损只覆盖引擎自己建立的仓位；手动开的仓位没有所有权，不会自动加保护单。
 
+### 自动保本（`auto_breakeven`）
+
+单仓未实现盈利达到设定金额后，自动把该仓位的原生止损移到开仓均价。
+
+顶层配置全局默认，单个交易员可以覆盖：
+
+```yaml
+auto_breakeven:
+  enabled: true
+  trigger_usdt: 15
+leaders:
+- name: A
+  auto_breakeven:
+    enabled: false        # 只对这个交易员关闭
+```
+
+- 每 5 秒对账时用 `markPrice` 计算未实现盈利：多头 `(mark - entry) × 持仓数量`，空头反向。达到 `trigger_usdt` 就把止损触发价设为 `entryPrice`。
+- 不要求 `position_stop_loss.enabled`；没有配置止损时直接创建成本价止损。
+- 触发后止损固定在均价。leader 加仓抬高均价时，如果新触发价仍有效会随之上移。
+- 控制台手动取消保本会写入 `auto_breakeven_skip`，下一轮不会自动重新武装；仓位平掉或手动重新保本后清除。
+- 保本止损被打掉后仍沿用“止损后抑制再入场”：leader 平仓前不会重新进场。
+- 顶层 `auto_breakeven` 修改需要重启；单个 leader 的 `auto_breakeven` 可通过控制台 `PATCH /api/v1/leaders/{name}` 热改（前端暂无输入框）。
+- `trigger_usdt` 要明显大于点差/滑点噪音，否则止损贴成本价容易被正常波动扫掉。
+
 ### 账户硬止损（`hard_stop`）
 
 配置在 `execution_accounts.<name>.hard_stop` 下：
@@ -624,6 +648,8 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 | `entered` | `交易员:SYMBOL -> true`，是否真实成交过开仓 |
 | `small_order_carry` | `交易员:SYMBOL -> {side, amount}`，小单累计 |
 | `protection` | `执行账户:SYMBOL -> {id, contracts, trigger}`，单仓止损条件单 |
+| `breakeven` | `执行账户:SYMBOL -> true`，止损已移到成本价 |
+| `auto_breakeven_skip` | `执行账户:SYMBOL -> true`，手动取消自动保本后的抑制标记 |
 | `risk` | `{baseline, day, locked}`，账户硬止损基线 |
 
 ### `data/console.sqlite3`

@@ -276,7 +276,8 @@ class ConsoleStore:
 
 class ConsoleService:
     editable = {"address", "enabled", "coefficient", "total_margin", "symbol_blacklist",
-                "late_entry_enabled", "late_entry_offset_pct", "position_stop_loss"}
+                "late_entry_enabled", "late_entry_offset_pct", "position_stop_loss",
+                "auto_breakeven"}
 
     def __init__(self, engine, config, store_path="data/console.sqlite3", leader_stream=None):
         self.engine = engine
@@ -402,6 +403,20 @@ class ConsoleService:
                     raise ValueError("position_stop_loss must be an object")
                 if "max_loss_usdt" in stop and float(stop["max_loss_usdt"]) <= 0:
                     raise ValueError("position stop loss must be positive")
+            if "auto_breakeven" in changes:
+                value = changes["auto_breakeven"]
+                if not isinstance(value, dict):
+                    raise ValueError("auto_breakeven must be an object")
+                if "enabled" in value and not isinstance(value["enabled"], bool):
+                    raise ValueError("auto_breakeven.enabled must be a boolean")
+                if "trigger_usdt" in value:
+                    trigger = value["trigger_usdt"]
+                    if isinstance(trigger, bool) or not isinstance(trigger, (int, float)) or trigger <= 0:
+                        raise ValueError("auto_breakeven.trigger_usdt must be positive")
+                base = (self.config.get("auto_breakeven") or {}) if isinstance(self.config, dict) else {}
+                merged = {**base, **value}
+                if merged.get("enabled", False) and not merged.get("trigger_usdt"):
+                    raise ValueError("auto_breakeven.trigger_usdt is required when enabled")
             if "enabled" in changes:
                 value = changes["enabled"]
                 if isinstance(value, bool):

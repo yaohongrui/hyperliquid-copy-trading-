@@ -52,7 +52,7 @@ async def main(path):
     dry_run = bool(account.get("dry_run", False))
     symbol_map = SymbolMap(c.get("symbol_map"))
     exchange = DryRunExchange(account, symbol_map) if dry_run else CcxtExchange(account, symbol_map)
-    engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')), symbol_map=symbol_map)
+    engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')), symbol_map=symbol_map, auto_breakeven=c.get('auto_breakeven'))
     engine.config_manager = ConfigManager(path)
     mode = "dry-run" if dry_run else "LIVE"
     log.info("HL copytrade started in %s mode; leaders=%s account=%s", mode, ",".join(active) or "none", account_name)

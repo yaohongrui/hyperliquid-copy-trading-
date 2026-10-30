@@ -10,7 +10,8 @@ from risk.manager import RiskManager
 log = logging.getLogger(__name__)
 
 class Engine:
-    def __init__(self, exchange, leaders, account_state=None, notifier=None, state_store=None, symbol_map=None):
+    def __init__(self, exchange, leaders, account_state=None, notifier=None, state_store=None,
+                 symbol_map=None, auto_breakeven=None):
         self.exchange = exchange
         self.leaders = leaders
         self.state = account_state
@@ -47,6 +48,13 @@ class Engine:
         # console.  Persisted so a restart keeps the tighter stop instead of
         # silently restoring the configured loss-based one.
         self.breakeven = self.runtime_state.get('breakeven') or {}
+        # Auto break-even defaults (top-level config); a leader may override
+        # the same keys.  ``auto_breakeven_skip`` honours an explicit manual
+        # cancel so the next five-second reconcile does not re-arm it.
+        self.auto_breakeven = auto_breakeven if isinstance(auto_breakeven, dict) else {}
+        self.auto_breakeven_skip = self.runtime_state.get('auto_breakeven_skip') or {}
+        self._auto_be_retry_at = {}
+        self._auto_be_warned = {}
         # Symbols whose first snapshot failed before an order was placed.  The
         # next event must still treat them as startup so the initial entry
         # price check is not lost with the failed signal.
@@ -97,6 +105,9 @@ class Engine:
             # Breakeven is keyed by owner (account:symbol), not by leader.
             for key in [k for k, owner in self.owners.items() if owner == leader]:
                 self.breakeven.pop(key, None)
+                self.auto_breakeven_skip.pop(key, None)
+                self._auto_be_retry_at.pop(key, None)
+                self._auto_be_warned.pop(key, None)
             await self.cancel_pending_orders(leader=leader, reason='leader address changed')
             self._save_state()
             return True
@@ -115,6 +126,7 @@ class Engine:
             self.runtime_state['small_order_carry'] = self.small_order_carry
             self.runtime_state['pending_orders'] = self.pending_orders
             self.runtime_state['breakeven'] = self.breakeven
+            self.runtime_state['auto_breakeven_skip'] = self.auto_breakeven_skip
             self.runtime_state['risk'] = self.risk.state()
             self.state_store.save(self.runtime_state)
 
@@ -327,6 +339,9 @@ class Engine:
             self.owners.pop(key, None)
             self.entered.pop(f'{leader}:{symbol}', None)
             self.breakeven.pop(key, None)
+            self.auto_breakeven_skip.pop(key, None)
+            self._auto_be_retry_at.pop(key, None)
+            self._auto_be_warned.pop(key, None)
             self._save_state()
 
     @staticmethod
@@ -342,23 +357,14 @@ class Engine:
         immediately, turning "breakeven" into a market close at a loss.
         """
         key = self._owner_key(leader, symbol)
-        if self.owners.get(key) != leader:
-            raise KeyError(f'{symbol} is not owned by {leader}')
-        detail = await self.exchange.fetch_position_detail(symbol)
-        if not detail:
-            raise ValueError(f'no open position for {symbol}')
-        trigger = self._breakeven_trigger(detail)
-        cfg = self.leaders[leader].get('position_stop_loss') or {}
-        async with self._protection_lock:
-            self.breakeven[key] = True
-            self._save_state()
-            try:
-                await self._sync_protection_locked(leader, symbol, cfg, detail)
-            except Exception:
-                self.breakeven.pop(key, None)
-                self._save_state()
-                raise
-        return trigger
+        result = await self._set_breakeven_detail(leader, symbol, ignore_skip=True)
+        if result is None:
+            raise ValueError(f'could not place a breakeven stop for {symbol}')
+        # An explicit manual action overrides an earlier manual cancel.
+        self.auto_breakeven_skip.pop(key, None)
+        self._auto_be_retry_at.pop(key, None)
+        self._save_state()
+        return result['trigger']
 
     async def clear_breakeven(self, leader, symbol):
         """Revert a breakeven stop to the configured stop loss, if any."""
@@ -369,6 +375,10 @@ class Engine:
         async with self._protection_lock:
             if not self.breakeven.pop(key, None):
                 return False
+            # Honour the cancel during later reconciles instead of re-arming
+            # the stop from the next profit check.
+            self.auto_breakeven_skip[key] = True
+            self._auto_be_retry_at.pop(key, None)
             self._save_state()
             if cfg.get('enabled') and cfg.get('max_loss_usdt') is not None:
                 await self._sync_protection_locked(leader, symbol, cfg, None)
@@ -381,6 +391,99 @@ class Engine:
                     log.info('Breakeven protection %s for %s is already gone', self._protection_id(old), symbol)
                 self._save_state()
         return True
+
+    async def _set_breakeven_detail(self, leader, symbol, ignore_skip=False):
+        """Arm a break-even stop, re-reading the position under the lock.
+
+        Returns ``{'trigger', 'profit'}`` on success and ``None`` when no
+        protection order could be placed.  A stale reconciliation snapshot is
+        never used for the actual order: entry, mark and size are re-fetched.
+        """
+        key = self._owner_key(leader, symbol)
+        if self.owners.get(key) != leader:
+            raise KeyError(f'{symbol} is not owned by {leader}')
+        cfg = self.leaders[leader].get('position_stop_loss') or {}
+        async with self._protection_lock:
+            if not ignore_skip and self.auto_breakeven_skip.get(key):
+                return None
+            detail = await self.exchange.fetch_position_detail(symbol)
+            if not detail:
+                raise ValueError(f'no open position for {symbol}')
+            trigger = self._breakeven_trigger(detail)
+            profit = self._position_profit(detail)
+            self.breakeven[key] = True
+            self._save_state()
+            try:
+                status = await self._sync_protection_locked(leader, symbol, cfg, detail)
+            except Exception:
+                self.breakeven.pop(key, None)
+                self._save_state()
+                raise
+            if status == 'none':
+                # Never leave a persisted flag that claims a stop exists.
+                self.breakeven.pop(key, None)
+                self._save_state()
+                return None
+            return {'trigger': trigger, 'profit': profit if profit is not None else 0.0}
+
+    def _auto_breakeven_config(self, leader):
+        base = self.auto_breakeven if isinstance(self.auto_breakeven, dict) else {}
+        override = (self.leaders.get(leader) or {}).get('auto_breakeven') or {}
+        if not isinstance(override, dict):
+            override = {}
+        return {**base, **override}
+
+    @staticmethod
+    def _position_profit(detail):
+        """Mark-based unrealized profit, matching the breakeven trigger basis."""
+        if not detail:
+            return None
+        try:
+            entry = float(detail.get('entryPrice') or 0)
+            mark = float(detail.get('markPrice') or detail.get('markPx') or 0)
+            contracts = abs(float(detail.get('contracts') or 0))
+            contract_size = abs(float(detail.get('contractSize') or 1))
+        except (TypeError, ValueError):
+            return None
+        side = str(detail.get('side') or '').lower()
+        if entry <= 0 or mark <= 0 or contracts <= 0:
+            return None
+        amount = contracts * contract_size
+        return (mark - entry) * amount if side == 'long' else (entry - mark) * amount
+
+    async def _maybe_auto_breakeven(self, leader, symbol, detail):
+        """Arm breakeven once this position's profit reaches the configured amount."""
+        key = self._owner_key(leader, symbol)
+        if self.breakeven.get(key) or self.auto_breakeven_skip.get(key):
+            return None
+        cfg = self._auto_breakeven_config(leader)
+        if not cfg.get('enabled'):
+            return None
+        try:
+            trigger_usdt = float(cfg.get('trigger_usdt') or 0)
+        except (TypeError, ValueError):
+            return None
+        if trigger_usdt <= 0:
+            return None
+        now = time.time()
+        if self._auto_be_retry_at.get(key, 0) > now:
+            return None
+        profit = self._position_profit(detail)
+        if profit is None or profit < trigger_usdt:
+            return None
+        try:
+            result = await self._set_breakeven_detail(leader, symbol)
+        except Exception:
+            self._auto_be_retry_at[key] = now + 60
+            log.warning('AUTO BREAKEVEN failed for %s %s', leader, symbol, exc_info=True)
+            return None
+        if result is None:
+            self._auto_be_retry_at[key] = now + 60
+            log.warning('AUTO BREAKEVEN could not place a stop for %s %s', leader, symbol)
+            return None
+        log.warning('AUTO BREAKEVEN armed leader=%s symbol=%s profit=%.2f trigger=%g',
+                    leader, symbol, result['profit'], result['trigger'])
+        return result
 
     @staticmethod
     def _breakeven_trigger(detail):
@@ -399,19 +502,19 @@ class Engine:
         if not self.breakeven.get(key) and (not cfg.get('enabled') or cfg.get('max_loss_usdt') is None):
             return
         async with self._protection_lock:
-            await self._sync_protection_locked(leader, symbol, cfg, detail)
+            return await self._sync_protection_locked(leader, symbol, cfg, detail)
 
     async def _sync_protection_locked(self, leader, symbol, cfg, detail):
         if detail is None:
             detail = await self.exchange.fetch_position_detail(symbol)
         if not detail:
-            return
+            return 'none'
         contracts = abs(float(detail.get('contracts') or 0))
         contract_size = abs(float(detail.get('contractSize') or 1))
         position_amount = contracts * contract_size
         entry = float(detail.get('entryPrice') or 0)
         if not position_amount or entry <= 0:
-            return
+            return 'none'
         side = str(detail.get('side') or '').lower()
         key = self._owner_key(leader, symbol)
         if self.breakeven.get(key):
@@ -433,7 +536,7 @@ class Engine:
             self._save_state()
             if hasattr(self.exchange, 'cancel_protection_orders'):
                 await self.exchange.cancel_protection_orders(symbol)
-            return
+            return 'none'
         # Native stop orders are intentionally owned by the exchange; this demo
         # records the latest id for later replacement/cancellation.
         old = self.runtime_state.get('protection', {}).get(key)
@@ -443,7 +546,7 @@ class Engine:
         # Do not churn orders on every reconciliation tick.  Recreate only
         # when the live position or its trigger has changed.
         if old_id and old_contracts and old_trigger and abs(old_contracts - contracts) <= 1e-12 and abs(old_trigger - trigger) <= max(abs(trigger), 1) * 1e-10:
-            return
+            return 'kept'
         # Cleaning duplicates costs a full conditional-order listing on Gate, so
         # only do it when we are about to replace the protection order.
         if hasattr(self.exchange, 'cancel_protection_orders'):
@@ -460,6 +563,7 @@ class Engine:
             'id': oid, 'contracts': contracts, 'trigger': trigger,
         }
         self._save_state()
+        return 'placed'
 
     @staticmethod
     def _detail_size(detail):
@@ -483,6 +587,7 @@ class Engine:
         This catches manual closes and partial closes, which do not produce a
         leader signal and therefore never pass through ``process``.
         """
+        notifications = []
         async with self._lock:
             items = []
             for key, leader in list(self.owners.items()):
@@ -524,9 +629,23 @@ class Engine:
                         if not self.entered.get(f'{leader}:{symbol}'):
                             self.entered[f'{leader}:{symbol}'] = True
                             self._save_state()
-                        await self._sync_protection(leader, symbol, detail=detail)
+                        armed = await self._maybe_auto_breakeven(leader, symbol, detail)
+                        if armed:
+                            notifications.append(
+                                (leader, symbol, armed['profit'], armed['trigger']))
+                        else:
+                            await self._sync_protection(leader, symbol, detail=detail)
                 except Exception:
                     log.warning('Protection reconciliation failed for %s', key, exc_info=True)
+        # Notifications do network I/O; send them after releasing the signal lock.
+        handler = getattr(getattr(self, 'notifier', None), 'notify_breakeven', None)
+        if handler:
+            for leader, symbol, profit, trigger in notifications:
+                try:
+                    await handler(leader, symbol, profit, trigger)
+                except Exception:
+                    log.warning('AUTO BREAKEVEN notification failed for %s %s',
+                                leader, symbol, exc_info=True)
 
     async def prepare_startup(self):
         # Failure must propagate; unknown account state is never zero exposure.
