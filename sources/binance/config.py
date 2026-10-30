@@ -34,10 +34,18 @@ class BinanceBrowserConfig:
     timeout_ms: int = 30000
 
 
+DEFAULT_POLL_INTERVAL_SECONDS = 10.0
+
+
 @dataclass
 class BinanceSessionConfig:
     refresh_interval_hours: float = 4.0
     auth_probe_portfolio_id: str = ""
+    # Binance's copy-trading endpoint throttles on the order of a few requests
+    # per minute.  The shared leader loop ticks every ``polling.interval_seconds``
+    # (2.5s by default), so each source declares the cadence its endpoint can
+    # actually sustain.
+    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
 
 
 @dataclass

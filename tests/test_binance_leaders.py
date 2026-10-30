@@ -1,3 +1,4 @@
+import time
 import unittest
 from decimal import Decimal
 
@@ -7,7 +8,7 @@ from sources.binance.leaders import (
     signed_amount,
     to_positions,
 )
-from sources.binance.position_source import LeaderPosition
+from sources.binance.position_source import LeaderPosition, PollRateLimited
 
 
 def row(symbol="BTCUSDT", side="BOTH", amount="1", entry="100", mark="101", pnl="1", leverage=10):
@@ -68,6 +69,12 @@ class FakeSource:
         if isinstance(item, Exception):
             raise item
         return item
+
+
+class SlowSource(FakeSource):
+    """Adapter that declares a slower cadence than the shared loop."""
+
+    poll_interval = 10.0
 
 
 class FakeEngine:
@@ -213,6 +220,27 @@ class PollerTests(unittest.IsolatedAsyncioTestCase):
             await poller.poll_once("L")
         self.assertEqual(poller.errors["L"], 3)
         self.assertEqual(len(notifier.calls), 1)
+
+    async def test_source_poll_interval_skips_early_calls(self):
+        source = SlowSource([[row()]])
+        poller, engine = self.poller(source)
+
+        await poller.poll_once("L")
+        await poller.poll_once("L")
+        self.assertEqual(source.calls, 1)
+
+        poller.next_poll_at["L"] = 0
+        await poller.poll_once("L")
+        self.assertEqual(source.calls, 2)
+
+    async def test_rate_limit_retry_after_delays_the_next_attempt(self):
+        source = FakeSource([PollRateLimited("请求过于频繁", retry_after=30)])
+        poller, engine = self.poller(source)
+
+        await poller.poll_once("L")
+        self.assertGreaterEqual(poller.next_poll_at["L"], time.monotonic() + 29)
+        await poller.poll_once("L")
+        self.assertEqual(source.calls, 1)
 
 
 if __name__ == "__main__":

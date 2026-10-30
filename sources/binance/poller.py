@@ -6,8 +6,15 @@ from time import time
 
 import aiohttp
 
-from .config import BinanceWebConfig
-from .position_source import LeaderPosition, PollAuthError, PollError, parse_leader_positions
+from .config import BinanceWebConfig, DEFAULT_POLL_INTERVAL_SECONDS
+from .position_source import (
+    RATE_LIMIT_CODE,
+    LeaderPosition,
+    PollAuthError,
+    PollError,
+    PollRateLimited,
+    parse_leader_positions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +113,11 @@ class Poller:
         """Return the current in-memory HTTP authentication settings."""
         return self._cfg
 
+    @property
+    def poll_interval(self) -> float:
+        """Cadence this endpoint tolerates; see ``BinanceSessionConfig``."""
+        return DEFAULT_POLL_INTERVAL_SECONDS
+
     async def refresh_current_prices(
         self, positions: list[LeaderPosition]
     ) -> list[LeaderPosition]:
@@ -171,11 +183,17 @@ class Poller:
 
         try:
             async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                status = resp.status
                 data = await resp.json()
         except Exception as e:
             logger.error("Poll failed for %s: %s", portfolio_id, e)
             raise PollError(f"Request failed for {portfolio_id}: {e}") from e
 
+        if status == 429 or data.get("code") == RATE_LIMIT_CODE:
+            logger.warning("API throttled for %s: %s", portfolio_id, data.get("message"))
+            raise PollRateLimited(
+                f"API throttled for {portfolio_id}: {data.get('message')}"
+            )
         if data.get("code") != "000000":
             logger.error("API error for %s: %s", portfolio_id, data.get("message"))
             raise PollAuthError(f"API error for {portfolio_id}: {data.get('message')}")

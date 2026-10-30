@@ -13,9 +13,19 @@ import random
 from pathlib import Path
 from time import monotonic
 
-from .browser import BinanceAuthError, BinanceBrowserAuth, BrowserAuthConfig
+from .browser import (
+    BinanceAuthError,
+    BinanceBrowserAuth,
+    BinanceRateLimited,
+    BrowserAuthConfig,
+)
 from .config import BinanceBrowserConfig, BinanceSessionConfig
-from .position_source import PollAuthError, PollError, parse_leader_positions
+from .position_source import (
+    PollAuthError,
+    PollError,
+    PollRateLimited,
+    parse_leader_positions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +51,16 @@ class HybridBinancePositionSource:
         # trying to bring it back, with a cooldown so a logged-out profile does
         # not spawn Chromium on every 2.5-second poll.
         self._next_start_at = 0.0
+        self._last_start_error: str | None = None
+        # Binance throttles the copy-trading endpoint when it is polled every
+        # few seconds.  Independent sources may not sustain the shared leader
+        # loop cadence, so this one declares its own.
+        self._poll_interval = max(1.0, float(session_config.poll_interval_seconds))
         self._request_count = 0
+
+    @property
+    def poll_interval(self) -> float:
+        return self._poll_interval
 
     def set_notifier(self, notifier) -> None:
         self._notifier = notifier
@@ -79,11 +98,13 @@ class HybridBinancePositionSource:
             # open_live_session verifies the private account API; empty
             # positions additionally require verified leader visibility.
             await auth.fetch_positions_live(self._probe_portfolio_id)
-        except Exception:
+        except Exception as exc:
             await auth.stop()
+            self._last_start_error = str(exc)
             raise
         self._auth = auth
         self._next_start_at = 0.0
+        self._last_start_error = None
         self._schedule_refresh()
         logger.info(
             "[BrowserLive] persistent session started probe=%s profile=%s",
@@ -94,13 +115,24 @@ class HybridBinancePositionSource:
         """Start a browser that a previous recovery attempt left dead."""
         if self._auth is not None:
             return
-        if monotonic() < self._next_start_at:
-            raise PollAuthError("persistent browser is not started")
+        now = monotonic()
+        if now < self._next_start_at:
+            remaining = max(1, int(self._next_start_at - now + 0.999))
+            detail = f"; last error: {self._last_start_error}" if self._last_start_error else ""
+            raise PollAuthError(
+                f"persistent browser is not started (retrying in {remaining}s{detail})",
+                retry_after=float(remaining),
+            )
         try:
             await self._start_browser()
+        except BinanceRateLimited as exc:
+            self._next_start_at = monotonic() + 60
+            raise self._rate_limited(exc) from exc
         except Exception as exc:
             self._next_start_at = monotonic() + 60
-            raise PollAuthError(f"persistent browser restart failed: {exc}") from exc
+            raise PollAuthError(
+                f"persistent browser restart failed: {exc}", retry_after=60.0
+            ) from exc
 
     async def stop(self) -> None:
         async with self._lock:
@@ -117,6 +149,7 @@ class HybridBinancePositionSource:
             raise ValueError("Changing binance_source.browser settings requires restarting the service")
         self._session_config = session_config
         self._probe_portfolio_id = session_config.auth_probe_portfolio_id
+        self._poll_interval = max(1.0, float(session_config.poll_interval_seconds))
         self._schedule_refresh()
 
     async def _refresh_page(self, reason: str) -> None:
@@ -142,15 +175,28 @@ class HybridBinancePositionSource:
             self._next_start_at = monotonic() + 60
             raise
 
+    def _rate_limited(self, exc: BinanceRateLimited) -> PollRateLimited:
+        """Turn Binance's throttle into a back-off instead of a session error.
+
+        Reloading the page or restarting Chromium would only add more requests
+        against the same throttled account, which extends the throttle.
+        """
+        logger.warning("[BrowserLive] Binance throttled position reads: %s", exc)
+        return PollRateLimited(str(exc), retry_after=exc.retry_after)
+
     async def fetch_positions(self, portfolio_id: str):
         async with self._lock:
             await self._ensure_browser()
             if monotonic() >= self._next_refresh_at:
                 try:
                     await self._refresh_page("scheduled")
+                except BinanceRateLimited as exc:
+                    raise self._rate_limited(exc) from exc
                 except Exception as exc:
                     try:
                         await self._restart_browser(f"scheduled refresh failed: {exc}")
+                    except BinanceRateLimited as restart_exc:
+                        raise self._rate_limited(restart_exc) from restart_exc
                     except Exception as restart_exc:
                         raise PollAuthError(
                             f"scheduled browser recovery failed: {restart_exc}"
@@ -159,6 +205,8 @@ class HybridBinancePositionSource:
             request_started = monotonic()
             try:
                 items = await self._auth.fetch_positions_live(portfolio_id)
+            except BinanceRateLimited as exc:
+                raise self._rate_limited(exc) from exc
             except Exception as first_error:
                 logger.warning(
                     "[BrowserLive] fetch failed portfolio=%s request=%d error=%s",
@@ -167,10 +215,14 @@ class HybridBinancePositionSource:
                 try:
                     await self._refresh_page("fetch failure")
                     items = await self._auth.fetch_positions_live(portfolio_id)
+                except BinanceRateLimited as exc:
+                    raise self._rate_limited(exc) from exc
                 except Exception as refresh_error:
                     try:
                         await self._restart_browser(f"page recovery failed: {refresh_error}")
                         items = await self._auth.fetch_positions_live(portfolio_id)
+                    except BinanceRateLimited as exc:
+                        raise self._rate_limited(exc) from exc
                     except Exception as restart_error:
                         raise PollAuthError(
                             f"persistent browser recovery failed for {portfolio_id}: {restart_error}"

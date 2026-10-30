@@ -33,12 +33,38 @@ class LeaderPosition:
         return self.position_amount > 0
 
 
+# Binance answers HTTP 200 with ``请求过于频繁`` ("requests too frequent") when
+# the copy-trading endpoint is polled faster than its quota.  Retrying through
+# it only extends the throttle, so it must be treated as backpressure rather
+# than as a broken login session.
+RATE_LIMIT_CODE = "90801003"
+DEFAULT_RATE_LIMIT_RETRY_SECONDS = 60.0
+
+
 class PollError(Exception):
-    """Position source failed due to transport or response-format problems."""
+    """Position source failed due to transport or response-format problems.
+
+    ``retry_after`` lets a source tell the poller how long to wait before the
+    next attempt (used for Binance's throttle responses).
+    """
+
+    retry_after: float | None = None
+
+    def __init__(self, *args, retry_after: float | None = None):
+        super().__init__(*args)
+        self.retry_after = retry_after
 
 
 class PollAuthError(PollError):
     """The position source no longer has a usable Binance session."""
+
+
+class PollRateLimited(PollError):
+    """Binance throttled the request; it must not be retried immediately."""
+
+    def __init__(self, message: str,
+                 retry_after: float = DEFAULT_RATE_LIMIT_RETRY_SECONDS):
+        super().__init__(message, retry_after=retry_after)
 
 
 class PositionSource(Protocol):

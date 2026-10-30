@@ -2,7 +2,12 @@ import unittest
 import json
 from unittest.mock import AsyncMock, MagicMock
 
-from sources.binance.browser import BinanceAuthError, BinanceBrowserAuth, BrowserAuthConfig
+from sources.binance.browser import (
+    BinanceAuthError,
+    BinanceBrowserAuth,
+    BinanceRateLimited,
+    BrowserAuthConfig,
+)
 
 
 class FakeContext:
@@ -65,6 +70,17 @@ class BrowserLoginTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BinanceAuthError):
             await auth.fetch_positions_live("leader")
         auth._page.evaluate.assert_not_awaited()
+
+    async def test_throttle_response_backs_off_without_clearing_the_session(self):
+        auth = self.live_auth([
+            (200, {"code": "90801003", "message": "请求过于频繁", "data": None}),
+        ])
+
+        with self.assertRaises(BinanceRateLimited) as captured:
+            await auth.fetch_positions_live("leader")
+
+        self.assertIn("请求过于频繁", str(captured.exception))
+        self.assertEqual(captured.exception.retry_after, 60.0)
 
     async def test_navigation_replaces_headers_only_after_private_identity(self):
         auth = self.live_auth([])

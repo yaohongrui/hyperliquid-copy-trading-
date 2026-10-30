@@ -33,6 +33,17 @@ class BuildSourcesTests(unittest.TestCase):
         })
         self.assertEqual(sources["b"].web.csrf_token, "")
 
+    def test_session_poll_interval_defaults_and_overrides(self):
+        sources = build_sources({
+            "position_sources": {
+                "default": {"type": "binance"},
+                "fast": {"type": "binance",
+                         "session": {"poll_interval_seconds": 4}},
+            }
+        })
+        self.assertEqual(sources["default"].session.poll_interval_seconds, 10.0)
+        self.assertEqual(sources["fast"].session.poll_interval_seconds, 4)
+
     def test_unknown_type_is_rejected(self):
         with self.assertRaises(ValueError):
             build_sources({"position_sources": {"b": {"type": "gate"}}})

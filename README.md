@@ -245,6 +245,7 @@ position_sources:
     session:
       refresh_interval_hours: 4.0
       auth_probe_portfolio_id: '5275595931132915200'
+      poll_interval_seconds: 10    # Binance 限频，不能按全局 2.5s 轮询
 ```
 
 | 字段 | 说明 |
@@ -254,6 +255,7 @@ position_sources:
 | `browser.headless` | 无桌面环境时保持 `true` |
 | `session.auth_probe_portfolio_id` | hybrid 启动自检使用的可见带单组合 ID |
 | `session.refresh_interval_hours` | 定时刷新页面的间隔 |
+| `session.poll_interval_seconds` | 该来源的轮询间隔。Binance 对 copy-trading 接口限频（返回 `90801003 请求过于频繁`），所以不能跟随全局 `polling.interval_seconds`；被限频时来源会退避 60 秒而不是重启浏览器 |
 
 > 登录态依赖 `p20t`/`r20t` cookie，需要人工在 VNC 中登录。会话过期时只会停止新信号，不会把带单员误判为空仓。首次登录：`python3 -m sources.binance.browser --profile <dir> login`。
 

@@ -1,10 +1,12 @@
 import unittest
+from time import monotonic
 from unittest.mock import AsyncMock, patch
 from decimal import Decimal
 
 from sources.binance.session import HybridBinancePositionSource
 from sources.binance.config import BinanceBrowserConfig, BinanceSessionConfig
-from sources.binance.position_source import PollAuthError
+from sources.binance.browser import BinanceRateLimited
+from sources.binance.position_source import PollAuthError, PollRateLimited
 
 
 def position(amount="1"):
@@ -168,6 +170,60 @@ class BrowserLiveSourceTests(unittest.IsolatedAsyncioTestCase):
             auth = FakeAuth.instances[0]
             auth.open_live_session.assert_awaited_once_with("protected")
             await source.stop()
+
+    async def test_poll_interval_comes_from_session_config(self):
+        with patch("sources.binance.session.BinanceBrowserAuth", FakeAuth):
+            source = HybridBinancePositionSource(
+                object(), BinanceBrowserConfig(),
+                BinanceSessionConfig(auth_probe_portfolio_id="protected",
+                                     poll_interval_seconds=7.5),
+                "fallback",
+            )
+            self.assertEqual(source.poll_interval, 7.5)
+
+    async def test_throttled_fetch_backs_off_without_touching_the_browser(self):
+        with patch("sources.binance.session.BinanceBrowserAuth", FakeAuth):
+            source = self.source()
+            await source.start()
+            auth = FakeAuth.instances[0]
+            auth.fetch_positions_live.reset_mock()
+            auth.fetch_positions_live.side_effect = BinanceRateLimited("请求过于频繁")
+
+            with self.assertRaises(PollRateLimited) as captured:
+                await source.fetch_positions("leader-1")
+
+            self.assertEqual(captured.exception.retry_after, 60.0)
+            auth.reload_live_session.assert_not_awaited()
+            self.assertIs(source._auth, auth)
+            self.assertEqual(len(FakeAuth.instances), 1)  # no restart
+            await source.stop()
+
+    async def test_throttled_page_refresh_does_not_restart_the_browser(self):
+        with patch("sources.binance.session.BinanceBrowserAuth", FakeAuth):
+            source = self.source()
+            await source.start()
+            auth = FakeAuth.instances[0]
+            source._next_refresh_at = 0
+            auth.reload_live_session.side_effect = BinanceRateLimited("请求过于频繁")
+
+            with self.assertRaises(PollRateLimited):
+                await source.fetch_positions("leader-1")
+
+            self.assertIs(source._auth, auth)
+            self.assertEqual(len(FakeAuth.instances), 1)  # no restart
+            await source.stop()
+
+    async def test_cooldown_error_reports_the_last_failure_and_retry_after(self):
+        with patch("sources.binance.session.BinanceBrowserAuth", FakeAuth):
+            source = self.source()
+            source._next_start_at = monotonic() + 60
+            source._last_start_error = "login cookie expired"
+
+            with self.assertRaises(PollAuthError) as captured:
+                await source.fetch_positions("leader-1")
+
+            self.assertIn("login cookie expired", str(captured.exception))
+            self.assertGreater(captured.exception.retry_after, 0)
 
 
 if __name__ == "__main__":

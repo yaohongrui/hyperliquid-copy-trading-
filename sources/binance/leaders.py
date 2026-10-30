@@ -130,6 +130,10 @@ class LeaderPoller:
         self.missing: dict[str, dict[str, int]] = {}
         self.errors: dict[str, int] = {}
         self.last_success: dict[str, float] = {}
+        # Sources with a slower endpoint (Binance throttles aggressively) can
+        # declare their own ``poll_interval``; the shared loop keeps ticking so
+        # Hyperliquid leaders are unaffected.
+        self.next_poll_at: dict[str, float] = {}
         self.running = False
         self._task: asyncio.Task | None = None
 
@@ -166,12 +170,21 @@ class LeaderPoller:
         portfolio_id = str(cfg.get("portfolio_id") or "").strip()
         if source is None or not portfolio_id:
             return
+        interval = self._source_interval(source)
+        now = time.monotonic()
+        if now < self.next_poll_at.get(name, 0.0):
+            return
+        if interval is not None:
+            self.next_poll_at[name] = now + interval
         try:
             raw = await source.fetch_positions(portfolio_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.errors[name] = self.errors.get(name, 0) + 1
+            retry_after = getattr(exc, "retry_after", None)
+            if retry_after:
+                self.next_poll_at[name] = time.monotonic() + max(0.0, float(retry_after))
             count = self.errors[name]
             if count == 1 or count == 3 or count % 20 == 0:
                 log.warning(
@@ -196,8 +209,18 @@ class LeaderPoller:
     def _forget(self, name: str) -> None:
         """Drop all cached state for a leader that is now disabled."""
         for store in (self.latest, self.latest_raw, self.missing,
-                      self.errors, self.last_success):
+                      self.errors, self.last_success, self.next_poll_at):
             store.pop(name, None)
+
+    def _source_interval(self, source) -> float | None:
+        """Return the adapter's declared cadence, or None for the shared one."""
+        value = getattr(source, "poll_interval", None)
+        if value is None:
+            return None
+        try:
+            return max(self.interval, float(value))
+        except (TypeError, ValueError):
+            return None
 
     def _merge_raw(self, name: str, raw: list[LeaderPosition], positions: dict[str, Position]) -> list[LeaderPosition]:
         """Keep retained rows in the display snapshot during the one-miss window."""

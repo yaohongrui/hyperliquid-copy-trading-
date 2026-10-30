@@ -19,8 +19,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from .config import BinanceBrowserConfig, BinanceWebConfig
-from .position_source import PollAuthError, PollError, parse_leader_positions
+from .config import BinanceBrowserConfig, BinanceWebConfig, DEFAULT_POLL_INTERVAL_SECONDS
+from .position_source import (
+    DEFAULT_RATE_LIMIT_RETRY_SECONDS,
+    RATE_LIMIT_CODE,
+    PollAuthError,
+    PollError,
+    PollRateLimited,
+    parse_leader_positions,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -49,6 +56,15 @@ class BrowserAuthConfig:
 
 class BinanceAuthError(RuntimeError):
     """Browser could not provide a usable Binance session."""
+
+
+class BinanceRateLimited(BinanceAuthError):
+    """Binance answered with its throttle code (``请求过于频繁``)."""
+
+    def __init__(self, message: str,
+                 retry_after: float = DEFAULT_RATE_LIMIT_RETRY_SECONDS):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class BinanceBrowserAuth:
@@ -331,6 +347,15 @@ class BinanceBrowserAuth:
             ) from exc
         if not isinstance(payload, dict):
             raise BinanceAuthError("Browser API returned an unexpected payload")
+        # Binance reports throttling as HTTP 200 with a business code.  Callers
+        # must back off instead of refreshing the page or restarting Chromium,
+        # both of which only add more requests to the same throttled account.
+        if result.get("status") == 429 or payload.get("code") == RATE_LIMIT_CODE:
+            raise BinanceRateLimited(
+                "Binance throttled the position request: "
+                f"HTTP {result.get('status')} code={payload.get('code')} "
+                f"{payload.get('message') or ''}".strip()
+            )
         if result.get("status") != 200 or payload.get("code") != "000000":
             raise BinanceAuthError(
                 "in-page positions rejected: "
@@ -461,6 +486,10 @@ class BinanceBrowserPositionSource:
         # Serialize leader reads so poll and health tasks cannot mix responses.
         self._fetch_lock = asyncio.Lock()
 
+    @property
+    def poll_interval(self) -> float:
+        return DEFAULT_POLL_INTERVAL_SECONDS
+
     async def start(self) -> None:
         if self._auth is not None:
             return
@@ -496,6 +525,8 @@ class BinanceBrowserPositionSource:
                 return parse_leader_positions(items, portfolio_id)
             except PollError:
                 raise
+            except BinanceRateLimited as exc:
+                raise PollRateLimited(str(exc), retry_after=exc.retry_after) from exc
             except BinanceAuthError as exc:
                 # A valid response is the only reliable proof that the persistent
                 # profile is still authenticated.  Preserve the coordinator's
