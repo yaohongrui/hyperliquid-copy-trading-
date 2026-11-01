@@ -41,7 +41,7 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 ### 通知与控制
 
 - Telegram 长轮询机器人：`/status`、`/positions`、`/leader_positions`、`/pause`、`/resume`、`/unlock_hard_stop`。
-- 成交、挂单被接受、下单失败、信号跳过都会推送通知，并附带原因。
+- 成交、挂单、撤单、下单失败、信号跳过都会推送通知，并附带原因。
 - 持仓报告可渲染成 PNG 图片发送（`report_format: image|text`）。
 - 只响应配置的 `chat_id`；重启时会跳过旧消息，不会重放历史命令。
 
@@ -538,16 +538,17 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 
 默认主会话（适合静音，只看运行状态）：
 
-- `ORDER FILLED`：成交方向、仓位方向、动作、成交数量、均价。
-- `ORDER ACCEPTED`：订单已被交易所接受但尚未成交（例如延迟入场的限价单）。
-- `ORDER SKIPPED`：跳过原因，包括暂停、黑名单、symbol skip、所有权冲突、启动价格不利、小单累计、无可减仓位、反手跳过等。
+- `ORDER FILLED`：执行账户、交易员、币种、交易员仓位方向、实际下单方向、信号类型、订单类型、成交数量、成交均价。
+- `ORDER RESTING (UNFILLED)`：限价单已挂出但尚未成交。会显示订单状态、限价和信号时的市价，并说明它会一直保留到成交，或被交易员平仓/减仓、方向反转、新开仓信号撤销。
+- `UNFILLED ORDER CANCELLED`：未成交挂单被撤销及原因，包括交易员平仓/减仓、方向反转、交易员被禁用、被新的开仓信号替代、账户已平仓、硬止损等。
+- `SIGNAL SKIPPED`：信号被跳过及原因，包括暂停、黑名单、symbol skip、所有权冲突、启动价格不利、小单累计、无可减仓位、反手跳过等。
 - `AUTO BREAKEVEN`：自动保本触发，通知盈利金额和新的止损价。
 - 启动/停止时分别发送 `SYSTEM STARTED` / `SYSTEM STOPPED`。
 
 配置 `telegram.alerts` 后，以下高优先级事件发到独立告警频道；告警频道发送失败时回退到主会话：
 
 - `ORDER FAILED`：下单异常及原因。
-- `SOURCE FAILED`：Binance 数据源连续 3 次失败。
+- `LEADER SOURCE FAILED`：Binance 数据源连续 3 次失败；会说明现有持仓不受影响。
 - `HARD STOP TRIGGERED`：账户硬止损触发，包含权益、当日基线、当日亏损和限额。
 - `HARD STOP FLATTEN FAILED` / `HARD STOP FLATTEN RECOVERED`：平仓失败只告警一次，后续重试成功再发恢复通知。
 - 解除锁定要在**主控制会话**发送 `/unlock_hard_stop`；告警频道只出不进。

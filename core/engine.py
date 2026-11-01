@@ -948,9 +948,9 @@ class Engine:
                                                  'reduce_only': reduce, 'timestamp': time.time()})
                     if self.notifier:
                         if order.status == 'closed':
-                            await self.notifier.notify_filled(leader, replace(s, delta=order.amount if side == 'buy' else -order.amount), order)
+                            await self.notifier.notify_filled(leader, replace(s, delta=order.amount if side == 'buy' else -order.amount), order, order_type=typ)
                         else:
-                            await self.notifier.notify_accepted(leader, s, order)
+                            await self.notifier.notify_accepted(leader, s, order, order_type=typ)
                     if reduce:
                         await self._release_if_flat(leader, s.symbol)
                     elif order.status == 'closed':

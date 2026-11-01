@@ -33,10 +33,10 @@ class Notifier:
     async def notify_skipped(self, leader, signal, reason):
         self.skipped.append((leader, signal.symbol, signal.kind, reason))
 
-    async def notify_filled(self, leader, signal, order):
+    async def notify_filled(self, leader, signal, order, order_type=None):
         pass
 
-    async def notify_accepted(self, leader, signal, order):
+    async def notify_accepted(self, leader, signal, order, order_type=None):
         pass
 
     async def notify_failed(self, leader, signal, exc):

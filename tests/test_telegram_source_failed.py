@@ -16,8 +16,9 @@ class NotifySourceFailedTests(unittest.IsolatedAsyncioTestCase):
 
         manager.send.assert_awaited_once()
         message = manager.send.await_args.args[0]
-        self.assertIn("SOURCE FAILED", message)
+        self.assertIn("LEADER SOURCE FAILED", message)
         self.assertIn("Binance Leader", message)
+        self.assertIn("existing positions are unchanged", message)
         self.assertIn("polling failed", message)
 
 
