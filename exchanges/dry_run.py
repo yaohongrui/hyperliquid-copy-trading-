@@ -9,6 +9,13 @@ class DryRunExchange(Exchange):
   return o
  async def fetch_positions(self): return self.positions.copy()
  async def fetch_open_orders(self): return [o for o in self.orders.values() if o.status == 'open']
+ async def fetch_order(self,order_id,symbol=None):
+  order=self.orders.get(str(order_id))
+  if order is None: return None
+  filled=abs(order.amount) if order.status=='closed' else 0.0
+  return {'status': order.status, 'filled': filled,
+          'remaining': 0.0 if order.status=='closed' else abs(order.amount),
+          'average': order.price, 'price': order.price, 'side': order.side}
  async def equity(self): return float(self.config.get('fixed_balance_usdt') or 0)
  async def cancel_order(self,order_id,symbol=None):
   if order_id in self.orders: self.orders[order_id].status='canceled'

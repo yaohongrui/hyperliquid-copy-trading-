@@ -23,6 +23,9 @@ class Recorder:
     async def notify_cancelled(self, *args):
         return await self._record("cancelled", *args)
 
+    async def notify_limit_filled(self, *args):
+        return await self._record("limit_filled", *args)
+
     async def notify_skipped(self, *args):
         return await self._record("skipped", *args)
 
@@ -53,12 +56,13 @@ class RoutingNotifierTests(unittest.IsolatedAsyncioTestCase):
         await router.notify_filled("L", "signal", "order")
         await router.notify_accepted("L", "signal", "order")
         await router.notify_cancelled("L", "S", {"id": "o1"}, "leader is flat")
+        await router.notify_limit_filled("L", "S", {"id": "o1"}, 100.0, 1.0, 0.0)
         await router.notify_skipped("L", "signal", "reason")
         await router.notify_breakeven("L", "BTC", 12.0, 100.0)
 
         self.assertEqual(
             [call[0] for call in normal.calls],
-            ["filled", "accepted", "cancelled", "skipped", "breakeven"],
+            ["filled", "accepted", "cancelled", "limit_filled", "skipped", "breakeven"],
         )
         self.assertEqual(alerts.calls, [])
 

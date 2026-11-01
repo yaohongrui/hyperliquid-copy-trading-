@@ -21,6 +21,54 @@ def exchange(mapping=None, markets=None):
     return instance
 
 
+class CcxtFetchOrderTests(unittest.IsolatedAsyncioTestCase):
+    def instance(self, client):
+        exchange = CcxtExchange.__new__(CcxtExchange)
+        exchange.client = client
+        exchange.symbol_map = SymbolMap()
+        return exchange
+
+    async def test_contract_fill_is_converted_to_base_units(self):
+        class Client:
+            markets = {
+                "ESPORTS/USDT:USDT": {
+                    "swap": True, "base": "ESPORTS", "quote": "USDT",
+                    "contractSize": 10,
+                },
+            }
+
+            async def fetch_order(self, order_id, symbol=None):
+                self.called = (order_id, symbol)
+                return {
+                    "id": order_id, "status": "closed", "filled": 20.0,
+                    "remaining": 0.0, "average": 0.99, "price": 1.0,
+                    "side": "buy",
+                }
+
+        client = Client()
+        order = await self.instance(client).fetch_order("123", "ESPORTS")
+
+        self.assertEqual(client.called, ("123", "ESPORTS/USDT:USDT"))
+        self.assertEqual(order["status"], "closed")
+        self.assertEqual(order["filled"], 200.0)
+        self.assertEqual(order["remaining"], 0.0)
+        self.assertEqual(order["average"], 0.99)
+
+    async def test_order_not_found_is_reported_as_none(self):
+        class Client:
+            markets = {
+                "ESPORTS/USDT:USDT": {
+                    "swap": True, "base": "ESPORTS", "quote": "USDT",
+                    "contractSize": 1,
+                },
+            }
+
+            async def fetch_order(self, order_id, symbol=None):
+                raise RuntimeError('{"label":"ORDER_NOT_FOUND"}')
+
+        self.assertIsNone(await self.instance(Client()).fetch_order("123", "ESPORTS"))
+
+
 class CcxtSymbolTests(unittest.TestCase):
     def test_direct_venue_symbol(self):
         instance = exchange()

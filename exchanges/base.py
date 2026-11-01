@@ -9,6 +9,7 @@ class Exchange(ABC):
  @abstractmethod
  async def fetch_positions(self): ...
  async def fetch_open_orders(self): return []
+ async def fetch_order(self,order_id,symbol=None): raise NotImplementedError
  async def cancel_order(self,order_id,symbol=None): return None
  async def cancel_all_orders(self): return 0
  async def has_open_positions(self): return False

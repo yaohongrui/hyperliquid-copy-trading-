@@ -299,6 +299,31 @@ class CcxtExchange:
                 log.warning('Failed to fetch Binance conditional orders', exc_info=True)
         return orders
 
+    async def fetch_order(self, order_id, symbol=None):
+        """Return one order in base-asset units, or None if it is gone.
+
+        Gate stops returning cancelled unfilled orders, so ``None`` means the
+        caller must fall back to position reconciliation or drop the record.
+        """
+        market = self._symbol(symbol) if symbol else None
+        try:
+            result = await self.client.fetch_order(str(order_id), market)
+        except Exception as exc:
+            if self._order_gone(exc):
+                return None
+            raise
+        contract_size = 1.0
+        if market:
+            contract_size = float(self.client.markets[market].get('contractSize') or 1)
+        return {
+            'status': str(result.get('status') or '').lower(),
+            'filled': float(result.get('filled') or 0) * contract_size,
+            'remaining': float(result.get('remaining') or 0) * contract_size,
+            'average': result.get('average') or result.get('price'),
+            'price': result.get('price'),
+            'side': result.get('side'),
+        }
+
     async def fetch_realized_pnl(self):
         """Return recent exchange realized-PnL rows in the console schema.
 

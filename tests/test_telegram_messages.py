@@ -91,9 +91,51 @@ class TelegramMessageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("UNFILLED ORDER CANCELLED", text)
         self.assertIn("<b>Order side</b>: BUY", text)
-        self.assertIn("<b>Quantity</b>: 200", text)
+        self.assertIn("<b>Order qty</b>: 200", text)
         self.assertIn("<b>Order ID</b>: 123", text)
         self.assertIn("<b>Reason</b>: leader is flat", text)
+
+    async def test_cancelled_after_partial_fill_reports_the_remainder(self):
+        manager = self.manager()
+        entry = {"id": "123", "side": "buy", "amount": 200.0, "filled": 80.0}
+
+        text = await self.sent_text(
+            manager,
+            manager.notify_cancelled("binance-1", "ESPORTS", entry, "leader is flat"),
+        )
+
+        self.assertIn("ORDER CANCELLED (PARTIALLY FILLED)", text)
+        self.assertIn("<b>Filled qty</b>: 80", text)
+        self.assertIn("<b>Remaining qty</b>: 120", text)
+
+    async def test_filled_resting_order_reports_fill_and_limit_price(self):
+        manager = self.manager()
+        entry = {"id": "123", "side": "buy", "amount": 200.0, "price": 1.4}
+
+        text = await self.sent_text(
+            manager,
+            manager.notify_limit_filled("binance-1", "ESPORTS", entry, 200.0, 1.42, 0.0),
+        )
+
+        self.assertIn("LIMIT ORDER FILLED", text)
+        self.assertIn("<b>Filled qty</b>: 200", text)
+        self.assertIn("<b>Avg fill price</b>: 1.42", text)
+        self.assertIn("<b>Limit price</b>: 1.4", text)
+        self.assertNotIn("Remaining qty", text)
+
+    async def test_partial_fill_says_the_rest_is_still_resting(self):
+        manager = self.manager()
+        entry = {"id": "123", "side": "buy", "amount": 200.0, "price": 1.4}
+
+        text = await self.sent_text(
+            manager,
+            manager.notify_limit_filled("binance-1", "ESPORTS", entry, 80.0, 1.41, 120.0),
+        )
+
+        self.assertIn("PARTIALLY FILLED", text)
+        self.assertIn("<b>Filled qty</b>: 80", text)
+        self.assertIn("<b>Remaining qty</b>: 120", text)
+        self.assertIn("<b>Note</b>: The rest of the order is still resting.", text)
 
     async def test_hard_stop_does_not_claim_the_flatten_already_succeeded(self):
         manager = self.manager()

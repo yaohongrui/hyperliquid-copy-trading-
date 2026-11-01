@@ -154,6 +154,7 @@ class Engine:
         self.pending_orders[self._pending_key(leader, symbol)] = {
             'id': str(order.id), 'leader': leader, 'symbol': symbol,
             'side': order.side, 'amount': float(order.amount or 0),
+            'price': order.price, 'filled': 0.0,
             'created_at': time.time(),
         }
         self._save_state()
@@ -178,9 +179,20 @@ class Engine:
                 log.warning('Failed to cancel pending order %s for %s (%s)', order_id, key, reason, exc_info=True)
                 return False
             # The order is no longer on the book, but it may have filled
-            # instead of being cancelled.  Drop the tracking without claiming
-            # a cancellation that we cannot verify.
+            # instead of being cancelled.  Ask the venue once before dropping
+            # the record so a fill that raced with our cancel is still
+            # reported instead of disappearing silently.
             log.info('Pending order %s for %s is already gone (%s)', order_id, key, reason)
+            if notify:
+                state = await self._pending_order_state(item)
+                if state is not None:
+                    filled, remaining, full = self._state_fill(state, item)
+                    if filled > float(item.get('filled') or 0) + 1e-12:
+                        await self._notify_pending_fill(item, filled, remaining, state)
+                        item['filled'] = filled
+                    if full:
+                        self.entered[f'{leader}:{symbol}'] = True
+                    self._save_state()
         else:
             cancelled = True
             log.info('Cancelled pending order %s for %s (%s)', order_id, key, reason)
@@ -203,8 +215,70 @@ class Engine:
                 item.get('leader'), item.get('symbol'), reason, notify=notify,
             )
 
+    @staticmethod
+    def _assume_pending_open(item):
+        """Fallback when an adapter cannot report individual order status."""
+        filled = max(0.0, float(item.get('filled') or 0))
+        amount = abs(float(item.get('amount') or 0))
+        return {
+            'status': 'open', 'filled': filled,
+            'remaining': max(0.0, amount - filled),
+            'average': None, 'price': item.get('price'),
+        }
+
+    async def _pending_order_state(self, item):
+        """Return the venue's latest view of one resting order.
+
+        ``None`` means the query failed this cycle and the order must stay
+        tracked.  A ``gone`` status means the venue no longer knows it, which
+        happens on Gate for cancelled unfilled orders.
+        """
+        fetcher = getattr(self.exchange, 'fetch_order', None)
+        order_id = item.get('id')
+        symbol = item.get('symbol')
+        if fetcher is None or not order_id or not symbol:
+            return self._assume_pending_open(item)
+        try:
+            order = await fetcher(order_id, symbol)
+        except NotImplementedError:
+            return self._assume_pending_open(item)
+        except Exception:
+            log.warning('Pending order %s status query failed for %s',
+                        order_id, symbol, exc_info=True)
+            return None
+        if order is not None:
+            return order
+        return {'status': 'gone', 'filled': 0.0, 'remaining': 0.0,
+                'average': None, 'price': None}
+
+    @staticmethod
+    def _state_fill(state, item):
+        """Normalize an order snapshot into (filled, remaining, full)."""
+        status = str(state.get('status') or '').lower()
+        filled = max(0.0, float(state.get('filled') or 0))
+        remaining = max(0.0, float(state.get('remaining') or 0))
+        full = status in ('closed', 'filled') or (filled > 0 and remaining <= 1e-12)
+        if full:
+            filled = filled or abs(float(item.get('amount') or 0))
+            remaining = 0.0
+        return filled, remaining, full
+
+    async def _notify_pending_fill(self, item, filled, remaining, state):
+        handler = getattr(self.notifier, 'notify_limit_filled', None) if self.notifier else None
+        if handler is None:
+            return
+        price = state.get('average') or item.get('price')
+        try:
+            await handler(
+                item.get('leader'), item.get('symbol'), item, filled,
+                price, remaining,
+            )
+        except Exception:
+            log.warning('LIMIT ORDER FILLED notification failed for %s %s',
+                        item.get('leader'), item.get('symbol'), exc_info=True)
+
     async def reconcile_pending_orders(self):
-        """Keep resting entries aligned with the leader's current position.
+        """Keep resting entries aligned with the leader and report fills.
 
         There is no time-based expiry.  A late-entry limit stays on the book
         until it fills or its premise disappears: the leader goes flat or
@@ -219,6 +293,42 @@ class Engine:
                     self.pending_orders.pop(key, None)
                     self._save_state()
                     continue
+
+                state = await self._pending_order_state(item)
+                if state is None:
+                    # The venue did not answer; keep tracking and retry.
+                    continue
+                status = str(state.get('status') or '').lower()
+                filled, remaining, full = self._state_fill(state, item)
+                if full:
+                    await self._notify_pending_fill(item, filled, 0.0, state)
+                    self.entered[f'{leader}:{symbol}'] = True
+                    self.pending_orders.pop(key, None)
+                    self._save_state()
+                    continue
+                if filled > float(item.get('filled') or 0) + 1e-12:
+                    # Partial fill: report the increase but keep watching.
+                    await self._notify_pending_fill(item, filled, remaining, state)
+                    item['filled'] = filled
+                    self._save_state()
+                if status in ('canceled', 'cancelled', 'expired', 'rejected'):
+                    self.pending_orders.pop(key, None)
+                    self._save_state()
+                    handler = getattr(self.notifier, 'notify_cancelled', None) if self.notifier else None
+                    if handler:
+                        try:
+                            await handler(leader, symbol, item, f'exchange reported {status}')
+                        except Exception:
+                            log.warning('ORDER CANCELLED notification failed for %s %s',
+                                        leader, symbol, exc_info=True)
+                    continue
+                if status == 'gone':
+                    self.pending_orders.pop(key, None)
+                    self._save_state()
+                    log.info('Pending order %s for %s disappeared from the exchange',
+                             item.get('id'), key)
+                    continue
+                # The order is still open (possibly partially filled).
                 cfg = self.leaders.get(leader)
                 if cfg is None or not cfg.get('enabled', True):
                     await self._cancel_pending(leader, symbol, 'leader is disabled')

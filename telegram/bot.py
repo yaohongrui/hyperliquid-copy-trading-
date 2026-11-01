@@ -311,16 +311,52 @@ class TelegramManager:
             reason_label="Note",
         ))
 
-    async def notify_cancelled(self, leader, symbol, entry, reason):
-        """Notify that a resting entry was cancelled without filling."""
-        return await self.send(self._event_message("🚫 UNFILLED ORDER CANCELLED", [
+    async def notify_limit_filled(self, leader, symbol, entry, filled, price, remaining=0.0):
+        """Notify that a resting limit entry filled (fully or partially)."""
+        remaining = max(0.0, float(remaining or 0))
+        full = remaining <= 1e-12
+        title = "✅ LIMIT ORDER FILLED" if full else "🟡 LIMIT ORDER PARTIALLY FILLED"
+        fields = [
             ("Account", self.account_name),
             ("Leader", leader),
             ("Symbol", symbol),
             ("Order side", str(entry.get("side") or "").upper()),
-            ("Quantity", abs(float(entry.get("amount") or 0))),
-            ("Order ID", entry.get("id")),
-        ], reason=reason))
+            ("Filled qty", abs(float(filled or 0))),
+        ]
+        if not full:
+            fields.append(("Remaining qty", remaining))
+        if price is not None:
+            fields.append(("Avg fill price", price))
+        if entry.get("price") is not None:
+            fields.append(("Limit price", entry.get("price")))
+        fields.append(("Order ID", entry.get("id")))
+        return await self.send(self._event_message(
+            title,
+            fields,
+            reason=None if full else "The rest of the order is still resting.",
+            reason_label="Note",
+        ))
+
+    async def notify_cancelled(self, leader, symbol, entry, reason):
+        """Notify that a resting entry was cancelled without filling."""
+        order_qty = abs(float(entry.get("amount") or 0))
+        filled = abs(float(entry.get("filled") or 0))
+        title = ("🚫 ORDER CANCELLED (PARTIALLY FILLED)"
+                 if filled > 0 else "🚫 UNFILLED ORDER CANCELLED")
+        fields = [
+            ("Account", self.account_name),
+            ("Leader", leader),
+            ("Symbol", symbol),
+            ("Order side", str(entry.get("side") or "").upper()),
+            ("Order qty", order_qty),
+        ]
+        if filled > 0:
+            fields.extend([
+                ("Filled qty", filled),
+                ("Remaining qty", max(0.0, order_qty - filled)),
+            ])
+        fields.append(("Order ID", entry.get("id")))
+        return await self.send(self._event_message(title, fields, reason=reason))
 
     async def notify_breakeven(self, leader, symbol, profit, trigger):
         return await self.send(self._event_message("🛡️ AUTO BREAKEVEN", [
@@ -506,6 +542,9 @@ class RoutingNotifier:
 
     async def notify_cancelled(self, *args):
         return await self._normal_call("notify_cancelled", *args)
+
+    async def notify_limit_filled(self, *args):
+        return await self._normal_call("notify_limit_filled", *args)
 
     async def notify_skipped(self, *args):
         return await self._normal_call("notify_skipped", *args)

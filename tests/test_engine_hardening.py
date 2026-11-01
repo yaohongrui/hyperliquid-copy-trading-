@@ -58,13 +58,35 @@ class FlakyCancelExchange(RecordingExchange):
         await super().cancel_order(order_id, symbol)
 
 
+class FillAwareExchange(RecordingExchange):
+    """Exchange double that can report an individual order's fill state."""
+
+    def __init__(self):
+        super().__init__()
+        self.order_states = {}
+
+    async def fetch_order(self, order_id, symbol=None):
+        return self.order_states.get(str(order_id))
+
+
+class CancelRacesFillExchange(FillAwareExchange):
+    """The cancel call says the order is gone because it just filled."""
+
+    async def cancel_order(self, order_id, symbol=None):
+        raise RuntimeError("ORDER_NOT_FOUND")
+
+
 class TradeNotifier:
     def __init__(self):
         self.cancelled = []
         self.skipped = []
+        self.fills = []
 
     async def notify_cancelled(self, leader, symbol, item, reason):
         self.cancelled.append((leader, symbol, item.get("id"), reason))
+
+    async def notify_limit_filled(self, leader, symbol, entry, filled, price, remaining):
+        self.fills.append((leader, symbol, entry.get("id"), filled, price, remaining))
 
     async def notify_skipped(self, leader, signal, reason):
         self.skipped.append((leader, signal.symbol, signal.kind, reason))
@@ -188,6 +210,71 @@ class PendingOrderTests(unittest.IsolatedAsyncioTestCase):
             notifier.cancelled,
             [("L", "S", "o1", "close signal from leader")],
         )
+
+    async def test_filled_resting_order_is_notified(self):
+        exchange = FillAwareExchange()
+        notifier = TradeNotifier()
+        engine = self.engine(exchange, notifier)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        exchange.order_states["o1"] = {
+            "status": "closed", "filled": 100.0, "remaining": 0.0,
+            "average": 0.99, "price": 1.0, "side": "buy",
+        }
+        await engine.reconcile_pending_orders()
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertTrue(engine.entered.get("L:S"))
+        self.assertEqual(
+            notifier.fills,
+            [("L", "S", "o1", 100.0, 0.99, 0.0)],
+        )
+
+    async def test_cancel_that_loses_the_race_still_reports_the_fill(self):
+        exchange = CancelRacesFillExchange()
+        notifier = TradeNotifier()
+        engine = self.engine(exchange, notifier)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+        exchange.order_states["o1"] = {
+            "status": "closed", "filled": 100.0, "remaining": 0.0,
+            "average": 0.99, "price": 1.0, "side": "buy",
+        }
+
+        await engine.process("L", {})
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(notifier.fills, [("L", "S", "o1", 100.0, 0.99, 0.0)])
+
+    async def test_partial_fill_is_reported_once_then_completed(self):
+        exchange = FillAwareExchange()
+        notifier = TradeNotifier()
+        engine = self.engine(exchange, notifier)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        exchange.order_states["o1"] = {
+            "status": "open", "filled": 40.0, "remaining": 60.0,
+            "average": 0.99, "price": 1.0, "side": "buy",
+        }
+        await engine.reconcile_pending_orders()
+        self.assertIn("L:S", engine.pending_orders)
+        self.assertEqual(engine.pending_orders["L:S"]["filled"], 40.0)
+        self.assertEqual(notifier.fills, [("L", "S", "o1", 40.0, 0.99, 60.0)])
+
+        await engine.reconcile_pending_orders()  # unchanged: no duplicate
+        self.assertEqual(len(notifier.fills), 1)
+
+        exchange.order_states["o1"] = {
+            "status": "closed", "filled": 100.0, "remaining": 0.0,
+            "average": 0.995, "price": 1.0, "side": "buy",
+        }
+        await engine.reconcile_pending_orders()
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(len(notifier.fills), 2)
+        self.assertEqual(notifier.fills[-1], ("L", "S", "o1", 100.0, 0.995, 0.0))
 
     async def test_reconcile_keeps_owner_while_limit_is_working(self):
         exchange = RecordingExchange()

@@ -41,7 +41,7 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 ### 通知与控制
 
 - Telegram 长轮询机器人：`/status`、`/positions`、`/leader_positions`、`/pause`、`/resume`、`/unlock_hard_stop`。
-- 成交、挂单、撤单、下单失败、信号跳过都会推送通知，并附带原因。
+- 成交、挂单、限价单成交、撤单、下单失败、信号跳过都会推送通知，并附带原因。
 - 持仓报告可渲染成 PNG 图片发送（`report_format: image|text`）。
 - 只响应配置的 `chat_id`；重启时会跳过旧消息，不会重放历史命令。
 
@@ -540,7 +540,8 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 
 - `ORDER FILLED`：执行账户、交易员、币种、交易员仓位方向、实际下单方向、信号类型、订单类型、成交数量、成交均价。
 - `ORDER RESTING (UNFILLED)`：限价单已挂出但尚未成交。会显示订单状态、限价和信号时的市价，并说明它会一直保留到成交，或被交易员平仓/减仓、方向反转、新开仓信号撤销。
-- `UNFILLED ORDER CANCELLED`：未成交挂单被撤销及原因，包括交易员平仓/减仓、方向反转、交易员被禁用、被新的开仓信号替代、账户已平仓、硬止损等。
+- `LIMIT ORDER FILLED` / `LIMIT ORDER PARTIALLY FILLED`：延迟入场的限价单成交；部分成交会显示已成交量和剩余量，并在全部成交后再发一条完成通知。
+- `UNFILLED ORDER CANCELLED`：未成交挂单被撤销及原因，包括交易员平仓/减仓、方向反转、交易员被禁用、被新的开仓信号替代、账户已平仓、硬止损等；如果撤单前已有部分成交，会同时显示已成交量。
 - `SIGNAL SKIPPED`：信号被跳过及原因，包括暂停、黑名单、symbol skip、所有权冲突、启动价格不利、小单累计、无可减仓位、反手跳过等。
 - `AUTO BREAKEVEN`：自动保本触发，通知盈利金额和新的止损价。
 - 启动/停止时分别发送 `SYSTEM STARTED` / `SYSTEM STOPPED`。
