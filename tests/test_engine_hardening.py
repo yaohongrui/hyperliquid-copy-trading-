@@ -44,6 +44,38 @@ class RecordingExchange:
         return 0
 
 
+class FlakyCancelExchange(RecordingExchange):
+    """Cancellation fails once, then succeeds like a transient network error."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail_cancels = 1
+
+    async def cancel_order(self, order_id, symbol=None):
+        if self.fail_cancels:
+            self.fail_cancels -= 1
+            raise RuntimeError("temporary cancellation failure")
+        await super().cancel_order(order_id, symbol)
+
+
+class TradeNotifier:
+    def __init__(self):
+        self.cancelled = []
+        self.skipped = []
+
+    async def notify_cancelled(self, leader, symbol, item, reason):
+        self.cancelled.append((leader, symbol, item.get("id"), reason))
+
+    async def notify_skipped(self, leader, signal, reason):
+        self.skipped.append((leader, signal.symbol, signal.kind, reason))
+
+    async def notify_accepted(self, *args):
+        return None
+
+    async def notify_failed(self, *args):
+        return None
+
+
 class HardStopExchange(RecordingExchange):
     config = {"fixed_balance_usdt": 100, "hard_stop": {"max_daily_loss_usdt": 10}}
 
@@ -85,10 +117,10 @@ class Notifier:
 
 
 class PendingOrderTests(unittest.IsolatedAsyncioTestCase):
-    def engine(self, exchange=None):
+    def engine(self, exchange=None, notifier=None):
         cfg = {"total_margin": 100, "coefficient": 1,
                "late_entry_enabled": True, "late_entry_offset_pct": 1}
-        return Engine(exchange or RecordingExchange(), {"L": cfg})
+        return Engine(exchange or RecordingExchange(), {"L": cfg}, notifier=notifier)
 
     async def test_leader_close_cancels_unfilled_limit_entry(self):
         exchange = RecordingExchange()
@@ -104,18 +136,58 @@ class PendingOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exchange.cancelled, [("o1", "S")])
         self.assertNotIn("L:S", engine.pending_orders)
 
-    async def test_pending_order_expires_after_ttl(self):
+    async def test_pending_order_does_not_expire_with_age(self):
         exchange = RecordingExchange()
         engine = self.engine(exchange)
         await engine.process("L", {})
         await engine.process("L", {"S": Position("S", 100, 1)})
-        created = engine.pending_orders["L:S"]["created_at"]
 
-        await engine.expire_pending_orders(now=created + 10)
+        engine.pending_orders["L:S"]["created_at"] -= 86400
+        await engine.reconcile_pending_orders()
+
         self.assertIn("L:S", engine.pending_orders)
-        await engine.expire_pending_orders(now=created + 61)
+        self.assertEqual(exchange.cancelled, [])
+
+    async def test_reconcile_cancels_pending_when_leader_is_flat(self):
+        exchange = RecordingExchange()
+        engine = self.engine(exchange)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        engine.previous["L"] = {}
+        await engine.reconcile_pending_orders()
+
         self.assertNotIn("L:S", engine.pending_orders)
         self.assertEqual(exchange.cancelled, [("o1", "S")])
+
+    async def test_failed_cancellation_is_retried(self):
+        exchange = FlakyCancelExchange()
+        engine = self.engine(exchange)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        engine.previous["L"] = {}
+        await engine.reconcile_pending_orders()
+        self.assertIn("L:S", engine.pending_orders)
+        self.assertEqual(engine.pending_orders["L:S"]["cancel_reason"], "leader is flat")
+        self.assertEqual(exchange.cancelled, [])
+
+        await engine.reconcile_pending_orders()
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [("o1", "S")])
+
+    async def test_cancelled_order_is_notified(self):
+        exchange = RecordingExchange()
+        notifier = TradeNotifier()
+        engine = self.engine(exchange, notifier)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+        await engine.process("L", {})
+
+        self.assertEqual(
+            notifier.cancelled,
+            [("L", "S", "o1", "close signal from leader")],
+        )
 
     async def test_reconcile_keeps_owner_while_limit_is_working(self):
         exchange = RecordingExchange()

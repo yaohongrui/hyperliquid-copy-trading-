@@ -84,8 +84,8 @@ delta  = (交易员新仓位 - 交易员旧仓位) × ratio
 - `open`：默认市价；若 `late_entry_enabled: true` 且不是启动补仓，则挂限价单，价格为交易员入场价：
   - 买入：`entry × (1 - late_entry_offset_pct%)`
   - 卖出：`entry × (1 + late_entry_offset_pct%)`
-  - 限价单按 `leader:symbol` 跟踪，默认 60 秒未成交自动撤单（可用 `late_entry_ttl_seconds` 调整）。交易员发出 `decrease` / `close` / `close_reverse` 时也会立即撤掉对应挂单，避免成交后形成无人管理的孤儿仓位。
-  - 进程重启后未成交挂单仍会从 `state.json` 恢复跟踪并继续按 TTL 撤销。
+  - 限价单按 `leader:symbol` 跟踪，不设固定存活时间：成交后转为持仓；交易员发出 `decrease` / `close` / `close_reverse`、方向反转、交易员被禁用，或出现新的开仓信号时自动撤单。撤单失败会每 5 秒重试，不会留下可能成交的孤儿挂单。
+  - 进程重启后未成交挂单仍会从 `state.json` 恢复跟踪；如果交易员在停机期间已经平仓或反向，重启后的对账会在 5 秒内撤掉它。
 - `increase`：始终市价（延迟入场只作用于 `open`）。
 - `decrease` / `close`：reduce-only 市价。
 - Gate 的市价单会显式带 `IOC`；每次非 reduce-only 下单前会把该合约杠杆设置为配置值（不超过交易所上限），Gate 的 `margin_mode: crossed` 走全仓杠杆接口。
@@ -331,7 +331,6 @@ leaders:
 | `symbol_blacklist` | 黑名单，匹配 HL 币名（如 `BTC`）或加 `USDT` 后缀（如 `BTCUSDT`） |
 | `late_entry_enabled` | 是否对 `open` 使用延迟限价入场 |
 | `late_entry_offset_pct` | 限价相对交易员入场价的偏移百分比，非负 |
-| `late_entry_ttl_seconds` | 延迟入场限价单的存活时间，默认 60 秒；超时自动撤单 |
 | `position_stop_loss.enabled` | 是否启用单仓止损 |
 | `position_stop_loss.max_loss_usdt` | 单仓最大亏损金额（USDT），必须大于 0 |
 

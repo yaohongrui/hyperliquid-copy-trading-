@@ -158,48 +158,83 @@ class Engine:
         }
         self._save_state()
 
-    async def _cancel_pending(self, leader, symbol, reason):
+    async def _cancel_pending(self, leader, symbol, reason, notify=True):
         """Cancel one tracked limit entry; return True once it is off the book."""
         key = self._pending_key(leader, symbol)
         item = self.pending_orders.get(key)
         if not item:
             return False
         order_id = item.get('id')
+        cancelled = False
         try:
             await self.exchange.cancel_order(order_id, symbol)
         except Exception as exc:
             if not self._order_gone(exc):
+                # The order is still live.  Remember why it has to go so the
+                # five-second reconciliation retries the cancellation instead
+                # of leaving an entry that can fill after the leader left.
+                item['cancel_reason'] = reason
+                self._save_state()
                 log.warning('Failed to cancel pending order %s for %s (%s)', order_id, key, reason, exc_info=True)
                 return False
+            # The order is no longer on the book, but it may have filled
+            # instead of being cancelled.  Drop the tracking without claiming
+            # a cancellation that we cannot verify.
             log.info('Pending order %s for %s is already gone (%s)', order_id, key, reason)
         else:
+            cancelled = True
             log.info('Cancelled pending order %s for %s (%s)', order_id, key, reason)
         self.pending_orders.pop(key, None)
         self._save_state()
+        if notify and cancelled:
+            handler = getattr(self.notifier, 'notify_cancelled', None) if self.notifier else None
+            if handler:
+                try:
+                    await handler(leader, symbol, item, reason)
+                except Exception:
+                    log.warning('ORDER CANCELLED notification failed for %s %s', leader, symbol, exc_info=True)
         return True
 
-    async def cancel_pending_orders(self, leader=None, reason='cancelled'):
+    async def cancel_pending_orders(self, leader=None, reason='cancelled', notify=True):
         for item in list(self.pending_orders.values()):
             if leader is not None and item.get('leader') != leader:
                 continue
-            await self._cancel_pending(item.get('leader'), item.get('symbol'), reason)
+            await self._cancel_pending(
+                item.get('leader'), item.get('symbol'), reason, notify=notify,
+            )
 
-    async def expire_pending_orders(self, now=None):
-        """Cancel late-entry limits that have stayed unfilled past their TTL."""
-        now = time.time() if now is None else now
+    async def reconcile_pending_orders(self):
+        """Keep resting entries aligned with the leader's current position.
+
+        There is no time-based expiry.  A late-entry limit stays on the book
+        until it fills or its premise disappears: the leader goes flat or
+        reverses, the leader is disabled/removed, or a later signal replaces
+        it.  Failed cancellations are retried on every cycle.
+        """
         async with self._lock:
-            for item in list(self.pending_orders.values()):
+            for key, item in list(self.pending_orders.items()):
                 leader = item.get('leader')
                 symbol = item.get('symbol')
                 if not leader or not symbol:
+                    self.pending_orders.pop(key, None)
+                    self._save_state()
                     continue
-                cfg = self.leaders.get(leader) or {}
-                ttl = float(cfg.get('late_entry_ttl_seconds', 60) or 60)
-                age = now - float(item.get('created_at') or now)
-                if age >= ttl:
-                    await self._cancel_pending(
-                        leader, symbol, f'limit entry unfilled after {age:.0f}s (ttl {ttl:g}s)',
-                    )
+                cfg = self.leaders.get(leader)
+                if cfg is None or not cfg.get('enabled', True):
+                    await self._cancel_pending(leader, symbol, 'leader is disabled')
+                    continue
+                if item.get('cancel_reason'):
+                    await self._cancel_pending(leader, symbol, item['cancel_reason'])
+                    continue
+                positions = self.previous.get(leader)
+                if positions is None:
+                    continue
+                position = positions.get(symbol)
+                expected_long = str(item.get('side') or '').lower() == 'buy'
+                if position is None or abs(position.size) <= 1e-12:
+                    await self._cancel_pending(leader, symbol, 'leader is flat')
+                elif (position.size > 0) != expected_long:
+                    await self._cancel_pending(leader, symbol, 'leader reversed direction')
 
     async def check_hard_stop(self):
         """Check daily account drawdown and flatten exposure once per lock."""
@@ -234,7 +269,7 @@ class Engine:
                 try:
                     # Pending entry orders must be gone before flattening,
                     # otherwise a fill can reopen exposure while locked.
-                    await self.cancel_pending_orders(reason='hard stop')
+                    await self.cancel_pending_orders(reason='hard stop', notify=False)
                     cancel_all = getattr(self.exchange, 'cancel_all_orders', None)
                     if cancel_all:
                         await cancel_all()
