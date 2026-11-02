@@ -276,6 +276,66 @@ class PendingOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(notifier.fills), 2)
         self.assertEqual(notifier.fills[-1], ("L", "S", "o1", 100.0, 0.995, 0.0))
 
+    async def test_startup_keeps_a_matching_pending_entry(self):
+        exchange = RecordingExchange()
+        engine = self.engine(exchange)
+        engine.pending_orders["L:S"] = {
+            "id": "o1", "leader": "L", "symbol": "S", "side": "buy",
+            "amount": 100.0, "price": 0.99, "filled": 0.0, "created_at": 0,
+        }
+
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        self.assertIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [])
+        self.assertEqual(exchange.orders, [])
+
+    async def test_startup_cancels_a_pending_entry_on_the_opposite_side(self):
+        exchange = RecordingExchange()
+        engine = self.engine(exchange)
+        engine.pending_orders["L:S"] = {
+            "id": "o1", "leader": "L", "symbol": "S", "side": "buy",
+            "amount": 100.0, "price": 0.99, "filled": 0.0, "created_at": 0,
+        }
+
+        await engine.process("L", {"S": Position("S", -100, 1)})
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [("o1", "S")])
+        self.assertEqual(exchange.orders, [("S", "sell", 100.0, "market", False)])
+
+    async def test_startup_replaces_an_oversized_pending_entry(self):
+        exchange = RecordingExchange()
+        engine = self.engine(exchange)
+        engine.pending_orders["L:S"] = {
+            "id": "o1", "leader": "L", "symbol": "S", "side": "buy",
+            "amount": 200.0, "price": 0.99, "filled": 0.0, "created_at": 0,
+        }
+
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [("o1", "S")])
+        self.assertEqual(exchange.orders, [("S", "buy", 100.0, "market", False)])
+
+    async def test_startup_does_not_keep_a_stale_pending_record(self):
+        exchange = FillAwareExchange()
+        engine = self.engine(exchange)
+        engine.pending_orders["L:S"] = {
+            "id": "o1", "leader": "L", "symbol": "S", "side": "buy",
+            "amount": 100.0, "price": 0.99, "filled": 0.0, "created_at": 0,
+        }
+        exchange.order_states["o1"] = {
+            "status": "gone", "filled": 0.0, "remaining": 0.0,
+            "average": None, "price": 0.99, "side": "buy",
+        }
+
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [("o1", "S")])
+        self.assertEqual(exchange.orders, [("S", "buy", 100.0, "market", False)])
+
     async def test_reconcile_keeps_owner_while_limit_is_working(self):
         exchange = RecordingExchange()
         engine = self.engine(exchange)

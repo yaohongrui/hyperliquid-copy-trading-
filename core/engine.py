@@ -834,6 +834,36 @@ class Engine:
         # Failure must propagate; unknown account state is never zero exposure.
         await self.exchange.fetch_positions()
 
+    async def _pending_matches(self, item, signal):
+        """Return True when a resting entry still fits the startup snapshot.
+
+        A pending order survives a restart only when it points the same way as
+        the leader and is not larger than the remaining target gap.  Keeping an
+        oversized order would over-expose the account after a leader reduction
+        that happened while the process was down.
+        """
+        expected_long = str(item.get('side') or '').lower() == 'buy'
+        if (float(signal.target_size or 0) > 0) != expected_long:
+            return False
+        # A stale record (cancelled or filled while the process was down) must
+        # not keep the startup entry from being evaluated.  If the venue
+        # cannot answer, keep the order rather than cancelling it blindly.
+        state = await self._pending_order_state(item)
+        if state is None:
+            return True
+        status = str(state.get('status') or '').lower()
+        if status not in ('open', ''):
+            return False
+        live = await self.exchange.position_size(signal.symbol)
+        if live and (live > 0) != expected_long:
+            return False
+        gap = max(0.0, abs(float(signal.target_size or 0)) - abs(live))
+        remaining = max(
+            0.0,
+            abs(float(item.get('amount') or 0)) - abs(float(item.get('filled') or 0)),
+        )
+        return remaining <= gap + 1e-12
+
     async def _skip(self, leader, signal, reason):
         log.info('ORDER SKIPPED leader=%s symbol=%s reason=%s', leader, signal.symbol, reason)
         await self._notify('notify_skipped', leader, signal, reason)
@@ -920,7 +950,15 @@ class Engine:
                     elif s.kind in ('decrease', 'close') and self.owners.get(account_key) not in (None, leader):
                         await self._skip(leader, s, f'symbol is owned by leader {self.owners[account_key]}')
                         continue
-                    if s.kind == 'open' and self.pending_orders.get(self._pending_key(leader, s.symbol)):
+                    pending = self.pending_orders.get(self._pending_key(leader, s.symbol))
+                    if s.kind == 'open' and pending:
+                        if startup and await self._pending_matches(pending, s):
+                            # Keep a still-valid resting entry across a restart
+                            # instead of replacing it with a worse market order
+                            # and then skipping that entry on price.
+                            log.info('STARTUP keeping resting limit %s for %s',
+                                     pending.get('id'), s.symbol)
+                            continue
                         # A stale limit from an earlier episode is still live;
                         # never place a second entry on top of it.
                         if not await self._cancel_pending(leader, s.symbol, 'replaced by a new open signal'):
