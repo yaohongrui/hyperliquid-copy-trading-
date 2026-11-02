@@ -251,6 +251,10 @@ def _seed_entered(engine, store):
     primary = next((name for name in names if engine.leaders[name].get("enabled", True)), names[0])
     account_key = engine._account_key(primary)
     for symbol, leader in store.latest_open_fill_leaders(account_key).items():
+        # Fills of a leader since removed from the config must not resurrect
+        # entry bookkeeping for a leader that can no longer receive signals.
+        if leader not in engine.leaders:
+            continue
         engine.entered.setdefault(f"{leader}:{symbol}", True)
     engine._save_state()
 

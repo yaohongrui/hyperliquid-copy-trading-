@@ -107,10 +107,14 @@ class StopReentryTests(unittest.IsolatedAsyncioTestCase):
             store.insert_local_fills([{
                 "account": "acct", "leader": "A", "order_id": "o1", "symbol": "XYZ:SKHX",
                 "side": "buy", "quantity": 1, "price": 10, "reduce_only": False,
+            }, {
+                "account": "acct", "leader": "removed", "order_id": "o2", "symbol": "KORU",
+                "side": "buy", "quantity": 1, "price": 10, "reduce_only": False,
             }])
             engine = Engine(Exchange(live=0), {"A": {"total_margin": 100, "execution_account": "acct"}})
             _seed_entered(engine, store)
             self.assertTrue(engine.entered.get("A:XYZ:SKHX"))
+            self.assertNotIn("removed:KORU", engine.entered)
 
 
 if __name__ == "__main__":

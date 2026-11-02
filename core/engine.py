@@ -65,6 +65,46 @@ class Engine:
         # Console consumes these immutable fill events to attribute exchange
         # realized PnL back to the leader that generated the order.
         self.fill_events = []
+        if state_store:
+            self._drop_removed_leaders()
+
+    def _drop_removed_leaders(self):
+        """Forget runtime state owned by leaders removed from the config.
+
+        ``symbol_owners`` is persisted, so deleting a leader from the YAML
+        would otherwise leave owner keys whose leader lookup raises KeyError
+        in the five-second protection reconciliation.  A leader that is no
+        longer configured can never emit another signal, so its owner and
+        protection records and its entry/stop bookkeeping are dead state.
+        """
+        known = set(self.leaders)
+        stale_owners = {
+            key for key, leader in self.owners.items() if leader not in known
+        }
+        removed = {self.owners[key] for key in stale_owners}
+        stores = (
+            ('stopped', self.stopped),
+            ('entered', self.entered),
+            ('small_order_carry', self.small_order_carry),
+        )
+        for _, store in stores:
+            for key in store:
+                leader = key.split(':', 1)[0]
+                if leader not in known:
+                    removed.add(leader)
+        if not stale_owners and not removed:
+            return
+        for key in stale_owners:
+            self.owners.pop(key, None)
+            self.runtime_state.get('protection', {}).pop(key, None)
+            self.breakeven.pop(key, None)
+            self.auto_breakeven_skip.pop(key, None)
+        for _, store in stores:
+            for key in [k for k in store if k.split(':', 1)[0] in removed]:
+                store.pop(key, None)
+        log.warning('Dropped state for leaders removed from config: %s',
+                    ', '.join(sorted(removed)))
+        self._save_state()
 
     async def update_leader_config(self, leader, changes):
         """Apply validated console changes without replacing the leader map.
