@@ -289,6 +289,25 @@ class PendingOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exchange.cancelled, [])
 
 
+class NotificationIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_notification_failure_does_not_block_baseline_commit(self):
+        class ExplodingNotifier:
+            async def notify_skipped(self, *args, **kwargs):
+                raise RuntimeError("telegram down")
+
+        exchange = RecordingExchange()
+        cfg = {"total_margin": 100, "symbol_blacklist": ["S"]}
+        engine = Engine(exchange, {"L": cfg}, notifier=ExplodingNotifier())
+
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        # The skip must still commit the new leader baseline; otherwise the
+        # same signal is regenerated and retried forever.
+        self.assertIn("S", engine.previous["L"])
+        self.assertEqual(exchange.orders, [])
+
+
 class HardStopTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_flatten_retries_and_notifies_once(self):
         exchange = HardStopExchange()

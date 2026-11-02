@@ -518,54 +518,54 @@ class RoutingNotifier:
         self.alerts = alerts
 
     @staticmethod
-    async def _call(target, method, args):
+    async def _call(target, method, args, kwargs):
         handler = getattr(target, method, None) if target is not None else None
         if handler is None:
             return False
-        result = await handler(*args)
+        result = await handler(*args, **kwargs)
         # Existing notifiers return nothing on success; treat that as delivered.
         return True if result is None else bool(result)
 
-    async def _normal_call(self, method, *args):
-        return await self._call(self.normal, method, args)
+    async def _normal_call(self, method, *args, **kwargs):
+        return await self._call(self.normal, method, args, kwargs)
 
-    async def _alert_call(self, method, *args):
-        if await self._call(self.alerts, method, args):
+    async def _alert_call(self, method, *args, **kwargs):
+        if await self._call(self.alerts, method, args, kwargs):
             return True
-        return await self._call(self.normal, method, args)
+        return await self._call(self.normal, method, args, kwargs)
 
-    async def notify_filled(self, *args):
-        return await self._normal_call("notify_filled", *args)
+    async def notify_filled(self, *args, **kwargs):
+        return await self._normal_call("notify_filled", *args, **kwargs)
 
-    async def notify_accepted(self, *args):
-        return await self._normal_call("notify_accepted", *args)
+    async def notify_accepted(self, *args, **kwargs):
+        return await self._normal_call("notify_accepted", *args, **kwargs)
 
-    async def notify_cancelled(self, *args):
-        return await self._normal_call("notify_cancelled", *args)
+    async def notify_cancelled(self, *args, **kwargs):
+        return await self._normal_call("notify_cancelled", *args, **kwargs)
 
-    async def notify_limit_filled(self, *args):
-        return await self._normal_call("notify_limit_filled", *args)
+    async def notify_limit_filled(self, *args, **kwargs):
+        return await self._normal_call("notify_limit_filled", *args, **kwargs)
 
-    async def notify_skipped(self, *args):
-        return await self._normal_call("notify_skipped", *args)
+    async def notify_skipped(self, *args, **kwargs):
+        return await self._normal_call("notify_skipped", *args, **kwargs)
 
-    async def notify_breakeven(self, *args):
-        return await self._normal_call("notify_breakeven", *args)
+    async def notify_breakeven(self, *args, **kwargs):
+        return await self._normal_call("notify_breakeven", *args, **kwargs)
 
-    async def notify_failed(self, *args):
-        return await self._alert_call("notify_failed", *args)
+    async def notify_failed(self, *args, **kwargs):
+        return await self._alert_call("notify_failed", *args, **kwargs)
 
-    async def notify_source_failed(self, *args):
-        return await self._alert_call("notify_source_failed", *args)
+    async def notify_source_failed(self, *args, **kwargs):
+        return await self._alert_call("notify_source_failed", *args, **kwargs)
 
-    async def notify_hard_stop(self, *args):
-        return await self._alert_call("notify_hard_stop", *args)
+    async def notify_hard_stop(self, *args, **kwargs):
+        return await self._alert_call("notify_hard_stop", *args, **kwargs)
 
-    async def notify_hard_stop_error(self, *args):
-        return await self._alert_call("notify_hard_stop_error", *args)
+    async def notify_hard_stop_error(self, *args, **kwargs):
+        return await self._alert_call("notify_hard_stop_error", *args, **kwargs)
 
-    async def notify_hard_stop_recovered(self, *args):
-        return await self._alert_call("notify_hard_stop_recovered", *args)
+    async def notify_hard_stop_recovered(self, *args, **kwargs):
+        return await self._alert_call("notify_hard_stop_recovered", *args, **kwargs)
 
     def __getattr__(self, name):
         for target in (self.__dict__.get("normal"), self.__dict__.get("alerts")):

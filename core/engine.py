@@ -130,6 +130,20 @@ class Engine:
             self.runtime_state['risk'] = self.risk.state()
             self.state_store.save(self.runtime_state)
 
+    async def _notify(self, method, *args, **kwargs):
+        """Best-effort notification that must never abort order processing."""
+        handler = getattr(self.notifier, method, None) if self.notifier else None
+        if handler is None:
+            return False
+        try:
+            await handler(*args, **kwargs)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning('Notification %s failed', method, exc_info=True)
+            return False
+
     def _mark_stopped(self, leader, symbol):
         key = f'{leader}:{symbol}'
         if not self.stopped.get(key):
@@ -199,12 +213,7 @@ class Engine:
         self.pending_orders.pop(key, None)
         self._save_state()
         if notify and cancelled:
-            handler = getattr(self.notifier, 'notify_cancelled', None) if self.notifier else None
-            if handler:
-                try:
-                    await handler(leader, symbol, item, reason)
-                except Exception:
-                    log.warning('ORDER CANCELLED notification failed for %s %s', leader, symbol, exc_info=True)
+            await self._notify('notify_cancelled', leader, symbol, item, reason)
         return True
 
     async def cancel_pending_orders(self, leader=None, reason='cancelled', notify=True):
@@ -264,18 +273,11 @@ class Engine:
         return filled, remaining, full
 
     async def _notify_pending_fill(self, item, filled, remaining, state):
-        handler = getattr(self.notifier, 'notify_limit_filled', None) if self.notifier else None
-        if handler is None:
-            return
         price = state.get('average') or item.get('price')
-        try:
-            await handler(
-                item.get('leader'), item.get('symbol'), item, filled,
-                price, remaining,
-            )
-        except Exception:
-            log.warning('LIMIT ORDER FILLED notification failed for %s %s',
-                        item.get('leader'), item.get('symbol'), exc_info=True)
+        await self._notify(
+            'notify_limit_filled',
+            item.get('leader'), item.get('symbol'), item, filled, price, remaining,
+        )
 
     async def reconcile_pending_orders(self):
         """Keep resting entries aligned with the leader and report fills.
@@ -314,13 +316,10 @@ class Engine:
                 if status in ('canceled', 'cancelled', 'expired', 'rejected'):
                     self.pending_orders.pop(key, None)
                     self._save_state()
-                    handler = getattr(self.notifier, 'notify_cancelled', None) if self.notifier else None
-                    if handler:
-                        try:
-                            await handler(leader, symbol, item, f'exchange reported {status}')
-                        except Exception:
-                            log.warning('ORDER CANCELLED notification failed for %s %s',
-                                        leader, symbol, exc_info=True)
+                    await self._notify(
+                        'notify_cancelled', leader, symbol, item,
+                        f'exchange reported {status}',
+                    )
                     continue
                 if status == 'gone':
                     self.pending_orders.pop(key, None)
@@ -403,8 +402,9 @@ class Engine:
                         self._flatten_alerted = False
                         flatten_recovered = True
         finally:
-            if first_trigger and self.notifier:
-                await self.notifier.notify_hard_stop(
+            if first_trigger:
+                await self._notify(
+                    'notify_hard_stop',
                     equity, self.risk.baseline,
                     float(self.risk.baseline) - float(equity),
                 )
@@ -836,8 +836,7 @@ class Engine:
 
     async def _skip(self, leader, signal, reason):
         log.info('ORDER SKIPPED leader=%s symbol=%s reason=%s', leader, signal.symbol, reason)
-        if self.notifier:
-            await self.notifier.notify_skipped(leader, signal, reason)
+        await self._notify('notify_skipped', leader, signal, reason)
 
     async def _unfavorable_entry(self, signal, target, positions):
         """Return a description when the market is worse than the leader entry."""
@@ -1056,11 +1055,16 @@ class Engine:
                                                  'side': side, 'quantity': float(order.amount),
                                                  'price': float(order.price or s.price or 0),
                                                  'reduce_only': reduce, 'timestamp': time.time()})
-                    if self.notifier:
-                        if order.status == 'closed':
-                            await self.notifier.notify_filled(leader, replace(s, delta=order.amount if side == 'buy' else -order.amount), order, order_type=typ)
-                        else:
-                            await self.notifier.notify_accepted(leader, s, order, order_type=typ)
+                    if order.status == 'closed':
+                        await self._notify(
+                            'notify_filled', leader,
+                            replace(s, delta=order.amount if side == 'buy' else -order.amount),
+                            order, order_type=typ,
+                        )
+                    else:
+                        await self._notify(
+                            'notify_accepted', leader, s, order, order_type=typ,
+                        )
                     if reduce:
                         await self._release_if_flat(leader, s.symbol)
                     elif order.status == 'closed':
@@ -1069,8 +1073,7 @@ class Engine:
                     log.exception('Order processing failed: %s %s', leader, s.symbol)
                     if not ordered:
                         failed.add(s.symbol)
-                    if self.notifier:
-                        await self.notifier.notify_failed(leader, s, exc)
+                    await self._notify('notify_failed', leader, s, exc)
             # Commit the baseline per symbol.  A symbol whose order failed
             # keeps its previous value, so the next event (or the REST
             # fallback) regenerates the signal instead of silently dropping it.

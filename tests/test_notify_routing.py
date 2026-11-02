@@ -9,43 +9,45 @@ class Recorder:
     def __init__(self, result=True):
         self.result = result
         self.calls = []
+        self.kwargs = []
 
-    async def _record(self, name, *args):
+    async def _record(self, name, *args, **kwargs):
         self.calls.append((name,) + args)
+        self.kwargs.append(kwargs)
         return self.result
 
-    async def notify_filled(self, *args):
-        return await self._record("filled", *args)
+    async def notify_filled(self, *args, **kwargs):
+        return await self._record("filled", *args, **kwargs)
 
-    async def notify_accepted(self, *args):
-        return await self._record("accepted", *args)
+    async def notify_accepted(self, *args, **kwargs):
+        return await self._record("accepted", *args, **kwargs)
 
-    async def notify_cancelled(self, *args):
-        return await self._record("cancelled", *args)
+    async def notify_cancelled(self, *args, **kwargs):
+        return await self._record("cancelled", *args, **kwargs)
 
-    async def notify_limit_filled(self, *args):
-        return await self._record("limit_filled", *args)
+    async def notify_limit_filled(self, *args, **kwargs):
+        return await self._record("limit_filled", *args, **kwargs)
 
-    async def notify_skipped(self, *args):
-        return await self._record("skipped", *args)
+    async def notify_skipped(self, *args, **kwargs):
+        return await self._record("skipped", *args, **kwargs)
 
-    async def notify_breakeven(self, *args):
-        return await self._record("breakeven", *args)
+    async def notify_breakeven(self, *args, **kwargs):
+        return await self._record("breakeven", *args, **kwargs)
 
-    async def notify_failed(self, *args):
-        return await self._record("failed", *args)
+    async def notify_failed(self, *args, **kwargs):
+        return await self._record("failed", *args, **kwargs)
 
-    async def notify_source_failed(self, *args):
-        return await self._record("source_failed", *args)
+    async def notify_source_failed(self, *args, **kwargs):
+        return await self._record("source_failed", *args, **kwargs)
 
-    async def notify_hard_stop(self, *args):
-        return await self._record("hard_stop", *args)
+    async def notify_hard_stop(self, *args, **kwargs):
+        return await self._record("hard_stop", *args, **kwargs)
 
-    async def notify_hard_stop_error(self, *args):
-        return await self._record("hard_stop_error", *args)
+    async def notify_hard_stop_error(self, *args, **kwargs):
+        return await self._record("hard_stop_error", *args, **kwargs)
 
-    async def notify_hard_stop_recovered(self, *args):
-        return await self._record("hard_stop_recovered", *args)
+    async def notify_hard_stop_recovered(self, *args, **kwargs):
+        return await self._record("hard_stop_recovered", *args, **kwargs)
 
 
 class RoutingNotifierTests(unittest.IsolatedAsyncioTestCase):
@@ -113,6 +115,28 @@ class RoutingNotifierTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(await router.notify_filled("L", "signal", "order"))
         self.assertFalse(await router.notify_hard_stop(1.0, 2.0, 3.0))
+
+    async def test_keyword_arguments_are_forwarded(self):
+        normal = Recorder()
+        router = RoutingNotifier(normal, None)
+
+        await router.notify_filled("L", "signal", "order", order_type="market")
+        await router.notify_accepted("L", "signal", "order", order_type="limit")
+
+        self.assertEqual(normal.kwargs, [
+            {"order_type": "market"},
+            {"order_type": "limit"},
+        ])
+
+    async def test_alert_fallback_also_forwards_keyword_arguments(self):
+        normal, alerts = Recorder(), Recorder(result=False)
+        router = RoutingNotifier(normal, alerts)
+
+        self.assertTrue(await router.notify_failed(
+            "L", "signal", "boom", order_type="market",
+        ))
+        self.assertEqual(alerts.kwargs, [{"order_type": "market"}])
+        self.assertEqual(normal.kwargs, [{"order_type": "market"}])
 
 
 class FakeResponse:
