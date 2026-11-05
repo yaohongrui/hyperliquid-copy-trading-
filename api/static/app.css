@@ -345,6 +345,17 @@ button:disabled {
   cursor: not-allowed;
 }
 
+button.danger {
+  border-color: var(--negative-line);
+  background: var(--negative-soft);
+  color: var(--negative);
+}
+
+button.danger:hover {
+  background: var(--negative-soft);
+  border-color: var(--negative);
+}
+
 input {
   font: inherit;
 }
@@ -540,6 +551,13 @@ input::placeholder {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+}
+
+.toolbar .actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 #performance > h3 {
@@ -974,6 +992,10 @@ input::placeholder {
 
 .toast[hidden] {
   display: none;
+}
+
+.toast[data-tone="positive"] {
+  border-color: var(--positive-line);
 }
 
 @keyframes toast-in {

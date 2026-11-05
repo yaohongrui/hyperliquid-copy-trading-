@@ -199,14 +199,14 @@ hard_stop:
   3. 市价 reduce-only 平掉账户所有永续仓位（包括非引擎建立的仓位）；逐个仓位处理，失败会重试直到账户为空；
   4. 当日保持 `locked`；只有确认账户已空后才会记录 `flattened`，未完成平仓会持续重试。
   5. 通过 Telegram 推送一次 `HARD STOP TRIGGERED` 通知。
-- 手动解除：Telegram `/unlock_hard_stop`。会以当前权益重置当日基线、清除 `locked` / `flattened` 并恢复新开仓；否则旧基线会在下一次检查时立刻再次触发。
+- 手动解除：Telegram `/unlock_hard_stop` 或 Web 控制台的「Unlock hard stop」按钮（需二次确认）。会以当前权益重置当日基线、清除 `locked` / `flattened` 并恢复新开仓；否则旧基线会在下一次检查时立刻再次触发。
 - `locked` 会持久化，且 `process()` 在 `paused` 或 `locked` 时都会拒绝 `open` / `increase` / `close_reverse`。因此进程重启后即使 `paused` 恢复为 `false`，当日锁定期间也不会再开新仓；跨日后 `locked` 自动解除。
 
 ### 暂停/恢复
 
 - 暂停只阻止新风险：`open`、`increase`、`close_reverse` 会被跳过。
 - `decrease`、`close` 和已有的交易所条件单不受影响。
-- 入口：Telegram `/pause` `/resume`、控制台按钮、HTTP `POST /api/v1/control/{pause|resume}`、`POST /command`。
+- 入口：Telegram `/pause` `/resume`、控制台按钮、HTTP `POST /api/v1/control/{pause|resume|unlock_hard_stop}`、`POST /command`。
 
 ## 配置
 
@@ -511,7 +511,7 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 - `ORDER FAILED`：下单异常及原因。
 - `HARD STOP TRIGGERED`：账户硬止损触发，包含权益、当日基线、当日亏损和限额。
 - `HARD STOP FLATTEN FAILED` / `HARD STOP FLATTEN RECOVERED`：平仓失败只告警一次，后续重试成功再发恢复通知。
-- 解除锁定要在**主控制会话**发送 `/unlock_hard_stop`；告警频道只出不进。
+- 解除锁定要在**主控制会话**发送 `/unlock_hard_stop`，或在 Web 控制台点击「Unlock hard stop」；告警频道只出不进。
 
 启动时会先消费掉历史 update，避免重启后重放旧命令。
 
@@ -525,7 +525,7 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 
 - **Monitor**
   - 账户余额、未实现盈亏、权益、系统状态、止损配置。
-  - 暂停/恢复按钮。
+  - 暂停/恢复按钮；硬止损锁定时额外显示「Unlock hard stop」按钮，按当前权益重置当日基线并恢复新开仓。
   - 当前挂单、执行账户持仓、各交易员实时仓位。
   - 执行账户每个持仓行提供「一键保本」按钮：把该仓位的原生止损移到开仓价，仅浮盈时可用；再次点击可恢复配置的止损。
   - 交易员配置表单。

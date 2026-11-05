@@ -6,8 +6,9 @@ For the configured public hostname, install Caddy and use
 
 Open `https://yhr.lol/`. The console stores snapshots and normalized exchange
 trades in `data/console.sqlite3`. It refreshes every three seconds and sends
-updates over SSE. The web controls can pause/resume new entries, update
-leader sizing, blacklist, delayed-entry, and position-stop-loss settings, and
+updates over SSE. The web controls can pause/resume new entries, clear a hard-stop lock
+(resetting the daily loss baseline to current equity and resuming
+entries), update leader sizing, blacklist, delayed-entry, and position-stop-loss settings, and
 move an individual account position's native stop to its entry price
 ("Breakeven") or revert it. Disabled leaders stay listed on the Configuration
 page (and are marked as disabled) so they can be re-enabled without a restart;

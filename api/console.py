@@ -448,11 +448,32 @@ class ConsoleService:
 
     async def control(self, request):
         action = request.match_info["action"]
-        if action not in ("pause", "resume"):
+        if action not in ("pause", "resume", "unlock_hard_stop"):
             raise web.HTTPNotFound()
+        if action == "unlock_hard_stop":
+            try:
+                result = await self.engine.unlock_hard_stop()
+            except Exception:
+                log.exception("Hard stop unlock failed")
+                raise web.HTTPInternalServerError(text="hard stop unlock failed")
+            detail = {key: result.get(key) for key in ("was_locked", "equity", "baseline")}
+            await asyncio.to_thread(self.store.audit, "control.unlock_hard_stop", detail)
+            self._sync_control_status()
+            return web.json_response({"ok": True, "paused": self.engine.paused, **result})
         self.engine.paused = action == "pause"
+        self._sync_control_status()
         await asyncio.to_thread(self.store.audit, "control." + action, {})
         return web.json_response({"ok": True, "paused": self.engine.paused})
+
+    def _sync_control_status(self):
+        """Mirror a control change into the snapshot so the next fetch is fresh."""
+        status = self._snapshot.get("status")
+        if not isinstance(status, dict):
+            return
+        status["paused"] = bool(self.engine.paused)
+        risk = getattr(self.engine, "risk", None)
+        if risk is not None:
+            status["risk_locked"] = bool(risk.locked)
 
     async def breakeven(self, request):
         """Move one account position's stop to its entry price, or revert it."""

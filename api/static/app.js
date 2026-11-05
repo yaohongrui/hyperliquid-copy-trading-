@@ -64,6 +64,8 @@ function render(data) {
   if (positionCount) positionCount.textContent = (account.positions || []).length;
   $('#mode').textContent = status.risk_locked ? 'Risk locked' : status.paused ? 'Paused' : 'Running';
   $('#mode').dataset.state = status.risk_locked ? 'locked' : status.paused ? 'paused' : 'running';
+  const unlock = $('#unlock');
+  if (unlock) unlock.hidden = !status.risk_locked;
   const hardStop = status.hard_stop || {};
   const stops = status.position_stop_loss || [];
   const stopText = hardStop.max_daily_loss_usdt != null ? `Daily ${hardStop.max_daily_loss_usdt} USDT` : hardStop.max_daily_drawdown_pct != null ? `Daily ${hardStop.max_daily_drawdown_pct}%` : stops.length ? `Position ${stops[0].max_loss_usdt ?? 'configured'} USDT` : 'Off';
@@ -294,6 +296,22 @@ $('#toggle').onclick = async () => {
     toast(`Could not ${paused ? 'pause' : 'resume'} entries: ${error.message}`);
   } finally {
     button.disabled = false;
+  }
+};
+
+const unlockButton = $('#unlock');
+if (unlockButton) unlockButton.onclick = async () => {
+  if (!confirm('Clear the hard-stop lock?\n\nThis resets the daily loss baseline to current equity and resumes new entries.')) return;
+  unlockButton.disabled = true;
+  try {
+    const response = await fetch('/api/v1/control/unlock_hard_stop', { method: 'POST' });
+    if (!response.ok) throw Error((await response.text()).trim() || `request failed: ${response.status}`);
+    await load();
+    toast('Hard stop unlocked; daily baseline reset to current equity.', 'positive');
+  } catch (error) {
+    toast(`Could not unlock hard stop: ${error.message}`);
+  } finally {
+    unlockButton.disabled = false;
   }
 };
 
