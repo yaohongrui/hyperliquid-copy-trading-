@@ -4,17 +4,6 @@ hyperliquid:
   addresses:
   - 64064471586051217767591609323470888316015842704
   - 124057809289343838766394089726074669611213617961
-position_sources:
-  binance_live:
-    type: binance
-    mode: hybrid
-    browser:
-      profile_dir: data/binance-browser-profile
-      headless: true
-      timeout_ms: 30000
-    session:
-      refresh_interval_hours: 4.0
-      auth_probe_portfolio_id: '5275595931132915200'
 polling:
   interval_seconds: 2.5
   jitter_ms: 500

@@ -7,12 +7,8 @@ from exchanges.dry_run import DryRunExchange
 from exchanges.ccxt_exchange import CcxtExchange
 from core.engine import Engine
 from core.symbols import SymbolMap
-from sources.position_queries import account_positions, combined_leader_positions, leader_snapshot
+from sources.position_queries import account_positions, leader_positions, leader_snapshot
 from sources.hyperliquid_ws import HyperliquidWS
-from sources.routing import binance_leaders, hyperliquid_leaders, leader_source
-from sources.binance.config import build_sources
-from sources.binance.factory import create_source
-from sources.binance.leaders import LeaderPoller as BinanceLeaderPoller
 from telegram.bot import RoutingNotifier, TelegramManager
 from state.store import StateStore
 from api.console import ConsoleService
@@ -31,19 +27,9 @@ async def main(path):
     leaders = {x["name"]: x for x in c.get("leaders", [])}
     enabled = [x for x in leaders.values() if x.get("enabled", True)]
     active = {x["name"]: x for x in enabled}
-    # Leaders pick their position source by name.  Hyperliquid is the built-in
-    # sentinel; every other name must exist under ``position_sources``.
-    hl_leaders = hyperliquid_leaders(leaders)
-    bn_leaders = binance_leaders(leaders)
-    enabled_hl = hyperliquid_leaders(active)
-    try:
-        source_configs = build_sources(c)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"invalid position_sources: {exc}") from exc
-    for name, cfg in bn_leaders.items():
-        source = leader_source(cfg)
-        if source not in source_configs:
-            raise RuntimeError(f"leader {name} references unknown position source {source}")
+    # Every leader is fed by the built-in Hyperliquid websocket/REST feed.
+    hl_leaders = leaders
+    enabled_hl = active
     accounts = c.get("execution_accounts") or {}
     account_name = (enabled or list(leaders.values()) or [{}])[0].get("execution_account")
     account = accounts.get(account_name) if account_name else None
@@ -61,20 +47,16 @@ async def main(path):
     telegram_task = None
     alerts = None
     alerts_task = None
-    binance_poller = None
-    binance_retry_task = None
     ws_task = None
     protection_task = None
     api_runner = None
-    sources = {}
     exchange_started = False
     telegram_config = c.get("telegram") or {}
 
     async def _leader_report():
         # Leaders can be toggled at runtime, so always read the live map.
         current = {name: cfg for name, cfg in engine.leaders.items() if cfg.get("enabled", True)}
-        report = (lambda: binance_poller.format_positions()) if binance_poller is not None else None
-        return await combined_leader_positions(current, report)
+        return await leader_positions(current)
 
     def _telegram_manager(token, chat_id):
         return TelegramManager(
@@ -139,20 +121,6 @@ async def main(path):
             except ValueError as exc:
                 raise RuntimeError(f"invalid symbol_map: {exc}") from exc
             await engine.prepare_startup()
-        if bn_leaders:
-            used = sorted({leader_source(cfg) for cfg in bn_leaders.values()})
-            sources = {name: create_source(source_configs[name]) for name in used}
-            # A dead browser/cookie must not block startup or look like a flat
-            # leader; failed sources are retried in the background.
-            failed = await _start_sources(sources)
-            if failed:
-                binance_retry_task = asyncio.create_task(
-                    _retry_sources(sources, failed, stop), name="binance-source-retry",
-                )
-            binance_poller = BinanceLeaderPoller(
-                engine, sources, bn_leaders, c.get("polling") or {}, notifier=notifier,
-            )
-            await binance_poller.start()
         ws = HyperliquidWS(
             (c.get("hyperliquid") or {}).get("ws_url", "wss://api.hyperliquid.xyz/ws"),
             _hyperliquid_addresses(enabled_hl),
@@ -181,17 +149,10 @@ async def main(path):
         await web.TCPSite(api_runner, "127.0.0.1", 8766).start()
         await stop.wait()
     finally:
-        if binance_poller is not None:
-            await binance_poller.stop()
-        tasks = [task for task in (binance_retry_task, ws_task, protection_task) if task is not None]
+        tasks = [task for task in (ws_task, protection_task) if task is not None]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        for source in sources.values():
-            try:
-                await source.stop()
-            except Exception:
-                log.warning("Failed to stop position source", exc_info=True)
         if exchange_started:
             await exchange.stop()
         if telegram:
@@ -216,32 +177,6 @@ def _hyperliquid_addresses(leaders):
         for cfg in leaders.values()
         if cfg.get("enabled", True)
     ]
-
-
-async def _start_sources(sources, names=None):
-    """Start each source; return the set that failed. Never raises."""
-    failed = set()
-    for name in (list(sources) if names is None else list(names)):
-        try:
-            await sources[name].start()
-            log.info("Position source started name=%s", name)
-        except Exception as exc:
-            failed.add(name)
-            log.warning("Position source start failed name=%s error=%s", name, exc)
-    return failed
-
-
-async def _retry_sources(sources, pending, stop, interval=60):
-    """Retry failed position sources until they start or the service stops."""
-    pending = set(pending)
-    while pending and not stop.is_set():
-        try:
-            await asyncio.wait_for(stop.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            pass
-        if stop.is_set():
-            break
-        pending = await _start_sources(sources, pending)
 
 
 def _seed_entered(engine, store):

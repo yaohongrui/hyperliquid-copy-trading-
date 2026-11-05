@@ -228,37 +228,6 @@ hyperliquid:
 
 > `hyperliquid.addresses` 是历史字段，当前代码不使用。WebSocket 订阅的地址来自启用的 `leaders[].address`。
 
-### position_sources
-
-`source` 不是 `hyperliquid` 的交易员使用这里定义的 Binance 带单员来源。该来源读取 Binance 网页 copy-trading 私有接口，需要已登录的浏览器会话。
-
-```yaml
-position_sources:
-  binance_live:
-    type: binance
-    mode: hybrid            # http | browser | hybrid
-    web: {}                 # http 模式才需要 cookie/csrf_token 等
-    browser:
-      profile_dir: data/binance-browser-profile
-      headless: true
-      timeout_ms: 30000
-    session:
-      refresh_interval_hours: 4.0
-      auth_probe_portfolio_id: '5275595931132915200'
-      poll_interval_seconds: 10    # Binance 限频，不能按全局 2.5s 轮询
-```
-
-| 字段 | 说明 |
-| --- | --- |
-| `mode` | `hybrid`（推荐，持久 Chromium 页内请求）/ `browser`（导航抓响应）/ `http`（导出 cookie，不启动浏览器） |
-| `browser.profile_dir` | 已登录 Binance 的 Chromium profile；一个 profile 只能被一个进程使用 |
-| `browser.headless` | 无桌面环境时保持 `true` |
-| `session.auth_probe_portfolio_id` | hybrid 启动自检使用的可见带单组合 ID |
-| `session.refresh_interval_hours` | 定时刷新页面的间隔 |
-| `session.poll_interval_seconds` | 该来源的轮询间隔。Binance 对 copy-trading 接口限频（返回 `90801003 请求过于频繁`），所以不能跟随全局 `polling.interval_seconds`；被限频时来源会退避 60 秒而不是重启浏览器 |
-
-> 登录态依赖 `p20t`/`r20t` cookie，需要人工在 VNC 中登录。会话过期时只会停止新信号，不会把带单员误判为空仓。首次登录：`python3 -m sources.binance.browser --profile <dir> login`。
-
 ### execution_accounts
 
 ```yaml
@@ -309,21 +278,12 @@ leaders:
   position_stop_loss:
     enabled: true
     max_loss_usdt: 10
-- name: binance-leader-1
-  source: binance_live          # 指向 position_sources 的键
-  portfolio_id: '5275595931132915200'
-  execution_account: binance_primary
-  coefficient: 0.5
-  total_margin: 7000
-  enabled: false
 ```
 
 | 字段 | 说明 |
 | --- | --- |
 | `name` | 交易员名称，用于通知、日志、所有权和归因，必须唯一 |
 | `address` | 仅 HL 交易员使用。YAML 未加引号的 `0x...` 被解析成整数时，代码会自动转回十六进制 |
-| `source` | `hyperliquid`（默认）或 `position_sources` 中的键 |
-| `portfolio_id` | Binance 带单组合 ID；`source` 非 `hyperliquid` 时必填 |
 | `execution_account` | 指向 `execution_accounts` 中的键；同一进程内应保持一致 |
 | `coefficient` | 跟单倍率，非负，可为小数 |
 | `total_margin` | 交易员保证金规模（分母），必须大于 0 |
@@ -549,7 +509,6 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 配置 `telegram.alerts` 后，以下高优先级事件发到独立告警频道；告警频道发送失败时回退到主会话：
 
 - `ORDER FAILED`：下单异常及原因。
-- `LEADER SOURCE FAILED`：Binance 数据源连续 3 次失败；会说明现有持仓不受影响。
 - `HARD STOP TRIGGERED`：账户硬止损触发，包含权益、当日基线、当日亏损和限额。
 - `HARD STOP FLATTEN FAILED` / `HARD STOP FLATTEN RECOVERED`：平仓失败只告警一次，后续重试成功再发恢复通知。
 - 解除锁定要在**主控制会话**发送 `/unlock_hard_stop`；告警频道只出不进。
@@ -589,8 +548,7 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 
 校验规则：
 
-- `address` 必须是 42 字符的 `0x` 地址，且只对 `source: hyperliquid` 的交易员生效；Binance 交易员即使提交 `address` 也会被忽略。
-- `portfolio_id` 不可在控制台修改；更换带单员需要改配置并重启。
+- `address` 必须是 42 字符的 `0x` 地址。
 - `coefficient >= 0`。
 - `total_margin > 0`。
 - `late_entry_offset_pct >= 0`。
@@ -690,8 +648,6 @@ risk/manager.py         账户级每日硬止损
 sources/
   hyperliquid_ws.py     HL WebSocket 订阅与重连
   position_queries.py   REST 快照、Telegram 持仓报表
-  routing.py            按 source 分流 HL / Binance 交易员
-  binance/              Binance 带单员仓位来源（http / browser / hybrid）
 state/store.py          state.json 原子读写
 telegram/
   bot.py                长轮询命令与通知
@@ -707,9 +663,8 @@ tests/                  单元测试
 ## 已知限制与注意事项
 
 - **单执行账户**：一个进程只使用第一个启用交易员的 `execution_account` 创建交易所实例。所有启用的交易员应指向同一个账户。
-- **`enabled` 可运行时切换**：`Engine.process` 对禁用的交易员直接返回；Binance 轮询器会跳过并清空该交易员的缓存。禁用不会平掉已有仓位，重新启用会从新的启动快照开始。
-- **Binance 来源依赖网页登录态**：`hybrid` 模式需要一个已登录的 Chromium profile，且同一 profile 只能被一个进程使用；cookie 过期后需要 VNC 人工重新登录。浏览器启动/重启失败会自动按 60 秒退避重试，不需要重启整个服务；但登录态本身失效仍需重新登录。来源失败期间不会产生新信号，也不会被当成空仓。
-- **跨来源同名币共享账户仓位**：所有权按 `execution_account:symbol` 记录，先开仓的交易员拥有该币；另一个来源的同名信号会跳过。HL 的 `kPEPE` 与 Binance 的 `1000PEPE` 是不同的键，`symbol_map` 目前是全局映射，不区分来源。
+- **`enabled` 可运行时切换**：`Engine.process` 对禁用的交易员直接返回。禁用不会平掉已有仓位，重新启用会从新的启动快照开始。
+- **同名币共享账户仓位**：所有权按 `execution_account:symbol` 记录，先开仓的交易员拥有该币；其他交易员的同名信号会跳过。
 - **反手不处理**：`close_reverse` 永远跳过，旧仓保持不动，需要手动平仓后再等待下一次开仓信号。
 - **关闭单仓止损不会撤销已存在的条件单**：把 `position_stop_loss.enabled` 改成 `false` 只是不再新建/对账，已经挂在交易所的止损单仍然有效，需要手动撤销或等仓位平掉。
 - **暂停状态不持久化**：重启后 `paused` 恢复为 `false`；账户硬止损的 `locked` 会持久化，且 `process()` 会同时检查 `locked`，因此重启后当日锁定仍然有效。
@@ -728,4 +683,4 @@ tests/                  单元测试
 pytest tests/
 ```
 
-`pyproject.toml` 已配置 `pythonpath = ["."]`，不需要额外设置。测试覆盖：symbol_map 解析、CCXT 合约解析、信号跳过、启动补仓、小单累计、止损后抑制再入场、风控基线、绩效归因与旧库迁移、Binance 仓位解析与来源路由。
+`pyproject.toml` 已配置 `pythonpath = ["."]`，不需要额外设置。测试覆盖：symbol_map 解析、CCXT 合约解析、信号跳过、启动补仓、小单累计、止损后抑制再入场、风控基线、绩效归因与旧库迁移、Binance 保护单执行。
