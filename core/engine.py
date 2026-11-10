@@ -66,7 +66,43 @@ class Engine:
         # realized PnL back to the leader that generated the order.
         self.fill_events = []
         if state_store:
+            self._migrate_owners()
             self._drop_removed_leaders()
+
+    def _migrate_owners(self):
+        """Re-key ownership/protection after a leader's account label changes.
+
+        Owner keys embed ``execution_account``.  Correcting that value in the
+        config (for example a stale ``gate_primary`` label on a leader that
+        actually trades on the single Binance account) would otherwise leave
+        the old key in place and create a second claim for the same symbol.
+        """
+        changed = False
+        for key in list(self.owners):
+            leader = self.owners[key]
+            if leader not in self.leaders:
+                continue
+            symbol = key.split(':', 1)[1]
+            expected = self._owner_key(leader, symbol)
+            if expected == key:
+                continue
+            self.owners.pop(key, None)
+            changed = True
+            if expected in self.owners:
+                log.warning('Dropped stale ownership %s for %s; %s is owned by %s',
+                            key, symbol, expected, self.owners[expected])
+                continue
+            self.owners[expected] = leader
+            protection = self.runtime_state.get('protection') or {}
+            if key in protection:
+                protection[expected] = protection.pop(key)
+            if key in self.breakeven:
+                self.breakeven[expected] = self.breakeven.pop(key)
+            if key in self.auto_breakeven_skip:
+                self.auto_breakeven_skip[expected] = self.auto_breakeven_skip.pop(key)
+        if changed:
+            log.warning('Re-keyed symbol ownership to match configured execution accounts')
+            self._save_state()
 
     def _drop_removed_leaders(self):
         """Forget runtime state owned by leaders removed from the config.
@@ -529,6 +565,12 @@ class Engine:
             self._auto_be_warned.pop(key, None)
             self._save_state()
 
+    def _leader_holds_same_side(self, leader, symbol, live):
+        """True when the leader still holds ``symbol`` in the same direction."""
+        position = self.previous.get(leader, {}).get(symbol)
+        return (position is not None and abs(position.size) > 1e-12
+                and position.size * live > 0)
+
     @staticmethod
     def _protection_id(value):
         # State files written by older versions contain the id directly.
@@ -813,11 +855,28 @@ class Engine:
         notifications = []
         async with self._lock:
             items = []
+            seen = set()
             for key, leader in list(self.owners.items()):
                 symbol = key.split(':', 1)[1]
                 if self.symbol_map.is_skipped(symbol):
                     continue
                 items.append((key, leader, symbol))
+                seen.add(key)
+            # A stop-out suppression only makes sense while the account is
+            # flat.  Probe suppressed symbols even when the owner record was
+            # already released: the position may have been reopened manually,
+            # and later leader adds must then be followed instead of skipped.
+            for stopped_key in list(self.stopped):
+                leader, _, symbol = stopped_key.partition(':')
+                if not leader or not symbol or leader not in self.leaders:
+                    continue
+                if self.symbol_map.is_skipped(symbol):
+                    continue
+                owner_key = self._owner_key(leader, symbol)
+                if owner_key in seen:
+                    continue
+                items.append((owner_key, leader, symbol))
+                seen.add(owner_key)
             # Probe concurrently so reconciliation time does not grow with the
             # number of owned positions while the signal lock is held.
             probes = await asyncio.gather(
@@ -836,6 +895,11 @@ class Engine:
                             log.warning('Protection reconciliation failed for %s: %s', key, probe)
                         continue
                     live, detail = probe
+                    holder = self.owners.get(key)
+                    if holder not in (None, leader):
+                        # Another configured leader already owns this account
+                        # symbol; its own reconciliation entry handles it.
+                        continue
                     if abs(live) <= 1e-12:
                         if self.pending_orders.get(self._pending_key(leader, symbol)):
                             # A late-entry limit is still working; a flat
@@ -849,6 +913,15 @@ class Engine:
                             self._mark_stopped(leader, symbol)
                         await self._release_if_flat(leader, symbol, live=live)
                     else:
+                        if holder is None:
+                            claimed, owner = await self._claim_or_check(leader, symbol)
+                            if not claimed:
+                                continue
+                        if self._leader_holds_same_side(leader, symbol, live):
+                            if self.stopped.pop(f'{leader}:{symbol}', None):
+                                self._save_state()
+                                log.info('STOP-OUT CLEARED leader=%s symbol=%s: account holds a position again',
+                                         leader, symbol)
                         if not self.entered.get(f'{leader}:{symbol}'):
                             self.entered[f'{leader}:{symbol}'] = True
                             self._save_state()
@@ -978,8 +1051,21 @@ class Engine:
                         continue
                     stopped_key = f'{leader}:{s.symbol}'
                     if stopped_key in self.stopped and s.kind in ('open', 'increase'):
-                        await self._skip(leader, s, 'stopped out; waiting for the leader to close and reopen')
-                        continue
+                        live_now = await self.exchange.position_size(s.symbol)
+                        leader_position = positions.get(s.symbol)
+                        if (abs(live_now) > 1e-12 and leader_position is not None
+                                and live_now * leader_position.size > 0):
+                            # The account holds this symbol again (manual
+                            # reopen, or a residual left after the stop).  The
+                            # suppression only protects a flat account, so
+                            # resume following instead of skipping forever.
+                            self.stopped.pop(stopped_key, None)
+                            self._save_state()
+                            log.info('STOP-OUT CLEARED leader=%s symbol=%s: account holds a position again',
+                                     leader, s.symbol)
+                        else:
+                            await self._skip(leader, s, 'stopped out; waiting for the leader to close and reopen')
+                            continue
                     account_key = self._owner_key(leader, s.symbol)
                     had_owner = self.owners.get(account_key) == leader
                     if s.kind in ('open', 'increase', 'close_reverse'):
