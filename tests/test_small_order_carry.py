@@ -35,7 +35,7 @@ class LotExchange:
 class NotionalExchange(LotExchange):
     async def create_order(self, symbol, side, amount, order_type, price, reduce_only):
         if amount * 100 < 5:
-            raise OrderQuantityTooSmall('binanceusdm {"code":-4164,"msg":"Order\'s notional must be no smaller than 5"}')
+            raise OrderQuantityTooSmall('order must have minimum value of $10')
         return await super().create_order(symbol, side, amount, order_type, price, reduce_only)
 
 

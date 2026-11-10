@@ -8,6 +8,8 @@ class DryRunExchange(Exchange):
   if order_type=='market': self.positions[symbol]=self.positions.get(symbol,0)+(amount if side=='buy' else -amount)
   return o
  async def fetch_positions(self): return self.positions.copy()
+ async def position_size(self, symbol): return self.positions.get(symbol, 0)
+ async def entry_quote(self, symbol, side): return 1e-9 if side == 'buy' else 1e18
  async def fetch_open_orders(self): return [o for o in self.orders.values() if o.status == 'open']
  async def equity(self): return float(self.config.get('fixed_balance_usdt') or 0)
  async def cancel_order(self,order_id,symbol=None):

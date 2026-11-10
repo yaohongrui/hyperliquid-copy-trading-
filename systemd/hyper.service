@@ -1,15 +1,21 @@
 [Unit]
-Description=HL simplified copy-trading service
+Description=HL copy-trading service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/root/hyper
-ExecStart=/usr/bin/python3 /root/hyper/main.py --config /root/hyper/config/config.yaml
+User=yhr
+Group=yhr
+WorkingDirectory=/home/yhr/hyper
+ExecStart=/home/yhr/hyper/.venv/bin/python /home/yhr/hyper/main.py --config /home/yhr/hyper/config/config.yaml
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+# Telegram is not reachable directly from this host; route through the local proxy.
+Environment=HTTPS_PROXY=http://127.0.0.1:10808
+Environment=HTTP_PROXY=http://127.0.0.1:10808
+Environment=NO_PROXY=127.0.0.1,localhost
 
 [Install]
 WantedBy=multi-user.target

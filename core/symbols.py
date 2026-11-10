@@ -1,14 +1,13 @@
-"""Bridge Hyperliquid coin names to execution-venue instruments.
+"""Symbol aliases and skips.
 
-Hyperliquid reports each coin under its own name (``SKHX``, or a namespaced
-HIP-3 form such as ``XYZ:SKHX``), while Gate and Binance may list the same
-underlying under a different name.  ``symbol_map`` in config.yaml bridges the
-two: keys are Hyperliquid names, values are the venue instrument, written either
-as a CCXT unified symbol (``AMD/USDT:USDT``), a bare base asset (``AMD``) or a
-native venue name (``AMD_USDT``).
+Execution happens on Hyperliquid itself, so a leader's coin name is already the
+tradable instrument and no venue bridging is needed.  ``symbol_map`` remains
+only as an optional alias/skip table: keys are Hyperliquid coin names and a
+value of ``skip`` (or null/empty) marks the coin untradable, so the engine
+ignores its signals instead of surfacing an order failure on every event.
 
-A value of ``skip`` (or null/empty) marks a symbol as untradable, so the engine
-ignores all of its signals instead of surfacing an order failure on every event.
+Values may be written as a bare base asset (``AMD``) or a namespaced HIP-3 name
+(``XYZ:AMD``); aliases are resolved case-insensitively.
 """
 
 SKIP_VALUES = {"", "skip", "ignore", "none", "null"}

@@ -2,12 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
-
-from api.console import ConsoleService
 from core.engine import Engine
-from core.symbols import SymbolMap
 from state.store import StateStore
 
 
@@ -133,58 +128,6 @@ class BreakevenTests(unittest.IsolatedAsyncioTestCase):
             restarted = Engine(exchange, {"L": {"total_margin": 100}}, state_store=store)
 
             self.assertTrue(restarted.breakeven["__default__:BTC"])
-
-
-class ConsoleEngine:
-    def __init__(self):
-        self.symbol_map = SymbolMap({"XYZ:AMD": "AMD/USDT:USDT"})
-        self.owners = {"gate:XYZ:AMD": "L"}
-        self.breakeven = {}
-        self.calls = []
-
-    async def set_breakeven(self, leader, symbol):
-        self.calls.append(("set", leader, symbol))
-        self.breakeven[f"gate:{symbol}"] = True
-        return 2.5
-
-    async def clear_breakeven(self, leader, symbol):
-        self.calls.append(("clear", leader, symbol))
-        self.breakeven.pop(f"gate:{symbol}", None)
-        return True
-
-
-class ConsoleBreakevenTests(unittest.IsolatedAsyncioTestCase):
-    async def test_endpoint_maps_the_displayed_symbol_back_to_the_engine(self):
-        engine = ConsoleEngine()
-        with tempfile.TemporaryDirectory() as directory:
-            service = ConsoleService(engine, {}, str(Path(directory) / "console.sqlite3"))
-            app = web.Application()
-            app.router.add_post("/api/v1/positions/breakeven", service.breakeven)
-            async with TestClient(TestServer(app)) as client:
-                response = await client.post(
-                    "/api/v1/positions/breakeven", json={"symbol": "XYZ:AMD", "enabled": True})
-                body = await response.json()
-
-        self.assertEqual(response.status, 200)
-        self.assertEqual(body["trigger"], 2.5)
-        self.assertEqual(engine.calls, [("set", "L", "XYZ:AMD")])
-
-    async def test_endpoint_returns_400_when_the_engine_rejects_the_request(self):
-        class RejectingEngine(ConsoleEngine):
-            async def set_breakeven(self, leader, symbol):
-                raise ValueError("position is not in profit")
-
-        with tempfile.TemporaryDirectory() as directory:
-            service = ConsoleService(RejectingEngine(), {}, str(Path(directory) / "console.sqlite3"))
-            app = web.Application()
-            app.router.add_post("/api/v1/positions/breakeven", service.breakeven)
-            async with TestClient(TestServer(app)) as client:
-                response = await client.post(
-                    "/api/v1/positions/breakeven", json={"symbol": "XYZ:AMD", "enabled": True})
-                text = await response.text()
-
-        self.assertEqual(response.status, 400)
-        self.assertEqual(text, "position is not in profit")
 
 
 if __name__ == "__main__":

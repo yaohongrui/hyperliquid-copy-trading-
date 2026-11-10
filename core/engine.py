@@ -22,7 +22,6 @@ class Engine:
         self._protection_lock = asyncio.Lock()
         self.state_store = state_store
         self.symbol_map = symbol_map if isinstance(symbol_map, SymbolMap) else SymbolMap(symbol_map)
-        self.config_manager = None
         self.runtime_state = state_store.load() if state_store else {}
         self.risk = RiskManager(self.exchange.config.get('hard_stop'), self.runtime_state.get('risk'))
         self._risk_state_saved = None
@@ -43,20 +42,17 @@ class Engine:
         # ``leader:symbol``.  Without this a fill can arrive after the leader
         # has already closed and leave an orphan position behind.
         self.pending_orders = self.runtime_state.get('pending_orders', {})
-        # Owner keys whose native stop was moved to the entry price from the
-        # console.  Persisted so a restart keeps the tighter stop instead of
+        # Owner keys whose native stop was moved to the entry price (breakeven
+        # request).  Persisted so a restart keeps the tighter stop instead of
         # silently restoring the configured loss-based one.
         self.breakeven = self.runtime_state.get('breakeven') or {}
         # Symbols whose first snapshot failed before an order was placed.  The
         # next event must still treat them as startup so the initial entry
         # price check is not lost with the failed signal.
         self.startup_pending = {}
-        # Console consumes these immutable fill events to attribute exchange
-        # realized PnL back to the leader that generated the order.
-        self.fill_events = []
 
     async def update_leader_config(self, leader, changes):
-        """Apply validated console changes without replacing the leader map.
+        """Apply validated leader changes without replacing the leader map.
 
         Returns True when the address changed, so the caller can resubscribe
         the WebSocket and seed the new address from REST.
@@ -283,11 +279,12 @@ class Engine:
                 try:
                     await self.exchange.cancel_protection(self._protection_id(old), symbol)
                 except Exception as exc:
-                    # Gate removes a conditional order automatically when the
-                    # position reaches zero or its trigger fires, then answers
-                    # AUTO_ORDER_NOT_FOUND to a delete.  Treat both flavors of
-                    # "order is gone" as an already-completed cancellation
-                    # instead of aborting the release with the owner intact.
+                    # The exchange may remove a conditional order automatically
+                    # when the position reaches zero or its trigger fires, then
+                    # answer an order-not-found error to a delete.  Treat both
+                    # flavors of "order is gone" as an already-completed
+                    # cancellation instead of aborting the release with the
+                    # owner intact.
                     message = str(exc).upper()
                     if type(exc).__name__ != 'OrderNotFound' and 'ORDER_NOT_FOUND' not in message:
                         log.warning('Failed to cancel protection order %s for %s', old, symbol, exc_info=True)
@@ -390,10 +387,9 @@ class Engine:
             trigger = entry
         else:
             loss = float(cfg['max_loss_usdt'])
-            # Gate and other contract venues report ``contracts`` rather than
-            # base-asset quantity.  Convert before translating a dollar loss
-            # into a price distance, otherwise non-unit contract sizes trigger
-            # early.
+            # Venues differ in how they report position size; ``contracts *
+            # contractSize`` yields base-asset quantity so a dollar loss maps
+            # to a price distance without early triggers.
             trigger = entry - loss / position_amount if side == 'long' else entry + loss / position_amount
         mark = float(detail.get('markPrice') or detail.get('markPx') or 0)
         if trigger <= 0 or (mark > 0 and ((side == 'long' and trigger >= mark) or (side == 'short' and trigger <= mark))):
@@ -411,8 +407,8 @@ class Engine:
         # when the live position or its trigger has changed.
         if old_id and old_contracts and old_trigger and abs(old_contracts - contracts) <= 1e-12 and abs(old_trigger - trigger) <= max(abs(trigger), 1) * 1e-10:
             return
-        # Cleaning duplicates costs a full conditional-order listing on Gate, so
-        # only do it when we are about to replace the protection order.
+        # Cleaning duplicates costs a full conditional-order listing, so only
+        # do it when we are about to replace the protection order.
         if hasattr(self.exchange, 'cancel_protection_orders'):
             await self.exchange.cancel_protection_orders(symbol, old_id)
         if old_id and hasattr(self.exchange, 'cancel_protection'):
@@ -466,7 +462,9 @@ class Engine:
             for (key, leader, symbol), probe in zip(items, probes):
                 try:
                     if isinstance(probe, Exception):
-                        if isinstance(probe, ValueError) and str(probe).startswith('No USDT perpetual market'):
+                        if isinstance(probe, ValueError) and (
+                                'No USDT perpetual market' in str(probe)
+                                or 'No Hyperliquid market' in str(probe)):
                             self.runtime_state.get('protection', {}).pop(key, None)
                             self.owners.pop(key, None)
                             self._save_state()
@@ -716,11 +714,6 @@ class Engine:
                         if not reduce:
                             self.entered[stopped_key] = True
                             self._save_state()
-                        self.fill_events.append({'account': self._account_key(leader), 'leader': leader,
-                                                 'order_id': str(order.id), 'symbol': s.symbol,
-                                                 'side': side, 'quantity': float(order.amount),
-                                                 'price': float(order.price or s.price or 0),
-                                                 'reduce_only': reduce, 'timestamp': time.time()})
                     if self.notifier:
                         if order.status == 'closed':
                             await self.notifier.notify_filled(leader, replace(s, delta=order.amount if side == 'buy' else -order.amount), order)

@@ -2,10 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from api.console import ConsoleStore
 from core.engine import Engine
 from core.models import Order, Position
-from main import _seed_entered
 from state.store import StateStore
 
 
@@ -100,17 +98,6 @@ class StopReentryTests(unittest.IsolatedAsyncioTestCase):
             await restarted.process("L", {"S": Position("S", 100, 1)})
             self.assertEqual(exchange.orders, [("S", "buy", 100, False)])
             self.assertIn("L:S", restarted.stopped)
-
-    async def test_seed_entered_from_existing_local_fills(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = ConsoleStore(Path(directory) / "console.sqlite3")
-            store.insert_local_fills([{
-                "account": "acct", "leader": "A", "order_id": "o1", "symbol": "XYZ:SKHX",
-                "side": "buy", "quantity": 1, "price": 10, "reduce_only": False,
-            }])
-            engine = Engine(Exchange(live=0), {"A": {"total_margin": 100, "execution_account": "acct"}})
-            _seed_entered(engine, store)
-            self.assertTrue(engine.entered.get("A:XYZ:SKHX"))
 
 
 if __name__ == "__main__":

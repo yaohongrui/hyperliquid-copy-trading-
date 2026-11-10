@@ -2,8 +2,6 @@ import unittest
 
 from core.engine import Engine
 from core.models import Order, Position
-from core.symbols import SymbolMap
-from exchanges.ccxt_exchange import CcxtExchange
 
 
 class FixedBalanceExchange:
@@ -38,44 +36,6 @@ class FixedBalanceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(exchange.equity_calls, 0)
         self.assertEqual(exchange.orders, [("S", "buy", 100, False)])
-
-
-class LeverageClient:
-    def __init__(self):
-        self.markets = {
-            "BTC/USDT:USDT": {
-                "swap": True, "quote": "USDT", "contractSize": 1,
-                "limits": {"amount": {"min": 0}, "leverage": {"max": 50}},
-            },
-        }
-        self.leverage_calls = []
-        self.order_calls = 0
-
-    def amount_to_precision(self, market, amount):
-        return str(amount)
-
-    async def set_leverage(self, value, market, params=None):
-        self.leverage_calls.append((value, market, params))
-
-    async def create_order(self, *args, **kwargs):
-        self.order_calls += 1
-        return {"id": "1", "filled": 1, "amount": 1, "average": 1, "status": "closed"}
-
-
-class LeverageCacheTests(unittest.IsolatedAsyncioTestCase):
-    async def test_leverage_is_set_once_per_symbol(self):
-        exchange = CcxtExchange.__new__(CcxtExchange)
-        exchange.client = LeverageClient()
-        exchange.name = "binance"
-        exchange.config = {"leverage": 10}
-        exchange.symbol_map = SymbolMap()
-        exchange._leverage_set = {}
-
-        await exchange.create_order("BTC/USDT:USDT", "buy", 1)
-        await exchange.create_order("BTC/USDT:USDT", "buy", 1)
-
-        self.assertEqual(exchange.client.leverage_calls, [(10, "BTC/USDT:USDT", None)])
-        self.assertEqual(exchange.client.order_calls, 2)
 
 
 class ProtectionExchange:

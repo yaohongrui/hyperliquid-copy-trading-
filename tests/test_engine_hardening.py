@@ -2,8 +2,6 @@ import unittest
 
 from core.engine import Engine
 from core.models import Order, Position
-from core.symbols import SymbolMap
-from exchanges.ccxt_exchange import CcxtExchange
 from sources.hyperliquid_ws import HyperliquidWS
 
 
@@ -170,62 +168,6 @@ class HardStopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("o1", "S"), exchange.cancelled)
         self.assertNotIn("L:S", engine.pending_orders)
         self.assertEqual(exchange.cancel_all_calls, 1)
-
-
-class CloseAllPositionsTests(unittest.IsolatedAsyncioTestCase):
-    class Client:
-        def __init__(self):
-            self.positions = [{
-                "symbol": "BTC/USDT:USDT", "contracts": 2,
-                "contractSize": 0.5, "side": "long",
-            }]
-            self.markets = {"BTC/USDT:USDT": {"contractSize": 0.5}}
-
-        async def fetch_positions(self):
-            return list(self.positions)
-
-    async def test_contracts_are_converted_to_base_quantity(self):
-        instance = CcxtExchange.__new__(CcxtExchange)
-        instance.client = self.Client()
-        instance.name = "gate"
-        instance.config = {}
-        instance.symbol_map = SymbolMap()
-        recorded = []
-
-        async def create_order(symbol, side, amount, order_type="market", price=None, reduce_only=False):
-            recorded.append((symbol, side, amount, order_type, reduce_only))
-            instance.client.positions = []
-            return Order("x", symbol, side, amount, price, "closed", reduce_only)
-
-        async def cancel_all_orders():
-            return 0
-
-        instance.create_order = create_order
-        instance.cancel_all_orders = cancel_all_orders
-
-        closed = await instance.close_all_positions()
-        self.assertEqual(closed, 1)
-        # 2 contracts * 0.5 base per contract = 1.0 BTC, not 2.0.
-        self.assertEqual(recorded, [("BTC/USDT:USDT", "sell", 1.0, "market", True)])
-
-    async def test_remaining_position_raises_so_the_caller_retries(self):
-        instance = CcxtExchange.__new__(CcxtExchange)
-        instance.client = self.Client()
-        instance.name = "gate"
-        instance.config = {}
-        instance.symbol_map = SymbolMap()
-
-        async def create_order(*args, **kwargs):
-            raise RuntimeError("rejected")
-
-        async def cancel_all_orders():
-            return 0
-
-        instance.create_order = create_order
-        instance.cancel_all_orders = cancel_all_orders
-
-        with self.assertRaisesRegex(RuntimeError, "failed to flatten"):
-            await instance.close_all_positions(attempts=1)
 
 
 class LeaderEnabledTests(unittest.IsolatedAsyncioTestCase):

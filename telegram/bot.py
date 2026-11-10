@@ -262,7 +262,7 @@ class TelegramManager:
 
         timeout = aiohttp.ClientTimeout(total=self.polling_timeout + 10)
         offset = None
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             self.session = session
             # Avoid replaying old commands every time the service restarts.
             while not self._stop.is_set() and offset is None:

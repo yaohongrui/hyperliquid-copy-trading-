@@ -2,12 +2,12 @@ import asyncio
 import time
 
 import aiohttp
-import ccxt.async_support as ccxt
 from core.models import Position
 
 # The dex list only changes when a HIP-3 deployment is added, so a per-process
-# cache keeps the 20-weight ``perpDexs`` probe off the hot path.  The console
-# and the websocket resync share one IP quota, so every avoided call matters.
+# cache keeps the 20-weight ``perpDexs`` probe off the hot path.  The REST
+# fallback and the websocket resync share one IP quota, so every avoided call
+# matters.
 _PERP_DEX_TTL = 300.0
 _perp_dex_cache = {"at": 0.0, "values": [None]}
 
@@ -172,6 +172,52 @@ async def leader_positions(leaders):
     return "\n".join(lines) if lines else "No leaders configured."
 
 
+def _hyperliquid_info(config):
+    """Build a read-only Info client and resolve the account address."""
+    from eth_account import Account
+    from hyperliquid.info import Info
+    from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
+
+    base_url = TESTNET_API_URL if config.get("testnet") else MAINNET_API_URL
+    bootstrap = Info(base_url, skip_ws=True)
+    raw = bootstrap.perp_dexs() or []
+    dexes = [""] + [item["name"] for item in raw[1:] if item and item.get("name")]
+    info = Info(base_url, skip_ws=True, perp_dexs=dexes)
+    address = config.get("account_address")
+    if isinstance(address, int):
+        address = hex(address)
+    if not address:
+        key = config.get("api_private_key") or config.get("secret_key")
+        if not key:
+            raise ValueError("account_address or api_private_key is required")
+        address = Account.from_key(key).address
+    return info, address, dexes
+
+
+def _hyperliquid_positions(info, address, dexes):
+    rows = []
+    for dex in dexes:
+        try:
+            state = info.user_state(address, dex)
+        except Exception:
+            continue
+        for item in state.get("assetPositions") or []:
+            position = item.get("position") or item
+            if _number(position.get("szi")):
+                rows.append(position)
+    return rows
+
+
+def _hyperliquid_open_orders(info, address, dexes):
+    rows = []
+    for dex in dexes:
+        try:
+            rows.extend(info.open_orders(address, dex) or [])
+        except Exception:
+            continue
+    return rows
+
+
 async def account_positions(accounts, leaders, symbol_map=None):
     names = {item.get("execution_account") for item in leaders.values()}
     lines = []
@@ -180,61 +226,44 @@ async def account_positions(accounts, leaders, symbol_map=None):
         if not config:
             continue
         exchange_type = config.get("exchange")
-        if exchange_type == "binance":
-            exchange_class = ccxt.binanceusdm
-            credentials = {"apiKey": config.get("api_key"), "secret": config.get("api_secret")}
-        elif exchange_type == "gate":
-            exchange_class = ccxt.gate
-            credentials = {"apiKey": config.get("api_key"), "secret": config.get("secret_key")}
-        else:
+        if exchange_type != "hyperliquid":
             lines.append(f"{name}: unsupported exchange {exchange_type}")
             continue
-        exchange = exchange_class({
-            **credentials,
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "swap",
-                "fetchOpenOrders": {"warnWithoutSymbol": False},
-            },
-        })
         try:
-            positions = await exchange.fetch_positions()
-            orders = await exchange.fetch_open_orders()
-            lines.append(f"{name} ({exchange_type})")
-            open_positions = [p for p in positions if _number(p.get("contracts"))]
-            if not open_positions:
-                lines.append("  No open positions")
-            rows = []
-            for position in open_positions:
-                contracts = _number(position.get("contracts"))
-                contract_size = _number(position.get("contractSize")) or _number((position.get("info") or {}).get("contractSize")) or 1.0
-                size = contracts * contract_size
-                entry = _number(position.get("entryPrice"))
-                mark = _number(position.get("markPrice"))
-                pnl = _number(position.get("unrealizedPnl"))
-                notional = _field(position, "notional", "positionValue")
-                margin = _field(position, "initialMargin", "marginUsed", "collateral")
-                leverage = _leverage(position) or (notional / margin if margin else 1.0)
-                direction = str(position.get("side") or ("long" if size > 0 else "short")).upper()
-                rows.append((_display(position.get("symbol", "?"), symbol_map), direction,
-                             f"{_roi(pnl, size, entry, leverage, notional, margin):g}%", _fmt(pnl), _fmt(entry),
-                             _fmt(mark), _fmt(abs(size))))
-            if rows:
-                lines.append(_table(rows, include_leverage=False))
-            lines.append("  Open orders")
-            if not orders:
-                lines.append("    No open orders")
-            for order in orders:
-                info = order.get('info') or {}
-                reduce_only = order.get('reduceOnly')
-                if reduce_only is None:
-                    reduce_only = info.get('reduceOnly', info.get('reduce_only', False))
-                lines.append(
-                    f"    {_display(order.get('symbol', '?'), symbol_map)} {str(order.get('side') or '?').upper()} "
-                    f"{_number(order.get('amount') or order.get('remaining')):g} @ "
-                    f"{_number(order.get('price')):g} | {str(order.get('type') or '?').upper()} "
-                    f"| reduce-only {bool(reduce_only)} | id {order.get('id', '?')}"
-                )
-        finally:
-            await exchange.close()
+            info, address, dexes = await asyncio.to_thread(_hyperliquid_info, config)
+            positions = await asyncio.to_thread(_hyperliquid_positions, info, address, dexes)
+            orders = await asyncio.to_thread(_hyperliquid_open_orders, info, address, dexes)
+        except Exception as exc:
+            lines.append(f"{name}: Hyperliquid query failed ({exc})")
+            continue
+        lines.append(f"{name} (hyperliquid)")
+        if not positions:
+            lines.append("  No open positions")
+        rows = []
+        for position in positions:
+            size = _number(position.get("szi"))
+            entry = _number(position.get("entryPx"))
+            notional = _field(position, "positionValue", "notional")
+            leverage = _leverage(position) or (notional / abs(size) if size else 1.0)
+            mark = notional / abs(size) if size else 0.0
+            pnl = _number(position.get("unrealizedPnl"))
+            rows.append((_display(position.get("coin", "?"), symbol_map),
+                         "LONG" if size > 0 else "SHORT",
+                         f"{_roi(pnl, size, entry, leverage, notional):g}%", _fmt(pnl), _fmt(entry),
+                         _fmt(mark), _fmt(abs(size))))
+        if rows:
+            lines.append(_table(rows, include_leverage=False))
+        lines.append("  Open orders")
+        if not orders:
+            lines.append("    No open orders")
+        for order in orders:
+            trigger = _number(order.get("triggerPx"))
+            kind = "TRIGGER" if order.get("isTrigger") else str(order.get("orderType") or "LIMIT").upper()
+            suffix = f" trigger {trigger:g}" if trigger else ""
+            lines.append(
+                f"    {_display(order.get('coin', '?'), symbol_map)} "
+                f"{'BUY' if str(order.get('side')).upper() == 'B' else 'SELL'} "
+                f"{_number(order.get('sz')):g} @ {_number(order.get('limitPx')):g} "
+                f"| {kind}{suffix} | reduce-only {bool(order.get('reduceOnly'))} | id {order.get('oid', '?')}"
+            )
     return "\n".join(lines) if lines else "No execution accounts configured."

@@ -1,8 +1,8 @@
 # HL 跟单机器人
 
-Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员仓位变化，用 CCXT 在 Gate / Binance 的 USDT 永续账户实时镜像下单，附带 Telegram 管理机器人和 Web 控制台。
+Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员仓位变化，用官方 `hyperliquid-python-sdk` 在同一交易所（主网，包含全部 HIP-3 perp dex）实时镜像下单，附带 Telegram 管理机器人。
 
-> **实盘注意**：Web 控制台默认只监听 `127.0.0.1:8766`，本身没有登录鉴权。一旦通过 Caddy 暴露到公网，任何能打开域名的人都可以暂停引擎、修改交易员参数。API key 和手动下单接口故意不开放。
+> **实盘注意**：`execution_accounts` 里的 API 钱包私钥拥有下单权限，请只通过环境变量 / `lead.env` 提供，不要提交到版本库。程序默认连主网；`testnet: true` 可切到测试网。
 
 ## 目录
 
@@ -12,7 +12,6 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 - [配置](#配置)
 - [运行与部署](#运行与部署)
 - [Telegram](#telegram)
-- [Web 控制台](#web-控制台)
 - [状态与数据](#状态与数据)
 - [项目结构](#项目结构)
 - [已知限制与注意事项](#已知限制与注意事项)
@@ -30,13 +29,13 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 - **小单累计（冰山单）**：下单量低于交易所最小数量/最小名义价值时，先记入 carry，累计够了再一起下；交易员减仓时优先抵消未成交的加仓。
 - **启动补仓**：重启时对比交易员现有仓位和账户实际仓位，只在现价不劣于交易员入场价时补齐；不满足条件则跳过，之后交易员再加仓仍会无条件跟随。
 - **止损后抑制再入场**：账户被原生止损、爆仓或手动平仓后，只要交易员还持有该币，就不再跟随加仓；直到交易员平掉该币、重新开仓，才恢复正常跟单。
-- **symbol_map**：处理 HL 币名与 Gate / Binance 合约名不一致的情况（包括 HIP-3 的 `XYZ:XXX` 命名），也可以把某个币标记为完全忽略。
+- **symbol_map（可选）**：执行和交易员在同一交易所，币名天然一致；`symbol_map` 只保留别名/忽略能力，也可以把某个币标记为完全忽略。
 
 ### 风控
 
 - **单仓止损**（`position_stop_loss`）：按亏损金额（USDT）换算出触发价，在交易所挂原生条件单，不依赖程序盯盘。每 5 秒对账，仓位变化或手动平仓后自动重建/撤销，平仓即清理。
 - **账户硬止损**（`hard_stop`）：按 UTC 自然日统计，支持 `max_daily_loss_usdt` 和 `max_daily_drawdown_pct`，触发后暂停新开仓并市价全平。
-- **暂停/恢复**：Telegram 或控制台可以暂停新开仓；暂停期间减仓和平仓仍会正常执行。
+- **暂停/恢复**：Telegram 可以暂停新开仓；暂停期间减仓和平仓仍会正常执行。
 
 ### 通知与控制
 
@@ -44,13 +43,6 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 - 成交、挂单被接受、下单失败、信号跳过都会推送通知，并附带原因。
 - 持仓报告可渲染成 PNG 图片发送（`report_format: image|text`）。
 - 只响应配置的 `chat_id`；重启时会跳过旧消息，不会重放历史命令。
-
-### 数据与统计
-
-- Web 控制台每 3 秒刷新账户、挂单、交易员仓位，通过 SSE 推送到浏览器。
-- Performance 页面统计已实现盈亏、手续费、资金费、现金流调整后收益率、最大回撤、分交易员盈亏和胜率。
-- 交易所成交会按本地订单归因到交易员；对不上的记录进入 `unattributed`，不会瞎猜。
-- 数据保存在 SQLite，旧库在控制台启动时自动就地升级/清理。
 
 ## 跟单规则细节
 
@@ -72,7 +64,7 @@ target = 交易员仓位 × ratio
 delta  = (交易员新仓位 - 交易员旧仓位) × ratio
 ```
 
-- `sizing_balance`：配置了 `fixed_balance_usdt` 就用它，否则用账户实时权益（Gate 为钱包余额 + 未实现盈亏，Binance 为钱包余额 + 所有仓位未实现盈亏）。
+- `sizing_balance`：配置了 `fixed_balance_usdt` 就用它，否则用 Hyperliquid 账户权益（各 perp dex 的 `accountValue` 之和）。
 - `total_margin` 是交易员的保证金规模，只作为分母，不是你的保证金。必须大于 0。
 - `coefficient` 是额外倍率，可以是小数；设为 0 等于不跟。
 - 杠杆（`leverage`）只影响保证金占用，不改变跟单的名义仓位；交易所杠杆不够时下单会失败。
@@ -88,8 +80,8 @@ delta  = (交易员新仓位 - 交易员旧仓位) × ratio
   - 进程重启后未成交挂单仍会从 `state.json` 恢复跟踪并继续按 TTL 撤销。
 - `increase`：始终市价（延迟入场只作用于 `open`）。
 - `decrease` / `close`：reduce-only 市价。
-- Gate 的市价单会显式带 `IOC`；每次非 reduce-only 下单前会把该合约杠杆设置为配置值（不超过交易所上限），Gate 的 `margin_mode: crossed` 走全仓杠杆接口。
-- 下单数量按交易所 `contractSize` 从基础币数量换算成张数，并按交易所精度取整。低于最小张数或最小名义价值时，非减仓单进入小单 carry，减仓单直接跳过。
+- 市价单用 IOC 限价单实现（以盘口中间价加/减 `slippage`，默认 5%）；每次非 reduce-only 下单前会把该币杠杆设置为配置值（不超过交易所上限，全仓）。
+- 下单数量按各币的 `szDecimals` 取整，价格按 5 位有效数字及 `6 - szDecimals` 位小数取整。低于交易所最小名义价值（约 $10）时，非减仓单进入小单 carry，减仓单直接跳过。
 
 ### 启动补仓
 
@@ -124,7 +116,7 @@ delta  = (交易员新仓位 - 交易员旧仓位) × ratio
 - `stopped` 期间交易员的 `open` / `increase` 信号全部跳过，避免止损后立刻被加仓信号重新拉回场内。
 - 交易员平掉该币后 `stopped` 自动清除；下一次开仓会正常复制。
 - 5 秒对账也会检测这种情况，所以即使没有新的 WS 信号，手动平仓也能被识别。
-- 重启时 `entered` 会从本地成交记录（`local_fills`）恢复，避免重启后把“从未成交的启动补仓”误判成止损。
+- 重启时 `entered` 会从 `data/state.json` 恢复，避免重启后把“从未成交的启动补仓”误判成止损。
 
 ## 风控
 
@@ -146,9 +138,7 @@ position_stop_loss:
   空头触发价 = 入场价 + max_loss_usdt / 持仓数量
   ```
 
-- 用交易所原生条件单平掉整个仓位：
-  - Gate：`triggerPrice` + `reduceOnly` 的市价条件单，通过 Gate 的 price-orders 接口查询/撤销。
-  - Binance：`STOP_MARKET` + `closePosition=true`，触发时由交易所决定平仓数量。
+- 用 Hyperliquid 原生触发单平掉整个仓位：`triggerPx` + `isMarket` + `tpsl: sl`，`reduceOnly=true`；触发后按市价成交。
 - 每 5 秒对账一次，只处理引擎自己拥有的 symbol：
   - 仓位归零：释放所有权，并撤销残留条件单。
   - 仓位存在：确保条件单存在；持仓张数或触发价变化时重建。
@@ -182,7 +172,7 @@ hard_stop:
 
 - 暂停只阻止新风险：`open`、`increase`、`close_reverse` 会被跳过。
 - `decrease`、`close` 和已有的交易所条件单不受影响。
-- 入口：Telegram `/pause` `/resume`、控制台按钮、HTTP `POST /api/v1/control/{pause|resume}`、`POST /command`。
+- 入口：Telegram `/pause` / `/resume`。
 
 ## 配置
 
@@ -208,13 +198,12 @@ hyperliquid:
 
 ```yaml
 execution_accounts:
-  gate_primary:
-    exchange: gate
-    api_key: ${GATE_API_KEY}
-    secret_key: ${GATE_SECRET_KEY}
-    settle: usdt
-    margin_mode: crossed
-    leverage: 50
+  hl_primary:
+    exchange: hyperliquid
+    # account_address: '0x...'   # API 钱包与主账户地址不同时填写
+    api_private_key: ${HL_API_PRIVATE_KEY}
+    testnet: false
+    leverage: 10
     dry_run: false
     fixed_balance_usdt: 100
     hard_stop:
@@ -223,13 +212,11 @@ execution_accounts:
 
 | 字段 | 说明 |
 | --- | --- |
-| `exchange` | `gate` 或 `binance`（Binance 走 `binanceusdm`） |
-| `api_key` | 交易所 API key |
-| `secret_key` | **Gate** 使用这个字段名 |
-| `api_secret` | **Binance** 使用这个字段名 |
-| `settle` | Gate 结算币种，默认 `usdt`；也用于 Gate 账本和条件单接口 |
-| `margin_mode` | Gate 全仓请填 `crossed`（兼容 `cross`） |
-| `leverage` | 下单前设置的目标杠杆；不超过交易所上限。只影响保证金，不改变仓位大小 |
+| `exchange` | 固定 `hyperliquid` |
+| `account_address` | 可选；API 钱包（agent）与主账户地址不同时填主账户地址，缺省用私钥派生地址 |
+| `api_private_key` | API 钱包私钥（签名用），建议只放 `lead.env` 或环境变量 |
+| `testnet` | `true` 连测试网；默认主网（含全部 HIP-3 perp dex） |
+| `leverage` | 下单前设置的目标杠杆；不超过该币上限。只影响保证金，不改变仓位大小 |
 | `dry_run` | `true` 时使用内存模拟交易所，不连真实账户 |
 | `fixed_balance_usdt` | 固定跟单预算；不填则使用账户实时权益 |
 | `hard_stop.max_daily_loss_usdt` | 当日亏损达到该 USDT 数触发硬止损 |
@@ -244,7 +231,7 @@ leaders:
 - name: A
   address: '0x15ba...'
   source: hyperliquid
-  execution_account: gate_primary
+  execution_account: hl_primary
   coefficient: 40
   total_margin: 500000
   enabled: true
@@ -286,17 +273,6 @@ state:
 
 保存 symbol 所有权、止损抑制状态、已成交标记、小单 carry、单仓止损单 id、账户硬止损基线。每次变动原子写入。
 
-### console
-
-```yaml
-console:
-  database: data/console.sqlite3
-  domain: yhr.lol
-```
-
-- `database`：SQLite 路径，目录会自动创建。
-- `domain`：仅作文档/部署参考，代码不读取。
-
 ### telegram
 
 ```yaml
@@ -318,29 +294,22 @@ telegram:
 
 `enabled: true` 但 token/chat_id 缺失或仍是未展开的 `${...}` 时，只打印警告，不会启动机器人。
 
-### symbol_map
+### symbol_map（可选）
 
-顶层可选配置，把 HL 币名映射到执行交易所的合约：
+执行和交易员在同一交易所，币名已经一致，通常**不需要配置**。保留该字段只用于别名和忽略：
 
 ```yaml
 symbol_map:
-  'XYZ:SKHX': SKHX/USDT:USDT   # CCXT 统一标的
-  PEPE: 1000PEPE               # 裸基础币种
-  AMD: AMD_USDT                # 交易所原生写法
   'XYZ:OLD': skip              # 完全忽略
   'XYZ:DEAD': null             # 同上
 ```
 
 规则：
 
-- 键是 HL 币名，大小写不敏感；值是 CCXT 统一标的、基础币种或原生写法。
-- 映射目标必须是 USDT 永续；指向现货或非 USDT 合约会在启动时报错。
-- 解析顺序：先精确匹配（保留 HIP-3 命名空间），未命中再按基础币种匹配。
-- 基础币种匹配时，skip 条目优先于普通映射，与配置顺序无关。
+- 键是 HL 币名，大小写不敏感；值可以是同名币种或 `skip`。
 - 值为 `skip`、`ignore`、`none`、`null`、空字符串或空值都表示忽略该币：所有信号都不执行，carry 会被清空。
-- HIP-3 名称包含冒号，YAML 中**必须加引号**，例如 `'XYZ:SKHX'`；不加引号会被解析成键值对。
-- 控制台和 Telegram 会把交易所合约名反向显示成 HL 名称。
-- 实盘启动时会逐个解析所有非 skip 映射，拼写错误会直接阻止启动。
+- HIP-3 名称包含冒号，YAML 中**必须加引号**，例如 `'XYZ:AMD'`；不加引号会被解析成键值对。
+- 不再做跨交易所标的映射；映射到未知币种会在启动时报错。
 - 只支持配置文件修改，运行中修改需要重启进程。
 
 ### 完整示例
@@ -351,27 +320,21 @@ hyperliquid:
   reconnect_seconds: 3
 
 execution_accounts:
-  gate_primary:
-    exchange: gate
-    api_key: ${GATE_API_KEY}
-    secret_key: ${GATE_SECRET_KEY}
-    settle: usdt
-    margin_mode: crossed
-    leverage: 50
+  hl_primary:
+    exchange: hyperliquid
+    api_private_key: ${HL_API_PRIVATE_KEY}
+    testnet: false
+    leverage: 10
     dry_run: false
     fixed_balance_usdt: 100
     hard_stop:
       max_daily_drawdown_pct: 30
 
-symbol_map:
-  'XYZ:SKHX': SKHX/USDT:USDT
-  'XYZ:OLD': skip
-
 leaders:
 - name: A
   address: '0x0000000000000000000000000000000000000000'
   source: hyperliquid
-  execution_account: gate_primary
+  execution_account: hl_primary
   coefficient: 40
   total_margin: 500000
   enabled: true
@@ -384,7 +347,7 @@ leaders:
 - name: B
   address: '0x1111111111111111111111111111111111111111'
   source: hyperliquid
-  execution_account: gate_primary
+  execution_account: hl_primary
   coefficient: 2
   total_margin: 200000
   enabled: true
@@ -397,10 +360,6 @@ leaders:
 
 state:
   path: data/state.json
-
-console:
-  database: data/console.sqlite3
-  domain: example.com
 
 telegram:
   enabled: true
@@ -426,31 +385,21 @@ python main.py --config config/config.yaml
 
 - 默认配置路径是 `config/config.yaml`，可以用 `--config` 指定。
 - 日志输出到 stdout，级别 INFO；下单结果、跳过原因、启动参数、硬止损都会记录。
-- 实盘启动顺序：加载配置 → 创建交易所 → 加载市场 → 校验 `symbol_map` → 拉取账户仓位（失败则退出）→ 处理各交易员 REST 快照 → 启动 WebSocket → 启动控制台和 5 秒对账任务。
+- 实盘启动顺序：加载配置 → 创建 Hyperliquid 客户端（发现默认 dex + 所有 HIP-3 dex）→ 校验 `symbol_map` → 拉取账户仓位（失败则退出）→ 处理各交易员 REST 快照 → 启动 WebSocket 和低速率 REST 兜底 → 启动 5 秒对账任务。
 - `dry_run: true` 时使用内存模拟交易所：市价单立即成交、限价单保持挂单、权益取 `fixed_balance_usdt`（未配置则为 0），不会连接真实账户，也不会创建交易所原生止损单。适合验证配置和跟单流程，但不能验证交易所连通性。
 
 ### systemd
 
-`systemd/hyper.service` 已按 `/root/hyper` 部署写好：
+`systemd/hyper.service` 已按本机 `/home/yhr/hyper` + `.venv` 写好。安装需要 root：
 
 ```bash
-cp systemd/hyper.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now hyper
+sudo cp systemd/hyper.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now hyper
 journalctl -u hyper -f
 ```
 
-### HTTPS 反向代理
-
-控制台只监听 `127.0.0.1:8766`。用 Caddy 反代：
-
-```caddyfile
-yhr.lol {
-    reverse_proxy 127.0.0.1:8766
-}
-```
-
-Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更多说明见 `CONSOLE.md`。
+如果部署在别的路径，修改 `WorkingDirectory` / `ExecStart` 里的路径，并确保运行用户对 `data/` 有写权限。
 
 ## Telegram
 
@@ -477,85 +426,6 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 
 `report_format: image` 时，`/positions` 和 `/leader_positions` 会渲染成深色 PNG 报告卡片；渲染或发送失败会自动回退为文本消息。
 
-## Web 控制台
-
-默认地址：`http://127.0.0.1:8766/`，公网通过 Caddy 反代。
-
-### 页面
-
-- **Monitor**
-  - 账户余额、未实现盈亏、权益、系统状态、止损配置。
-  - 暂停/恢复按钮。
-  - 当前挂单、执行账户持仓、各交易员实时仓位。
-  - 执行账户每个持仓行提供「一键保本」按钮：把该仓位的原生止损移到开仓价，仅浮盈时可用；再次点击可恢复配置的止损。
-  - 交易员配置表单。
-- **Performance**
-  - 时间范围：Today / 30D / All / 自定义 `since`–`until`（Unix 秒）。
-  - 指标：已实现毛盈亏、手续费、资金费、净盈亏、现金流调整后收益率、最大回撤、成交数。
-  - 图表：账户权益曲线、分交易员已实现盈亏。
-  - 分交易员表：净盈亏、毛盈亏、手续费、资金费、胜率、成交数、贡献占比。
-  - 当前持仓按交易员归因。
-- **Configuration**
-  - 修改交易员地址、系数、`total_margin`、启用状态、延迟入场、单仓止损。
-  - 保存后写回 `config.yaml` 并热更新引擎（`enabled` 除外，见注意事项）。
-  - 每次修改写入 `audit_logs`。
-
-### 可编辑字段
-
-通过 `PATCH /api/v1/leaders/{name}` 可以修改：
-
-`address`、`enabled`、`coefficient`、`total_margin`、`symbol_blacklist`、`late_entry_enabled`、`late_entry_offset_pct`、`position_stop_loss`。
-
-校验规则：
-
-- `address` 必须是 42 字符的 `0x` 地址。
-- `coefficient >= 0`。
-- `total_margin > 0`。
-- `late_entry_offset_pct >= 0`。
-- `position_stop_loss.max_loss_usdt > 0`。
-
-修改 `address` 时，引擎会清空该交易员的旧仓位基线（`previous`）、停止/成交/小单 carry 状态和未成交挂单，然后按启动流程重新拉取新地址的 REST 快照，并让 WebSocket 重新订阅新地址。旧地址的仓位不会被当成 `close` 误平。
-
-`symbol_blacklist` 只能通过 API 修改，控制台表单里没有输入框。
-
-### API
-
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET | `/api/v1/dashboard` | 最近一次快照 |
-| GET | `/api/v1/trades?limit=100` | 成交记录，最多 500 条 |
-| GET | `/api/v1/stats` | 快照 + 绩效汇总 |
-| GET | `/api/v1/performance/overview?account=&since=&until=` | 绩效、交易员聚合、持仓归因 |
-| GET | `/api/v1/performance/leaders` | 分交易员绩效 |
-| GET | `/api/v1/performance/equity` | 权益曲线 |
-| GET | `/api/v1/events` | SSE 快照流，3 秒推送，30 秒心跳 |
-| PATCH | `/api/v1/leaders/{name}` | 修改交易员配置 |
-| POST | `/api/v1/positions/breakeven` | 单个仓位一键保本/恢复止损，body：`{"symbol":"BTC","enabled":true}` |
-| POST | `/api/v1/control/{pause\|resume}` | 暂停/恢复 |
-| POST | `/command` | 与 Telegram 命令等价的文本接口 |
-
-### 绩效统计口径
-
-- `net_pnl = gross_pnl - fees + funding`。
-- `gross_pnl` 是交易所返回的已实现盈亏；`fee` 存正数成本；`funding` 正数表示收入。
-- 权益曲线用 `equity - 累计现金流` 做调整，再计算收益率和最大回撤。
-- 现金流来自交易所的充值、提现、资金费历史（适配器支持时）。
-- 曲线查询会按时间分桶，最多返回 400 个点，避免长时间窗口拉爆内存。
-
-### 交易归因
-
-- 引擎本地成交（`local_fills`）记录每一笔真实下单，包括 reduce-only 标记。
-- 交易所平仓记录优先匹配本地 reduce-only 成交：同 symbol、时间差 24 小时内、最近的一条。
-- 交易所原生止损/爆仓/手动平仓没有本地 reduce-only 成交，会归因到该 symbol 在平仓时间之前最近的一笔开仓成交（`attribution = stop_close`）。
-- 无法匹配的记录保留为 `unattributed`，不会猜测。
-
-### 交易所盈亏数据源
-
-- **Gate**：以合约账户账本（account book）为准，把同一订单的 `pnl` 和 `fee` 腿合并成一条记录。这是唯一能完整覆盖每次平仓（包括止损和反手）的数据源。
-- **Binance**：优先 `fetchIncome`，失败时回退到成交记录。
-- Gate 的 `position_close`（平仓历史）仅作为回退；一旦账本数据可用，旧的回退记录会被清理。
-- 控制台启动时会就地迁移旧库：毫秒时间戳转秒、删除历史 fee-only 脏数据、删除被账本取代的 `position_close` 记录。
-
 ## 状态与数据
 
 ### `data/state.json`
@@ -571,36 +441,25 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 | `protection` | `执行账户:SYMBOL -> {id, contracts, trigger}`，单仓止损条件单 |
 | `risk` | `{baseline, day, locked}`，账户硬止损基线 |
 
-### `data/console.sqlite3`
-
-| 表 | 内容 |
-| --- | --- |
-| `equity_snapshots` | 每 3 秒的权益/未实现盈亏快照 |
-| `trades` | 交易所已实现盈亏记录、归因交易员、来源 |
-| `cash_flows` | 充值、提现、资金费 |
-| `local_fills` | 引擎本地成交，用于归因和重启恢复 |
-| `audit_logs` | 控制台修改/暂停操作的审计记录 |
-
 `data/` 已在 `.gitignore` 中，不会进入版本库。
 
 ## 项目结构
 
 ```text
-main.py                 启动入口、WebSocket 消费、5 秒风控对账
+main.py                 启动入口、WebSocket 消费、REST 兜底、5 秒风控对账
 validate.py             配置结构校验
 config/
   config.yaml           主配置
   lead.env              密钥（git 忽略）
   loader.py             环境变量/占位符加载
-  manager.py            控制台写回 config.yaml
 core/
   engine.py             信号执行、仓位管理、小单 carry、止损抑制
   detector.py           仓位差分生成信号
   models.py             Position / Signal / Order 数据结构
-  symbols.py            symbol_map 解析与反向显示
+  symbols.py            symbol_map 别名/忽略解析
 exchanges/
   base.py               交易所接口
-  ccxt_exchange.py      Gate / Binance 实现
+  hyperliquid_exchange.py  Hyperliquid 原生执行（含 HIP-3）
   dry_run.py            内存模拟交易所
 risk/manager.py         账户级每日硬止损
 sources/
@@ -610,34 +469,26 @@ state/store.py          state.json 原子读写
 telegram/
   bot.py                长轮询命令与通知
   report_image.py       PNG 报告渲染
-api/
-  app.py                aiohttp 应用与 /command
-  console.py            控制台 API、SQLite、绩效与归因
-  static/               控制台前端
-systemd/                systemd 与 Caddy 配置
+systemd/                systemd 服务配置
 tests/                  单元测试
 ```
 
 ## 已知限制与注意事项
 
 - **单执行账户**：一个进程只使用第一个启用交易员的 `execution_account` 创建交易所实例。所有启用的交易员应指向同一个账户。
-- **`enabled` 只在启动时生效**：启动时只加载 `enabled: true` 的交易员，控制台也只能看到这些交易员。运行中把某个交易员改成 `enabled: false` 不会停止它继续跟单，需要重启进程；启动时未启用的交易员无法从控制台启用。
+- **`enabled` 只在启动时生效**：启动时按配置加载交易员；运行中把某个交易员改成 `enabled: false` 不会停止它继续跟单，需要重启进程。
 - **反手不处理**：`close_reverse` 永远跳过，旧仓保持不动，需要手动平仓后再等待下一次开仓信号。
 - **关闭单仓止损不会撤销已存在的条件单**：把 `position_stop_loss.enabled` 改成 `false` 只是不再新建/对账，已经挂在交易所的止损单仍然有效，需要手动撤销或等仓位平掉。
 - **暂停状态不持久化**：重启后 `paused` 恢复为 `false`；账户硬止损的 `locked` 会持久化，且 `process()` 会同时检查 `locked`，因此重启后当日锁定仍然有效。
-- **控制台保存会重写 YAML**：通过控制台修改交易员参数会重新序列化整个 `config.yaml`，注释和手工排版会丢失；`${ENV}` 占位符会保留。
-- **symbol_map 需要重启**：它不在控制台可编辑字段中，修改后必须重启进程。
-- **控制台无鉴权**：暴露公网前请自行加 Basic Auth、VPN 或 IP 限制。`lead.env` 里的 `CONSOLE_USERNAME` / `CONSOLE_PASSWORD` 当前代码没有使用。
-- **地址修改**：控制台可以改交易员地址。修改后引擎会重置该交易员的仓位基线、撤销旧挂单、立即用新地址拉取 REST 快照，并触发 WebSocket 重新订阅；不需要重启进程。
-- **未使用字段**：`hyperliquid.addresses`、`leaders[].source`、`console.domain` 当前不影响运行。
+- **symbol_map 需要重启**：它只能通过配置文件修改，修改后必须重启进程。
+- **未使用字段**：`hyperliquid.addresses`、`leaders[].source` 当前不影响运行。
 - **启动仓位查询失败会直接退出**：`prepare_startup` 故意让异常向上抛出，避免把未知账户状态当成零仓位处理。
 - **账户硬止损会平掉所有仓位**：包括非引擎建立的手动仓位。
-- **数据库无自动清理**：权益快照每 3 秒写入一条，长期运行后 SQLite 会持续增长；查询已做降采样，但没有保留策略。
 
 ## 测试
 
 ```bash
-pytest tests/
+python -m pytest tests/      # 或 python -m unittest discover -s tests
 ```
 
-`pyproject.toml` 已配置 `pythonpath = ["."]`，不需要额外设置。测试覆盖：symbol_map 解析、CCXT 合约解析、信号跳过、启动补仓、小单累计、止损后抑制再入场、风控基线、绩效归因与旧库迁移。
+`pyproject.toml` 已配置 `pythonpath = ["."]`，不需要额外设置。测试覆盖：symbol_map 解析、Hyperliquid 适配器（数量/价格取整、订单解析、HIP-3 多 dex）、信号跳过、启动补仓、小单累计、止损后抑制再入场、风控基线。
