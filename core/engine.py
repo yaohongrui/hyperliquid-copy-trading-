@@ -220,10 +220,15 @@ class Engine:
             log.warning('Notification %s failed', method, exc_info=True)
             return False
 
-    def _mark_stopped(self, leader, symbol):
+    def _mark_stopped(self, leader, symbol, side=None):
         key = f'{leader}:{symbol}'
-        if not self.stopped.get(key):
-            self.stopped[key] = True
+        # Remember the leader's side so the suppression can end when the leader
+        # later reverses.  A high-frequency leader may cross zero between two
+        # snapshots, so "leader is flat" is not always observable and a
+        # boolean latch would otherwise block this symbol forever.
+        side = side if side in ('long', 'short') else True
+        if self.stopped.get(key) != side:
+            self.stopped[key] = side
             self._save_state()
 
     @staticmethod
@@ -910,7 +915,8 @@ class Engine:
                                 and self.entered.get(f'{leader}:{symbol}')):
                             # The account is flat but the leader still holds:
                             # our side was stopped or closed manually.
-                            self._mark_stopped(leader, symbol)
+                            self._mark_stopped(leader, symbol,
+                                               'long' if baseline.size > 0 else 'short')
                         await self._release_if_flat(leader, symbol, live=live)
                     else:
                         if holder is None:
@@ -1015,14 +1021,25 @@ class Engine:
             signals = diff_positions(leader, previous, positions, ratio)
             self.previous_at[leader] = time.time()
             failed = set()
-            # A stop-out suppression ends once the leader itself is flat; the
-            # next open is then a genuinely new episode worth copying.
+            # A stop-out suppression ends when the leader starts a new episode:
+            # it goes flat, or it reverses direction.  A reversal is a close and
+            # reopen even when the flat state itself fell between two snapshots,
+            # so it must clear the suppression too; otherwise a leader that
+            # swings through zero can keep a symbol suppressed forever.
             for key in [k for k in self.stopped if k.startswith(f'{leader}:')]:
                 symbol = key[len(leader) + 1:]
                 position = positions.get(symbol)
                 if position is None or abs(position.size) <= 1e-12:
                     self.stopped.pop(key, None)
                     self._save_state()
+                    continue
+                stopped_side = self.stopped.get(key)
+                current_side = 'long' if position.size > 0 else 'short'
+                if stopped_side in ('long', 'short') and stopped_side != current_side:
+                    self.stopped.pop(key, None)
+                    self._save_state()
+                    log.info('STOP-OUT CLEARED leader=%s symbol=%s: leader reversed %s->%s',
+                             leader, symbol, stopped_side, current_side)
             if startup:
                 for key in list(self.small_order_carry):
                     if key.startswith(f'{leader}:') and key[len(leader) + 1:] not in positions:
@@ -1106,7 +1123,8 @@ class Engine:
                         # leader still holds.  Copying the add would create a
                         # fresh position right after the stop, so suppress
                         # re-entry until the leader goes flat and reopens.
-                        self._mark_stopped(leader, s.symbol)
+                        self._mark_stopped(leader, s.symbol,
+                                           'long' if s.target_size > 0 else 'short')
                         await self._release_if_flat(leader, s.symbol)
                         await self._skip(leader, s, 'account is flat (native close?); waiting for the leader to close and reopen')
                         continue
@@ -1139,8 +1157,30 @@ class Engine:
                             await self._skip(leader, s, f'resync price unfavorable: {reason}')
                             continue
                     if s.kind == 'close_reverse':
-                        await self._skip(leader, s, 'reversal requires reconciliation; automatic reversal disabled')
-                        continue
+                        # The leader closed and reopened on the other side.
+                        # Mirror it as one net order from our live position to
+                        # the leader's new scaled target.  Skipping this used to
+                        # leave the account sitting on the side the leader had
+                        # just abandoned.  A reversal is also a fresh episode,
+                        # so drop any stale stop-out suppression (including
+                        # legacy boolean markers) and old-side carry.
+                        target = s.target_size
+                        if abs(target) <= 1e-12:
+                            await self._skip(leader, s, 'reversal target is flat')
+                            continue
+                        delta = target - live
+                        if abs(delta) <= 1e-12:
+                            await self._skip(leader, s, 'account position already matches the reversed target')
+                            continue
+                        if self.stopped.pop(stopped_key, None):
+                            self._save_state()
+                            log.info('STOP-OUT CLEARED leader=%s symbol=%s: leader reversed',
+                                     leader, s.symbol)
+                        self._set_carry(leader, s.symbol)
+                        s = replace(s, delta=delta, side='long' if target > 0 else 'short')
+                        # Fall through to the shared entry path below.  No
+                        # "worse than leader entry" veto here: staying on the
+                        # abandoned side is worse than a slightly late fill.
                     reduce = s.kind in ('decrease', 'close')
                     carry = self.small_order_carry.get(f'{leader}:{s.symbol}', {})
                     carry_amount = float(carry.get('amount') or 0)
@@ -1164,7 +1204,8 @@ class Engine:
                             # leader add does not reopen the position.
                             if not live:
                                 if s.kind == 'decrease' and self.entered.get(stopped_key):
-                                    self._mark_stopped(leader, s.symbol)
+                                    self._mark_stopped(leader, s.symbol,
+                                                       'long' if s.target_size > 0 else 'short')
                                 await self._release_if_flat(leader, s.symbol)
                             await self._skip(leader, s, 'no matching account position to reduce')
                             continue

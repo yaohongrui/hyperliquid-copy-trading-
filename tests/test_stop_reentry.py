@@ -61,6 +61,60 @@ class StopReentryTests(unittest.IsolatedAsyncioTestCase):
         await engine.process("L", {"S": Position("S", 50, 1)})
         self.assertEqual(engine.exchange.orders[-1], ("S", "buy", 50, False))
 
+    async def test_leader_reversal_flips_the_account_position(self):
+        engine = self.engine()
+        await self.open_position(engine)
+
+        # The leader reverses straight from long to short.  Our account must
+        # cross to the new side instead of keeping the abandoned long.
+        await engine.process("L", {"S": Position("S", -50, 1)})
+        self.assertEqual(engine.exchange.orders[-1], ("S", "sell", 150, False))
+        self.assertEqual(engine.exchange.live, -50)
+
+    async def test_reversal_clears_legacy_boolean_stop_marker(self):
+        engine = self.engine()
+        await self.open_position(engine)
+        engine.stopped["L:S"] = True
+        engine._save_state()
+
+        await engine.process("L", {"S": Position("S", -50, 1)})
+        self.assertNotIn("L:S", engine.stopped)
+        self.assertEqual(engine.exchange.live, -50)
+
+    async def test_leader_reversal_clears_stop_suppression(self):
+        engine = self.engine()
+        await self.open_position(engine)
+
+        # The exchange-side stop fires while the leader is still long.
+        engine.exchange.live = 0
+        await engine.process("L", {"S": Position("S", 110, 1)})
+        self.assertEqual(engine.stopped.get("L:S"), "long")
+
+        # The leader sells straight through zero between two snapshots, so no
+        # flat state is ever observed.  A reversal is still a close and reopen,
+        # so the suppression must end and later adds in the new side are copied.
+        await engine.process("L", {"S": Position("S", -50, 1)})
+        self.assertNotIn("L:S", engine.stopped)
+        await engine.process("L", {"S": Position("S", -60, 1)})
+        self.assertEqual(engine.exchange.orders[-1], ("S", "sell", 10, False))
+
+    async def test_reversal_while_process_is_down_clears_suppression(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory) / "state.json")
+            exchange = Exchange(live=0)
+            engine = Engine(exchange, {"L": {"total_margin": 100}}, state_store=store)
+            await engine.process("L", {"S": Position("S", 100, 1)})
+            exchange.live = 0
+            await engine.process("L", {"S": Position("S", 110, 1)})
+            self.assertEqual(engine.stopped.get("L:S"), "long")
+
+            # The leader reversed while the process was down.  The first
+            # snapshot after the restart shows the opposite side, which is a
+            # fresh episode, so the stale suppression must not survive.
+            restarted = Engine(exchange, {"L": {"total_margin": 100}}, state_store=store)
+            await restarted.process("L", {"S": Position("S", -25, 1)})
+            self.assertNotIn("L:S", restarted.stopped)
+
     async def test_reconcile_marks_stop_and_releases_owner(self):
         engine = self.engine()
         await self.open_position(engine)
