@@ -273,6 +273,7 @@ console:
 | `database` | SQLite 路径，目录会自动创建 |
 | `domain` | 仅作文档/部署参考，代码不读取 |
 | `leader_rest_seconds` | 交易员 REST 兜底轮询间隔（秒），默认 60，最小 10 |
+| `dashboard_seconds` | 账户面板刷新间隔（秒），默认 5，最小 2；HIP-3 多 dex 账户会按每个 dex 查询，勿设得过低 |
 | `performance_seconds` | Performance 数据（成交/资金费/现金流）刷新间隔（秒），默认 60，最小 10 |
 | `performance_lookback_days` | 首次启动回填绩效数据的天数，默认 30 |
 | `performance_overlap_seconds` | 增量拉取时向水位之前回看的重叠秒数，默认 300，避免边界漏单 |

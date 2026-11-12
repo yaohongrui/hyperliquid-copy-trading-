@@ -367,6 +367,10 @@ class ConsoleService:
         # Ledger/trade/equity-curve refreshes paginate REST and scan SQLite;
         # the dashboard only needs the 3-second account view.
         self._performance_interval = max(10.0, float(console_config.get("performance_seconds", 60)))
+        # Each dashboard tick reads every perp dex from Hyperliquid.  HIP-3
+        # accounts can have a dozen dexes, so keep this slower than the old
+        # single-venue 3-second loop to stay inside the rate limit.
+        self._dashboard_interval = max(2.0, float(console_config.get("dashboard_seconds", 5)))
         # Incremental window: the first refresh backfills the lookback, later
         # ones only re-read a short overlap around the stored watermark.
         self._performance_lookback_days = max(1.0, float(console_config.get("performance_lookback_days", 30)))
@@ -685,7 +689,7 @@ class ConsoleService:
                 await self.refresh()
             except Exception:
                 log.warning("Console refresh failed", exc_info=True)
-            await asyncio.sleep(3)
+            await asyncio.sleep(self._dashboard_interval)
 
     async def refresh(self):
         await self._refresh_leader_fallback()

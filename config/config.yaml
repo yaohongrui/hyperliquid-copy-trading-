@@ -22,6 +22,7 @@ console:
   database: data/console.sqlite3
   domain: yhr.lol
   leader_rest_seconds: 60
+  dashboard_seconds: 6
   performance_seconds: 60
   performance_lookback_days: 30
   performance_overlap_seconds: 300

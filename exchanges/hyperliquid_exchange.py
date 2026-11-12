@@ -20,6 +20,7 @@ from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
+from hyperliquid.utils.error import ClientError
 
 from core.models import Order
 from core.symbols import SymbolMap
@@ -98,6 +99,12 @@ class HyperliquidExchange:
             flow_types = (flow_types,)
         self.cash_flow_types = tuple(str(item).lower() for item in flow_types)
         self._lock = threading.RLock()
+        # Console and engine both poll account state.  A very short cache lets
+        # fetch_positions/equity/open-orders share one round of per-dex calls
+        # without returning noticeably stale data; mutations clear it.
+        self._state_cache = {}
+        self._orders_cache = {}
+        self._cache_ttl = max(0.0, float(self.config.get("state_cache_seconds", 2.0) or 0))
         self.info = None
         self.client = None
         self.address = None
@@ -119,6 +126,49 @@ class HyperliquidExchange:
         # ``skip_ws=True``, so there is nothing to tear down.
         return None
 
+    @staticmethod
+    def _is_transient(exc):
+        return getattr(exc, "status_code", None) in (429, 500, 502, 503, 504)
+
+    def _sdk_call(self, fn, *args, **kwargs):
+        """Run one synchronous SDK call with a small backoff on rate limits."""
+        delay = 1.0
+        for attempt in range(3):
+            try:
+                return fn(*args, **kwargs)
+            except ClientError as exc:
+                if not self._is_transient(exc) or attempt == 2:
+                    raise
+                log.warning("Hyperliquid request throttled; retrying in %.1fs", delay)
+                time.sleep(delay)
+                delay *= 2
+
+    def _cache_get(self, cache, key):
+        item = cache.get(key)
+        if item is None:
+            return None
+        at, value = item
+        if time.monotonic() - at <= self._cache_ttl:
+            return value
+        cache.pop(key, None)
+        return None
+
+    @staticmethod
+    def _cache_put(cache, key, value):
+        cache[key] = (time.monotonic(), value)
+        return value
+
+    def _invalidate_account_cache(self):
+        self._state_cache.clear()
+        self._orders_cache.clear()
+
+    def _user_state(self, dex):
+        cached = self._cache_get(self._state_cache, dex)
+        if cached is not None:
+            return cached
+        return self._cache_put(
+            self._state_cache, dex, self._sdk_call(self.info.user_state, self.address, dex))
+
     @_serialized
     def _connect(self):
         if not self.private_key:
@@ -128,15 +178,18 @@ class HyperliquidExchange:
 
         # The default Info only knows the original dex; ask for the full list
         # of builder-deployed dexes so their assets are registered too.
-        bootstrap = Info(self.base_url, skip_ws=True, timeout=self.request_timeout)
-        raw = bootstrap.perp_dexs() or []
+        bootstrap = self._sdk_call(
+            Info, self.base_url, skip_ws=True, timeout=self.request_timeout)
+        raw = self._sdk_call(bootstrap.perp_dexs) or []
         hip3 = [item["name"] for item in raw[1:] if item and item.get("name")]
         self.dexes = [""] + hip3
 
-        self.info = Info(
+        self.info = self._sdk_call(
+            Info,
             self.base_url, skip_ws=True, perp_dexs=self.dexes, timeout=self.request_timeout,
         )
-        self.client = Exchange(
+        self.client = self._sdk_call(
+            Exchange,
             wallet,
             base_url=self.base_url,
             account_address=self.account_address,
@@ -145,14 +198,16 @@ class HyperliquidExchange:
         )
         self._coins = {name.upper(): name for name in self.info.coin_to_asset}
         try:
-            abstraction = self.info.query_user_abstraction_state(self.address)
+            abstraction = self._sdk_call(
+                self.info.query_user_abstraction_state, self.address)
             self.unified = abstraction in ("unifiedAccount", "portfolioMargin")
         except Exception:
             log.warning("Failed to read Hyperliquid account abstraction", exc_info=True)
         self._max_leverage = {}
         for dex in self.dexes:
             try:
-                meta = self.info.meta(dex=dex) if dex else self.info.meta()
+                meta = self._sdk_call(
+                    (lambda d=dex: self.info.meta(dex=d)) if dex else self.info.meta)
             except Exception:
                 log.warning("Failed to read Hyperliquid meta for dex %s", dex or "default", exc_info=True)
                 continue
@@ -225,7 +280,7 @@ class HyperliquidExchange:
     # -- account reads -----------------------------------------------------
     @_serialized
     def _positions_for_dex(self, dex):
-        state = self.info.user_state(self.address, dex)
+        state = self._user_state(dex)
         rows = []
         for item in state.get("assetPositions") or []:
             position = item.get("position") or item
@@ -286,16 +341,30 @@ class HyperliquidExchange:
     def _fetch_open_orders(self):
         rows = []
         for dex in self.dexes:
-            try:
-                # frontendOpenOrders carries isTrigger/triggerPx, which the plain
-                # openOrders feed omits; protection cleanup needs them.
-                orders = self.info.frontend_open_orders(self.address, dex) or []
-            except Exception:
+            orders = self._cache_get(self._orders_cache, dex)
+            if orders is None:
                 try:
-                    orders = self.info.open_orders(self.address, dex) or []
+                    # frontendOpenOrders carries isTrigger/triggerPx, which the plain
+                    # openOrders feed omits; protection cleanup needs them.
+                    orders = self._sdk_call(
+                        self.info.frontend_open_orders, self.address, dex) or []
+                except ClientError as exc:
+                    if self._is_transient(exc):
+                        log.warning(
+                            "Hyperliquid open orders throttled for dex %s", dex or "default")
+                        continue
+                    try:
+                        orders = self._sdk_call(
+                            self.info.open_orders, self.address, dex) or []
+                    except Exception:
+                        log.warning("Failed to read Hyperliquid open orders for dex %s",
+                                    dex or "default", exc_info=True)
+                        continue
                 except Exception:
-                    log.warning("Failed to read Hyperliquid open orders for dex %s", dex or "default", exc_info=True)
+                    log.warning("Failed to read Hyperliquid open orders for dex %s",
+                                dex or "default", exc_info=True)
                     continue
+                self._cache_put(self._orders_cache, dex, orders)
             for order in orders:
                 rows.append({
                     "id": str(order.get("oid")),
@@ -317,11 +386,11 @@ class HyperliquidExchange:
     def _equity(self):
         # The default dex is authoritative; HIP-3 dexes keep separate margin,
         # so sum them for a whole-account view.
-        state = self.info.user_state(self.address, "")
+        state = self._user_state("")
         total = _float((state.get("marginSummary") or {}).get("accountValue"))
         for dex in self.dexes[1:]:
             try:
-                state = self.info.user_state(self.address, dex)
+                state = self._user_state(dex)
             except Exception:
                 log.warning("Failed to read Hyperliquid account value for dex %s", dex, exc_info=True)
                 continue
@@ -331,7 +400,7 @@ class HyperliquidExchange:
             # perp accountValue only covers the held portion, so add the free
             # (unheld) spot balance to get the usable account value.
             try:
-                spot = self.info.spot_user_state(self.address)
+                spot = self._sdk_call(self.info.spot_user_state, self.address)
             except Exception:
                 log.warning("Failed to read Hyperliquid spot balance", exc_info=True)
                 spot = {}
@@ -526,7 +595,7 @@ class HyperliquidExchange:
                          if "closedPnl" in item)
             funding.extend(self._funding_row(item) for item in raw_funding)
             if backfill:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.25)
         return self._dedupe_sorted(fills + funding)
 
     async def fetch_realized_pnl(self, since=None, until=None, lookback_days=30,
@@ -548,7 +617,7 @@ class HyperliquidExchange:
             rows.extend(self._cash_flow_row(item) for item in raw_rows
                         if self._ledger_type(item).lower() in allowed)
             if backfill:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.25)
         return self._dedupe_sorted(rows)
 
     @_serialized
@@ -652,6 +721,7 @@ class HyperliquidExchange:
                 coin, is_buy, size, limit_px, {"limit": {"tif": "Ioc"}}, reduce_only=reduce_only,
             )
         status = self._parse_order(result)
+        self._invalidate_account_cache()
         filled = status["filled"] if not status["resting"] else size
         return Order(
             str(status["oid"] or ""), symbol, side, filled or size,
@@ -693,6 +763,7 @@ class HyperliquidExchange:
         if not coin:
             raise ValueError(f"cannot resolve Hyperliquid coin for order {order_id}")
         self._check_cancel(self.client.cancel(coin, int(order_id)))
+        self._invalidate_account_cache()
 
     async def cancel_order(self, order_id, symbol=None):
         await asyncio.to_thread(self._cancel_order, order_id, symbol)
@@ -708,6 +779,7 @@ class HyperliquidExchange:
             {"trigger": {"triggerPx": trigger, "isMarket": True, "tpsl": "sl"}},
             reduce_only=True,
         )
+        self._invalidate_account_cache()
         return str(self._parse_order(result)["oid"] or "")
 
     async def set_protection(self, symbol, side, amount, trigger_price):
@@ -730,6 +802,7 @@ class HyperliquidExchange:
                 except Exception as exc:
                     if not _order_gone(exc):
                         log.warning("Failed to cancel protection order %s", order["id"], exc_info=True)
+        self._invalidate_account_cache()
 
     async def cancel_protection_orders(self, symbol, keep_id=None):
         await asyncio.to_thread(self._cancel_protection_orders, symbol, keep_id)
@@ -744,6 +817,7 @@ class HyperliquidExchange:
             except Exception as exc:
                 if not _order_gone(exc):
                     log.warning("Failed to cancel Hyperliquid order %s", order["id"], exc_info=True)
+        self._invalidate_account_cache()
         return canceled
 
     async def cancel_all_orders(self):
