@@ -143,7 +143,9 @@ async def main(path):
             _consume_leaders(ws, engine, hl_leaders, (c.get("hyperliquid") or {}).get("silence_seconds", 120)),
             name="hyperliquid-ws",
         )
-        protection_task = asyncio.create_task(_reconcile_protections(engine, stop), name="protection-reconciler")
+        protection_task = asyncio.create_task(
+            _reconcile_protections(engine, stop, c.get('protection_reconcile_seconds', 5)),
+            name="protection-reconciler")
         api_runner = web.AppRunner(create_app(telegram, console))
         await api_runner.setup()
         await web.TCPSite(api_runner, "127.0.0.1", 8766).start()

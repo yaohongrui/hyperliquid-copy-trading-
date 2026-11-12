@@ -254,6 +254,14 @@ stop_out_cooldown_seconds: 600
 
 原生止损/爆仓离场后，如果交易员仍持有该币，在这个冷却窗口内跳过 `open` / `increase`。交易员平仓、反手，或冷却到期都会解除；冷却到期且账户仍空时，会立即按交易员当前目标重新对齐。默认 600 秒。
 
+### protection_reconcile_seconds
+
+```yaml
+protection_reconcile_seconds: 15
+```
+
+仓位/保护单对账与硬止损检查的间隔（秒），默认 5。Hyperliquid 的 HIP-3 账户需要按每个 dex 查询 REST，建议在实盘放在 15 秒左右以留在 API 额度内。
+
 ### console
 
 ```yaml
@@ -261,7 +269,8 @@ console:
   database: data/console.sqlite3
   domain: yhr.lol
   leader_rest_seconds: 60
-  performance_seconds: 60
+  dashboard_seconds: 15
+  performance_seconds: 180
   performance_lookback_days: 30
   performance_overlap_seconds: 300
   performance_page_size: 2000
@@ -274,7 +283,7 @@ console:
 | `domain` | 仅作文档/部署参考，代码不读取 |
 | `leader_rest_seconds` | 交易员 REST 兜底轮询间隔（秒），默认 60，最小 10 |
 | `dashboard_seconds` | 账户面板刷新间隔（秒），默认 5，最小 2；HIP-3 多 dex 账户会按每个 dex 查询，勿设得过低 |
-| `performance_seconds` | Performance 数据（成交/资金费/现金流）刷新间隔（秒），默认 60，最小 10 |
+| `performance_seconds` | Performance 数据（成交/资金费/现金流）刷新间隔（秒），默认 60，最小 10；示例配置用 180 |
 | `performance_lookback_days` | 首次启动回填绩效数据的天数，默认 30 |
 | `performance_overlap_seconds` | 增量拉取时向水位之前回看的重叠秒数，默认 300，避免边界漏单 |
 | `performance_page_size` | 单次 REST 分页行数，默认 2000（HL 接口上限） |
@@ -406,7 +415,8 @@ console:
   database: data/console.sqlite3
   domain: yhr.lol
   leader_rest_seconds: 60
-  performance_seconds: 60
+  dashboard_seconds: 15
+  performance_seconds: 180
   performance_lookback_days: 30
   performance_overlap_seconds: 300
   performance_page_size: 2000

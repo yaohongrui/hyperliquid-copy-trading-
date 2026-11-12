@@ -17,13 +17,16 @@ execution_accounts:
     request_timeout_seconds: 10
 
 stop_out_cooldown_seconds: 600
+# HIP-3 accounts read every dex from REST; keep reconciliation below the
+# request budget (the dashboard has its own interval).
+protection_reconcile_seconds: 15
 
 console:
   database: data/console.sqlite3
   domain: yhr.lol
   leader_rest_seconds: 60
-  dashboard_seconds: 6
-  performance_seconds: 60
+  dashboard_seconds: 15
+  performance_seconds: 180
   performance_lookback_days: 30
   performance_overlap_seconds: 300
   performance_page_size: 2000
