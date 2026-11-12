@@ -42,6 +42,60 @@ class RecordingExchange:
         return 0
 
 
+class FlakyCancelExchange(RecordingExchange):
+    """Cancellation fails once, then succeeds like a transient network error."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail_cancels = 1
+
+    async def cancel_order(self, order_id, symbol=None):
+        if self.fail_cancels:
+            self.fail_cancels -= 1
+            raise RuntimeError("temporary cancellation failure")
+        await super().cancel_order(order_id, symbol)
+
+
+class FillAwareExchange(RecordingExchange):
+    """Exchange double that can report an individual order's fill state."""
+
+    def __init__(self):
+        super().__init__()
+        self.order_states = {}
+
+    async def fetch_order(self, order_id, symbol=None):
+        return self.order_states.get(str(order_id))
+
+
+class CancelRacesFillExchange(FillAwareExchange):
+    """The cancel call says the order is gone because it just filled."""
+
+    async def cancel_order(self, order_id, symbol=None):
+        raise RuntimeError("ORDER_NOT_FOUND")
+
+
+class TradeNotifier:
+    def __init__(self):
+        self.cancelled = []
+        self.skipped = []
+        self.fills = []
+
+    async def notify_cancelled(self, leader, symbol, item, reason):
+        self.cancelled.append((leader, symbol, item.get("id"), reason))
+
+    async def notify_limit_filled(self, leader, symbol, entry, filled, price, remaining):
+        self.fills.append((leader, symbol, entry.get("id"), filled, price, remaining))
+
+    async def notify_skipped(self, leader, signal, reason):
+        self.skipped.append((leader, signal.symbol, signal.kind, reason))
+
+    async def notify_accepted(self, *args):
+        return None
+
+    async def notify_failed(self, *args):
+        return None
+
+
 class HardStopExchange(RecordingExchange):
     config = {"fixed_balance_usdt": 100, "hard_stop": {"max_daily_loss_usdt": 10}}
 
@@ -69,16 +123,24 @@ class HardStopExchange(RecordingExchange):
 class Notifier:
     def __init__(self):
         self.stops = 0
+        self.errors = []
+        self.recoveries = 0
 
     async def notify_hard_stop(self, equity, baseline, loss):
         self.stops += 1
 
+    async def notify_hard_stop_error(self, equity, exc):
+        self.errors.append((equity, str(exc)))
+
+    async def notify_hard_stop_recovered(self, equity):
+        self.recoveries += 1
+
 
 class PendingOrderTests(unittest.IsolatedAsyncioTestCase):
-    def engine(self, exchange=None):
+    def engine(self, exchange=None, notifier=None):
         cfg = {"total_margin": 100, "coefficient": 1,
                "late_entry_enabled": True, "late_entry_offset_pct": 1}
-        return Engine(exchange or RecordingExchange(), {"L": cfg})
+        return Engine(exchange or RecordingExchange(), {"L": cfg}, notifier=notifier)
 
     async def test_leader_close_cancels_unfilled_limit_entry(self):
         exchange = RecordingExchange()
@@ -94,18 +156,183 @@ class PendingOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exchange.cancelled, [("o1", "S")])
         self.assertNotIn("L:S", engine.pending_orders)
 
-    async def test_pending_order_expires_after_ttl(self):
+    async def test_pending_order_does_not_expire_with_age(self):
         exchange = RecordingExchange()
         engine = self.engine(exchange)
         await engine.process("L", {})
         await engine.process("L", {"S": Position("S", 100, 1)})
-        created = engine.pending_orders["L:S"]["created_at"]
 
-        await engine.expire_pending_orders(now=created + 10)
+        engine.pending_orders["L:S"]["created_at"] -= 86400
+        await engine.reconcile_pending_orders()
+
         self.assertIn("L:S", engine.pending_orders)
-        await engine.expire_pending_orders(now=created + 61)
+        self.assertEqual(exchange.cancelled, [])
+
+    async def test_reconcile_cancels_pending_when_leader_is_flat(self):
+        exchange = RecordingExchange()
+        engine = self.engine(exchange)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        engine.previous["L"] = {}
+        await engine.reconcile_pending_orders()
+
         self.assertNotIn("L:S", engine.pending_orders)
         self.assertEqual(exchange.cancelled, [("o1", "S")])
+
+    async def test_failed_cancellation_is_retried(self):
+        exchange = FlakyCancelExchange()
+        engine = self.engine(exchange)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        engine.previous["L"] = {}
+        await engine.reconcile_pending_orders()
+        self.assertIn("L:S", engine.pending_orders)
+        self.assertEqual(engine.pending_orders["L:S"]["cancel_reason"], "leader is flat")
+        self.assertEqual(exchange.cancelled, [])
+
+        await engine.reconcile_pending_orders()
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [("o1", "S")])
+
+    async def test_cancelled_order_is_notified(self):
+        exchange = RecordingExchange()
+        notifier = TradeNotifier()
+        engine = self.engine(exchange, notifier)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+        await engine.process("L", {})
+
+        self.assertEqual(
+            notifier.cancelled,
+            [("L", "S", "o1", "close signal from leader")],
+        )
+
+    async def test_filled_resting_order_is_notified(self):
+        exchange = FillAwareExchange()
+        notifier = TradeNotifier()
+        engine = self.engine(exchange, notifier)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        exchange.order_states["o1"] = {
+            "status": "closed", "filled": 100.0, "remaining": 0.0,
+            "average": 0.99, "price": 1.0, "side": "buy",
+        }
+        await engine.reconcile_pending_orders()
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertTrue(engine.entered.get("L:S"))
+        self.assertEqual(
+            notifier.fills,
+            [("L", "S", "o1", 100.0, 0.99, 0.0)],
+        )
+
+    async def test_cancel_that_loses_the_race_still_reports_the_fill(self):
+        exchange = CancelRacesFillExchange()
+        notifier = TradeNotifier()
+        engine = self.engine(exchange, notifier)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+        exchange.order_states["o1"] = {
+            "status": "closed", "filled": 100.0, "remaining": 0.0,
+            "average": 0.99, "price": 1.0, "side": "buy",
+        }
+
+        await engine.process("L", {})
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(notifier.fills, [("L", "S", "o1", 100.0, 0.99, 0.0)])
+
+    async def test_partial_fill_is_reported_once_then_completed(self):
+        exchange = FillAwareExchange()
+        notifier = TradeNotifier()
+        engine = self.engine(exchange, notifier)
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        exchange.order_states["o1"] = {
+            "status": "open", "filled": 40.0, "remaining": 60.0,
+            "average": 0.99, "price": 1.0, "side": "buy",
+        }
+        await engine.reconcile_pending_orders()
+        self.assertIn("L:S", engine.pending_orders)
+        self.assertEqual(engine.pending_orders["L:S"]["filled"], 40.0)
+        self.assertEqual(notifier.fills, [("L", "S", "o1", 40.0, 0.99, 60.0)])
+
+        await engine.reconcile_pending_orders()  # unchanged: no duplicate
+        self.assertEqual(len(notifier.fills), 1)
+
+        exchange.order_states["o1"] = {
+            "status": "closed", "filled": 100.0, "remaining": 0.0,
+            "average": 0.995, "price": 1.0, "side": "buy",
+        }
+        await engine.reconcile_pending_orders()
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(len(notifier.fills), 2)
+        self.assertEqual(notifier.fills[-1], ("L", "S", "o1", 100.0, 0.995, 0.0))
+
+    async def test_startup_keeps_a_matching_pending_entry(self):
+        exchange = RecordingExchange()
+        engine = self.engine(exchange)
+        engine.pending_orders["L:S"] = {
+            "id": "o1", "leader": "L", "symbol": "S", "side": "buy",
+            "amount": 100.0, "price": 0.99, "filled": 0.0, "created_at": 0,
+        }
+
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        self.assertIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [])
+        self.assertEqual(exchange.orders, [])
+
+    async def test_startup_cancels_a_pending_entry_on_the_opposite_side(self):
+        exchange = RecordingExchange()
+        engine = self.engine(exchange)
+        engine.pending_orders["L:S"] = {
+            "id": "o1", "leader": "L", "symbol": "S", "side": "buy",
+            "amount": 100.0, "price": 0.99, "filled": 0.0, "created_at": 0,
+        }
+
+        await engine.process("L", {"S": Position("S", -100, 1)})
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [("o1", "S")])
+        self.assertEqual(exchange.orders, [("S", "sell", 100.0, "market", False)])
+
+    async def test_startup_replaces_an_oversized_pending_entry(self):
+        exchange = RecordingExchange()
+        engine = self.engine(exchange)
+        engine.pending_orders["L:S"] = {
+            "id": "o1", "leader": "L", "symbol": "S", "side": "buy",
+            "amount": 200.0, "price": 0.99, "filled": 0.0, "created_at": 0,
+        }
+
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [("o1", "S")])
+        self.assertEqual(exchange.orders, [("S", "buy", 100.0, "market", False)])
+
+    async def test_startup_does_not_keep_a_stale_pending_record(self):
+        exchange = FillAwareExchange()
+        engine = self.engine(exchange)
+        engine.pending_orders["L:S"] = {
+            "id": "o1", "leader": "L", "symbol": "S", "side": "buy",
+            "amount": 100.0, "price": 0.99, "filled": 0.0, "created_at": 0,
+        }
+        exchange.order_states["o1"] = {
+            "status": "gone", "filled": 0.0, "remaining": 0.0,
+            "average": None, "price": 0.99, "side": "buy",
+        }
+
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        self.assertNotIn("L:S", engine.pending_orders)
+        self.assertEqual(exchange.cancelled, [("o1", "S")])
+        self.assertEqual(exchange.orders, [("S", "buy", 100.0, "market", False)])
 
     async def test_reconcile_keeps_owner_while_limit_is_working(self):
         exchange = RecordingExchange()
@@ -118,6 +345,25 @@ class PendingOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("__default__:S", engine.owners)
         self.assertIn("L:S", engine.pending_orders)
         self.assertEqual(exchange.cancelled, [])
+
+
+class NotificationIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_notification_failure_does_not_block_baseline_commit(self):
+        class ExplodingNotifier:
+            async def notify_skipped(self, *args, **kwargs):
+                raise RuntimeError("telegram down")
+
+        exchange = RecordingExchange()
+        cfg = {"total_margin": 100, "symbol_blacklist": ["S"]}
+        engine = Engine(exchange, {"L": cfg}, notifier=ExplodingNotifier())
+
+        await engine.process("L", {})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+
+        # The skip must still commit the new leader baseline; otherwise the
+        # same signal is regenerated and retried forever.
+        self.assertIn("S", engine.previous["L"])
+        self.assertEqual(exchange.orders, [])
 
 
 class HardStopTests(unittest.IsolatedAsyncioTestCase):
@@ -134,14 +380,37 @@ class HardStopTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(engine.risk.flattened)
         self.assertEqual(exchange.close_calls, 1)
         self.assertEqual(notifier.stops, 1)
+        self.assertEqual(len(notifier.errors), 1)
+        self.assertEqual(notifier.recoveries, 0)
 
         self.assertTrue(await engine.check_hard_stop())
         self.assertTrue(engine.risk.flattened)
         self.assertEqual(exchange.close_calls, 2)
         self.assertEqual(notifier.stops, 1)
+        self.assertEqual(len(notifier.errors), 1)
+        self.assertEqual(notifier.recoveries, 1)
 
         self.assertTrue(await engine.check_hard_stop())
         self.assertEqual(exchange.close_calls, 2)
+        self.assertEqual(notifier.recoveries, 1)
+
+    async def test_flatten_failure_alert_is_sent_once_per_episode(self):
+        exchange = HardStopExchange()
+        notifier = Notifier()
+        engine = Engine(exchange, {"L": {"total_margin": 100}}, notifier=notifier)
+        self.assertFalse(await engine.check_hard_stop())  # establishes baseline
+
+        exchange.equity_value = 80
+        exchange.fail_closes = 3
+        await engine.check_hard_stop()
+        await engine.check_hard_stop()
+        await engine.check_hard_stop()
+        self.assertEqual(len(notifier.errors), 1)
+        self.assertEqual(notifier.recoveries, 0)
+
+        await engine.check_hard_stop()  # fourth close attempt succeeds
+        self.assertEqual(len(notifier.errors), 1)
+        self.assertEqual(notifier.recoveries, 1)
 
     async def test_locked_state_blocks_new_exposure_without_paused(self):
         exchange = RecordingExchange()

@@ -1,21 +1,20 @@
 [Unit]
-Description=HL copy-trading service
+Description=Hyperliquid copy-trading service
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=yhr
-Group=yhr
 WorkingDirectory=/home/yhr/hyper
+UMask=0077
+ExecStartPre=/home/yhr/hyper/.venv/bin/python /home/yhr/hyper/validate.py /home/yhr/hyper/config/config.yaml
 ExecStart=/home/yhr/hyper/.venv/bin/python /home/yhr/hyper/main.py --config /home/yhr/hyper/config/config.yaml
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 Environment=PYTHONUNBUFFERED=1
-# Telegram is not reachable directly from this host; route through the local proxy.
-Environment=HTTPS_PROXY=http://127.0.0.1:10808
-Environment=HTTP_PROXY=http://127.0.0.1:10808
-Environment=NO_PROXY=127.0.0.1,localhost
+# The live deployment keeps a drop-in
+# (copy.service.d/*.conf) that sets Restart=always and OOMScoreAdjust;
+# do not remove it when updating this unit.
 
 [Install]
 WantedBy=multi-user.target

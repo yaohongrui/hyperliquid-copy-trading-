@@ -10,6 +10,11 @@ from .report_image import render_report
 
 log = logging.getLogger(__name__)
 
+# Notification sends must never stall the trading hot path.  The session keeps
+# its longer timeout for getUpdates long polling, while a single send gets a
+# short, independent deadline.
+_SEND_TIMEOUT = aiohttp.ClientTimeout(total=5)
+
 
 class TelegramManager:
     """Small Telegram Bot API long-polling client for the control commands."""
@@ -95,7 +100,7 @@ class TelegramManager:
             ("Account", self.account_name),
             ("New entries", "PAUSED" if self.engine.paused else "ENABLED"),
             ("Hard stop", "LOCKED" if self.engine.risk.locked else "OK"),
-            ("Stop loss", self._stop_loss_text()),
+            ("Hard stop limit", self._stop_loss_text()),
             ("Account equity", await self._equity_text()),
         ])
 
@@ -106,7 +111,7 @@ class TelegramManager:
             f"Account: {self.account_name}",
             f"New entries: {'PAUSED' if self.engine.paused else 'ENABLED'}",
             f"Hard stop: {'LOCKED' if self.engine.risk.locked else 'OK'}",
-            f"Stop loss: {self._stop_loss_text()}",
+            f"Hard stop limit: {self._stop_loss_text()}",
             f"Account equity: {equity}",
         ])
 
@@ -149,9 +154,10 @@ class TelegramManager:
             return await self.send_photo("LEADER POSITIONS", body)
         return False
 
-    async def _request(self, session, method, data=None, **params):
+    async def _request(self, session, method, data=None, request_timeout=None, **params):
         request_data = data if data is not None else params
-        async with session.post(f"{self._api_url}/{method}", data=request_data) as response:
+        async with session.post(
+                f"{self._api_url}/{method}", data=request_data, timeout=request_timeout) as response:
             response.raise_for_status()
             payload = await response.json()
             if not payload.get("ok"):
@@ -164,7 +170,7 @@ class TelegramManager:
             return False
         try:
             await self._request(self.session, "sendMessage", chat_id=self.chat_id,
-                                text=text, parse_mode="HTML")
+                                text=text, parse_mode="HTML", request_timeout=_SEND_TIMEOUT)
             return True
         except asyncio.CancelledError:
             raise
@@ -180,7 +186,7 @@ class TelegramManager:
             form.add_field("chat_id", self.chat_id)
             form.add_field("photo", render_report(title, body), filename="report.png", content_type="image/png")
             form.add_field("caption", title)
-            await self._request(self.session, "sendPhoto", data=form)
+            await self._request(self.session, "sendPhoto", data=form, request_timeout=_SEND_TIMEOUT)
             return True
         except asyncio.CancelledError:
             raise
@@ -196,13 +202,27 @@ class TelegramManager:
         return str(value)
 
     @classmethod
-    def _event_message(cls, title, fields, reason=None):
+    def _event_message(cls, title, fields, reason=None, reason_label="Reason"):
         lines = [f"<b>{escape(title)}</b>", "<i>━━━━━━━━━━━━</i>"]
         for label, value in fields:
             lines.append(f"<b>{escape(label)}</b>: {escape(cls._value(value))}")
         if reason is not None:
-            lines.extend(("", f"<b>Reason</b>: {escape(str(reason)[:300])}"))
+            lines.extend(("", f"<b>{escape(reason_label)}</b>: {escape(str(reason)[:300])}"))
         return "\n".join(lines)
+
+    _ORDER_STATUS = {
+        "open": "OPEN — resting, not filled",
+        "closed": "FILLED",
+        "canceled": "CANCELLED",
+        "cancelled": "CANCELLED",
+        "expired": "EXPIRED",
+        "rejected": "REJECTED",
+    }
+
+    @classmethod
+    def _order_status(cls, status):
+        text = str(status or "").lower()
+        return cls._ORDER_STATUS.get(text, text.upper() or "UNKNOWN")
 
     @staticmethod
     def _order_side(signal, order=None):
@@ -212,48 +232,154 @@ class TelegramManager:
             return str(side).upper()
         return "BUY" if signal.delta > 0 else "SELL"
 
-    @classmethod
-    def _trade_fields(cls, leader, signal, order=None):
+    def _trade_fields(self, leader, signal, order=None):
         return [
+            ("Account", self.account_name),
             ("Leader", leader),
             ("Symbol", signal.symbol),
-            ("Position direction", signal.side.upper()),
-            ("Order direction", cls._order_side(signal, order)),
-            ("Action", signal.kind.upper()),
+            ("Leader position", signal.side.upper()),
+            ("Order side", self._order_side(signal, order)),
+            ("Signal", signal.kind.upper()),
         ]
 
-    async def notify_filled(self, leader, signal, order):
-        kind = {"open": "OPEN", "increase": "INCREASE", "decrease": "DECREASE", "close": "CLOSE"}.get(signal.kind, signal.kind.upper())
-        price = getattr(order, "price", None)
+    async def notify_filled(self, leader, signal, order, order_type=None):
         fields = self._trade_fields(leader, signal, order)
-        fields[-1] = ("Action", kind)
+        if order_type:
+            fields.append(("Order type", str(order_type).upper()))
         fields.append(("Filled qty", abs(order.amount)))
+        price = getattr(order, "price", None)
         if price is not None:
-            fields.append(("Avg price", price))
-        await self.send(self._event_message("✅ ORDER FILLED", fields))
+            fields.append(("Avg fill price", price))
+        return await self.send(self._event_message("✅ ORDER FILLED", fields))
 
     async def notify_failed(self, leader, signal, exc):
-        await self.send(self._event_message("❌ ORDER FAILED", self._trade_fields(leader, signal), reason=exc))
+        return await self.send(self._event_message(
+            "❌ ORDER FAILED",
+            self._trade_fields(leader, signal),
+            reason=exc,
+            reason_label="Error",
+        ))
 
     async def notify_skipped(self, leader, signal, reason):
-        await self.send(self._event_message("⏭️ ORDER SKIPPED", self._trade_fields(leader, signal), reason=reason))
+        return await self.send(self._event_message(
+            "⏭️ SIGNAL SKIPPED", self._trade_fields(leader, signal), reason=reason,
+        ))
+
+    async def notify_source_failed(self, leader, exc):
+        return await self.send(self._event_message(
+            "⚠️ LEADER SOURCE FAILED",
+            [
+                ("Leader", leader),
+                ("Impact", "No new signals from this leader; existing positions are unchanged"),
+            ],
+            reason=exc,
+            reason_label="Error",
+        ))
 
     async def notify_hard_stop(self, equity, baseline, loss):
-        await self.send(self._event_message("🛑 HARD STOP TRIGGERED", [
+        return await self.send(self._event_message("🛑 HARD STOP TRIGGERED", [
             ("Account", self.account_name),
             ("Mode", self.mode),
             ("Account equity", f"{self._value(float(equity))} USDT"),
             ("Day baseline", f"{self._value(float(baseline))} USDT"),
             ("Daily loss", f"{self._value(float(loss))} USDT"),
             ("Limit", self._stop_loss_text()),
-            ("Action", "All positions closed; new entries paused"),
-        ], reason="Send /unlock_hard_stop to reset the daily baseline and resume entries."))
+            ("Action", "New entries paused; all positions are being flattened"),
+        ], reason="Send /unlock_hard_stop in the main control chat to reset the daily baseline and resume entries.",
+           reason_label="Next step"))
 
-    async def notify_accepted(self, leader, signal, order):
+    async def notify_accepted(self, leader, signal, order, order_type=None):
         """Notify when an exchange accepts an order that is not filled yet."""
-        await self.send(self._event_message("🕒 ORDER ACCEPTED", self._trade_fields(leader, signal, order) + [
-            ("Order", order.id),
-            ("Status", order.status.upper()),
+        fields = self._trade_fields(leader, signal, order)
+        if order_type:
+            fields.append(("Order type", str(order_type).upper()))
+        fields.extend([
+            ("Order ID", order.id),
+            ("Order status", self._order_status(order.status)),
+        ])
+        price = getattr(order, "price", None)
+        if price is not None:
+            price_label = "Limit price" if str(order_type or "").lower() == "limit" else "Order price"
+            fields.append((price_label, price))
+        if getattr(signal, "price", 0):
+            fields.append(("Market at signal", signal.price))
+        return await self.send(self._event_message(
+            "🕒 ORDER RESTING (UNFILLED)",
+            fields,
+            reason=("Stays on the book until filled; the leader's close/reduce "
+                    "or a new open signal cancels it."),
+            reason_label="Note",
+        ))
+
+    async def notify_limit_filled(self, leader, symbol, entry, filled, price, remaining=0.0):
+        """Notify that a resting limit entry filled (fully or partially)."""
+        remaining = max(0.0, float(remaining or 0))
+        full = remaining <= 1e-12
+        title = "✅ LIMIT ORDER FILLED" if full else "🟡 LIMIT ORDER PARTIALLY FILLED"
+        fields = [
+            ("Account", self.account_name),
+            ("Leader", leader),
+            ("Symbol", symbol),
+            ("Order side", str(entry.get("side") or "").upper()),
+            ("Filled qty", abs(float(filled or 0))),
+        ]
+        if not full:
+            fields.append(("Remaining qty", remaining))
+        if price is not None:
+            fields.append(("Avg fill price", price))
+        if entry.get("price") is not None:
+            fields.append(("Limit price", entry.get("price")))
+        fields.append(("Order ID", entry.get("id")))
+        return await self.send(self._event_message(
+            title,
+            fields,
+            reason=None if full else "The rest of the order is still resting.",
+            reason_label="Note",
+        ))
+
+    async def notify_cancelled(self, leader, symbol, entry, reason):
+        """Notify that a resting entry was cancelled without filling."""
+        order_qty = abs(float(entry.get("amount") or 0))
+        filled = abs(float(entry.get("filled") or 0))
+        title = ("🚫 ORDER CANCELLED (PARTIALLY FILLED)"
+                 if filled > 0 else "🚫 UNFILLED ORDER CANCELLED")
+        fields = [
+            ("Account", self.account_name),
+            ("Leader", leader),
+            ("Symbol", symbol),
+            ("Order side", str(entry.get("side") or "").upper()),
+            ("Order qty", order_qty),
+        ]
+        if filled > 0:
+            fields.extend([
+                ("Filled qty", filled),
+                ("Remaining qty", max(0.0, order_qty - filled)),
+            ])
+        fields.append(("Order ID", entry.get("id")))
+        return await self.send(self._event_message(title, fields, reason=reason))
+
+    async def notify_breakeven(self, leader, symbol, profit, trigger):
+        return await self.send(self._event_message("🛡️ AUTO BREAKEVEN", [
+            ("Account", self.account_name),
+            ("Leader", leader),
+            ("Symbol", symbol),
+            ("Unrealized profit", f"{self._value(float(profit))} USDT"),
+            ("Stop moved to", self._value(float(trigger))),
+        ], reason="Native stop moved to the position entry price.", reason_label="Note"))
+
+    async def notify_hard_stop_error(self, equity, exc):
+        return await self.send(self._event_message("❌ HARD STOP FLATTEN FAILED", [
+            ("Account", self.account_name),
+            ("Mode", self.mode),
+            ("Account equity", f"{self._value(float(equity))} USDT"),
+            ("Action", "Retrying every 5 seconds"),
+        ], reason=exc, reason_label="Error"))
+
+    async def notify_hard_stop_recovered(self, equity):
+        return await self.send(self._event_message("✅ HARD STOP FLATTEN RECOVERED", [
+            ("Account", self.account_name),
+            ("Mode", self.mode),
+            ("Account equity", f"{self._value(float(equity))} USDT"),
         ]))
 
     async def run(self):
@@ -262,7 +388,7 @@ class TelegramManager:
 
         timeout = aiohttp.ClientTimeout(total=self.polling_timeout + 10)
         offset = None
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             self.session = session
             # Avoid replaying old commands every time the service restarts.
             while not self._stop.is_set() and offset is None:
@@ -343,3 +469,106 @@ class TelegramManager:
                         pass
             await self.send("<b>SYSTEM STOPPED</b>")
             self.session = None
+
+    async def run_sender(self, probe_text=None):
+        """Run an outbound-only bot for high-priority alerts.
+
+        No ``getUpdates`` polling: the alert channel is write-only and must
+        never compete with the control bot for commands.
+        """
+        if not self.token or not self.chat_id:
+            raise ValueError("Telegram bot token and chat id are required")
+
+        timeout = aiohttp.ClientTimeout(total=self.polling_timeout + 10)
+        while not self._stop.is_set():
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    self.session = session
+                    try:
+                        if probe_text:
+                            await self.send(probe_text)
+                        await self._stop.wait()
+                    finally:
+                        self.session = None
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "Telegram alert sender failed (%s); retrying in 5 seconds",
+                    type(exc).__name__,
+                )
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
+
+
+class RoutingNotifier:
+    """Split notifications between the trading chat and a critical-alert bot.
+
+    Fills and skips are noise the operator can mute; hard stops and failures
+    must reach the high-priority channel.  If the alert channel cannot be
+    reached, critical messages fall back to the normal chat instead of being
+    lost.
+    """
+
+    def __init__(self, normal=None, alerts=None):
+        self.normal = normal
+        self.alerts = alerts
+
+    @staticmethod
+    async def _call(target, method, args, kwargs):
+        handler = getattr(target, method, None) if target is not None else None
+        if handler is None:
+            return False
+        result = await handler(*args, **kwargs)
+        # Existing notifiers return nothing on success; treat that as delivered.
+        return True if result is None else bool(result)
+
+    async def _normal_call(self, method, *args, **kwargs):
+        return await self._call(self.normal, method, args, kwargs)
+
+    async def _alert_call(self, method, *args, **kwargs):
+        if await self._call(self.alerts, method, args, kwargs):
+            return True
+        return await self._call(self.normal, method, args, kwargs)
+
+    async def notify_filled(self, *args, **kwargs):
+        return await self._normal_call("notify_filled", *args, **kwargs)
+
+    async def notify_accepted(self, *args, **kwargs):
+        return await self._normal_call("notify_accepted", *args, **kwargs)
+
+    async def notify_cancelled(self, *args, **kwargs):
+        return await self._normal_call("notify_cancelled", *args, **kwargs)
+
+    async def notify_limit_filled(self, *args, **kwargs):
+        return await self._normal_call("notify_limit_filled", *args, **kwargs)
+
+    async def notify_skipped(self, *args, **kwargs):
+        return await self._normal_call("notify_skipped", *args, **kwargs)
+
+    async def notify_breakeven(self, *args, **kwargs):
+        return await self._normal_call("notify_breakeven", *args, **kwargs)
+
+    async def notify_failed(self, *args, **kwargs):
+        return await self._alert_call("notify_failed", *args, **kwargs)
+
+    async def notify_source_failed(self, *args, **kwargs):
+        return await self._alert_call("notify_source_failed", *args, **kwargs)
+
+    async def notify_hard_stop(self, *args, **kwargs):
+        return await self._alert_call("notify_hard_stop", *args, **kwargs)
+
+    async def notify_hard_stop_error(self, *args, **kwargs):
+        return await self._alert_call("notify_hard_stop_error", *args, **kwargs)
+
+    async def notify_hard_stop_recovered(self, *args, **kwargs):
+        return await self._alert_call("notify_hard_stop_recovered", *args, **kwargs)
+
+    def __getattr__(self, name):
+        for target in (self.__dict__.get("normal"), self.__dict__.get("alerts")):
+            if target is not None and hasattr(target, name):
+                return getattr(target, name)
+        raise AttributeError(name)

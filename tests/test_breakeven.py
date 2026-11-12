@@ -2,7 +2,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from api.console import ConsoleService
 from core.engine import Engine
+from core.symbols import SymbolMap
 from state.store import StateStore
 
 
@@ -98,6 +103,25 @@ class BreakevenTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(exchange.set_calls[-1], ("BTC", "sell", 1.0, 100.0))
 
+    async def test_configured_stop_follows_add_and_reduce(self):
+        exchange = BreakevenExchange(entry=100, mark=101, contracts=2)
+        engine = self.engine(exchange, {"enabled": True, "max_loss_usdt": 10})
+
+        await engine.reconcile_protections()
+        self.assertEqual(exchange.set_calls[-1], ("BTC", "sell", 2.0, 95.0))
+
+        # The leader adds: the same dollar cap is spread over more contracts,
+        # so the stop moves closer to entry and must be replaced.
+        exchange.contracts = 4
+        exchange.entry = 101
+        await engine.reconcile_protections()
+        self.assertEqual(exchange.set_calls[-1], ("BTC", "sell", 4.0, 98.5))
+
+        # A partial close widens the per-contract distance again.
+        exchange.contracts = 1
+        await engine.reconcile_protections()
+        self.assertEqual(exchange.set_calls[-1], ("BTC", "sell", 1.0, 91.0))
+
     async def test_clear_restores_the_configured_stop_loss(self):
         exchange = BreakevenExchange()
         engine = self.engine(exchange, {"enabled": True, "max_loss_usdt": 10})
@@ -128,6 +152,107 @@ class BreakevenTests(unittest.IsolatedAsyncioTestCase):
             restarted = Engine(exchange, {"L": {"total_margin": 100}}, state_store=store)
 
             self.assertTrue(restarted.breakeven["__default__:BTC"])
+
+    async def test_invalid_replacement_keeps_the_existing_breakeven_stop(self):
+        exchange = BreakevenExchange(entry=100, mark=110, contracts=2)
+        engine = self.engine(exchange)
+        await engine.set_breakeven("L", "BTC")
+        exchange.cancel_calls.clear()
+        exchange.cancel_orders_calls.clear()
+        # The leader adds at a higher price: the new average entry (112) is
+        # above the mark (109), so an entry-priced stop would fire instantly.
+        exchange.entry = 112
+        exchange.mark = 109
+        await engine.reconcile_protections()
+
+        self.assertEqual(exchange.set_calls, [("BTC", "sell", 2.0, 100.0)])
+        self.assertEqual(exchange.cancel_calls, [])
+        self.assertEqual(exchange.cancel_orders_calls, [])
+        self.assertEqual(
+            engine.runtime_state["protection"]["__default__:BTC"]["trigger"], 100.0)
+
+    async def test_invalid_replacement_rebuilds_old_trigger_at_new_size(self):
+        exchange = BreakevenExchange(entry=100, mark=110, contracts=2)
+        engine = self.engine(exchange)
+        await engine.set_breakeven("L", "BTC")
+
+        exchange.entry = 112
+        exchange.mark = 109
+        exchange.contracts = 4
+        await engine.reconcile_protections()
+
+        # Gate stops carry a contract count; the old trigger must be re-placed
+        # with the new size so the add stays covered.
+        self.assertEqual(exchange.set_calls[-1], ("BTC", "sell", 4.0, 100.0))
+        self.assertEqual(
+            engine.runtime_state["protection"]["__default__:BTC"],
+            {"id": "p1", "contracts": 4.0, "trigger": 100.0},
+        )
+
+    async def test_clear_breakeven_still_cancels_an_invalid_replacement(self):
+        exchange = BreakevenExchange(entry=100, mark=110, contracts=2)
+        engine = self.engine(exchange, {"enabled": True, "max_loss_usdt": 10})
+        await engine.set_breakeven("L", "BTC")
+
+        exchange.entry = 112
+        exchange.mark = 109
+        exchange.contracts = 4
+        await engine.clear_breakeven("L", "BTC")
+
+        self.assertNotIn("__default__:BTC", engine.breakeven)
+        self.assertIn("BTC", [call[0] for call in exchange.cancel_orders_calls])
+
+
+class ConsoleEngine:
+    def __init__(self):
+        self.symbol_map = SymbolMap({"XYZ:AMD": "AMD/USDT:USDT"})
+        self.owners = {"hl:XYZ:AMD": "L"}
+        self.breakeven = {}
+        self.calls = []
+
+    async def set_breakeven(self, leader, symbol):
+        self.calls.append(("set", leader, symbol))
+        self.breakeven[f"hl:{symbol}"] = True
+        return 2.5
+
+    async def clear_breakeven(self, leader, symbol):
+        self.calls.append(("clear", leader, symbol))
+        self.breakeven.pop(f"hl:{symbol}", None)
+        return True
+
+
+class ConsoleBreakevenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_endpoint_maps_the_displayed_symbol_back_to_the_engine(self):
+        engine = ConsoleEngine()
+        with tempfile.TemporaryDirectory() as directory:
+            service = ConsoleService(engine, {}, str(Path(directory) / "console.sqlite3"))
+            app = web.Application()
+            app.router.add_post("/api/v1/positions/breakeven", service.breakeven)
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post(
+                    "/api/v1/positions/breakeven", json={"symbol": "XYZ:AMD", "enabled": True})
+                body = await response.json()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body["trigger"], 2.5)
+        self.assertEqual(engine.calls, [("set", "L", "XYZ:AMD")])
+
+    async def test_endpoint_returns_400_when_the_engine_rejects_the_request(self):
+        class RejectingEngine(ConsoleEngine):
+            async def set_breakeven(self, leader, symbol):
+                raise ValueError("position is not in profit")
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = ConsoleService(RejectingEngine(), {}, str(Path(directory) / "console.sqlite3"))
+            app = web.Application()
+            app.router.add_post("/api/v1/positions/breakeven", service.breakeven)
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post(
+                    "/api/v1/positions/breakeven", json={"symbol": "XYZ:AMD", "enabled": True})
+                text = await response.text()
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(text, "position is not in profit")
 
 
 if __name__ == "__main__":

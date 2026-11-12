@@ -11,7 +11,9 @@ list of dex names is passed in; ``_connect`` discovers that list from
 """
 
 import asyncio
+import functools
 import logging
+import threading
 import time
 
 from eth_account import Account
@@ -58,16 +60,44 @@ def _order_gone(exc):
     return any(token in message for token in _ORDER_GONE_TOKENS)
 
 
+def _serialized(method):
+    """Serialize a synchronous SDK call on the adapter's re-entrant lock.
+
+    ``requests.Session`` is not safe to use from several threads at once, and
+    the Console refreshes performance data while the engine trades.  Every
+    blocking SDK entry point therefore takes the same lock; it is an ``RLock``
+    so nested helpers (e.g. cancel -> open orders) can re-enter.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class HyperliquidExchange:
     """Minimal order/position adapter backed by the official Hyperliquid SDK."""
 
     def __init__(self, config, symbol_map=None):
+        self.name = "hyperliquid"
         self.config = config or {}
         self.symbol_map = symbol_map if isinstance(symbol_map, SymbolMap) else SymbolMap(symbol_map)
         self.base_url = TESTNET_API_URL if self.config.get("testnet") else MAINNET_API_URL
         self.account_address = _address(self.config.get("account_address"))
         self.private_key = self.config.get("api_private_key") or self.config.get("secret_key")
         self.slippage = float(self.config.get("slippage", 0.05) or 0.05)
+        self.request_timeout = float(self.config.get("request_timeout_seconds", 10) or 10)
+        self.performance_page_size = int(self.config.get("performance_page_size", 2000) or 2000)
+        flow_types = (
+            self.config.get("cash_flow_types")
+            or self.config.get("performance_cash_flow_types")
+            or ("deposit", "withdraw", "send", "receive", "internalTransfer",
+                "spotTransfer", "vaultDeposit", "vaultWithdraw")
+        )
+        if isinstance(flow_types, str):
+            flow_types = (flow_types,)
+        self.cash_flow_types = tuple(str(item).lower() for item in flow_types)
+        self._lock = threading.RLock()
         self.info = None
         self.client = None
         self.address = None
@@ -89,6 +119,7 @@ class HyperliquidExchange:
         # ``skip_ws=True``, so there is nothing to tear down.
         return None
 
+    @_serialized
     def _connect(self):
         if not self.private_key:
             raise RuntimeError("api_private_key is required for Hyperliquid execution")
@@ -97,17 +128,20 @@ class HyperliquidExchange:
 
         # The default Info only knows the original dex; ask for the full list
         # of builder-deployed dexes so their assets are registered too.
-        bootstrap = Info(self.base_url, skip_ws=True)
+        bootstrap = Info(self.base_url, skip_ws=True, timeout=self.request_timeout)
         raw = bootstrap.perp_dexs() or []
         hip3 = [item["name"] for item in raw[1:] if item and item.get("name")]
         self.dexes = [""] + hip3
 
-        self.info = Info(self.base_url, skip_ws=True, perp_dexs=self.dexes)
+        self.info = Info(
+            self.base_url, skip_ws=True, perp_dexs=self.dexes, timeout=self.request_timeout,
+        )
         self.client = Exchange(
             wallet,
             base_url=self.base_url,
             account_address=self.account_address,
             perp_dexs=self.dexes,
+            timeout=self.request_timeout,
         )
         self._coins = {name.upper(): name for name in self.info.coin_to_asset}
         try:
@@ -169,6 +203,7 @@ class HyperliquidExchange:
     def _dex(coin):
         return coin.split(":")[0] if ":" in coin else ""
 
+    @_serialized
     def _mark_price(self, coin):
         mids = self.info.all_mids(self._dex(coin)) or {}
         value = mids.get(coin)
@@ -188,6 +223,7 @@ class HyperliquidExchange:
             raise ValueError("; ".join(errors))
 
     # -- account reads -----------------------------------------------------
+    @_serialized
     def _positions_for_dex(self, dex):
         state = self.info.user_state(self.address, dex)
         rows = []
@@ -246,6 +282,7 @@ class HyperliquidExchange:
     async def entry_quote(self, symbol, side):
         return await asyncio.to_thread(self._mark_price, self._coin(symbol))
 
+    @_serialized
     def _fetch_open_orders(self):
         rows = []
         for dex in self.dexes:
@@ -276,6 +313,7 @@ class HyperliquidExchange:
     async def fetch_open_orders(self):
         return await asyncio.to_thread(self._fetch_open_orders)
 
+    @_serialized
     def _equity(self):
         # The default dex is authoritative; HIP-3 dexes keep separate margin,
         # so sum them for a whole-account view.
@@ -306,7 +344,246 @@ class HyperliquidExchange:
     async def equity(self):
         return await asyncio.to_thread(self._equity)
 
+    # -- performance / ledger reads ---------------------------------------
+    @staticmethod
+    def _to_ms(value):
+        """Normalize a seconds-or-milliseconds timestamp to milliseconds."""
+        number = float(value)
+        return int(number * 1000) if abs(number) < 1e11 else int(number)
+
+    def _window(self, since, until, lookback_days):
+        """Resolve the requested range to (start_ms, end_ms, backfill)."""
+        now_ms = int(time.time() * 1000)
+        end_ms = self._to_ms(until) if until is not None else now_ms
+        backfill = since is None
+        if backfill:
+            days = float(lookback_days or 0) or 30.0
+            start_ms = end_ms - int(days * 86400 * 1000)
+        else:
+            start_ms = self._to_ms(since)
+        if start_ms >= end_ms:
+            start_ms = end_ms - 86400 * 1000
+        return start_ms, end_ms, backfill
+
+    @staticmethod
+    def _windows(start_ms, end_ms, backfill):
+        """Split a backfill into day-sized chunks; incremental keeps one window."""
+        if not backfill:
+            return [(start_ms, end_ms)]
+        day = 86400 * 1000
+        windows = []
+        cursor = start_ms
+        while cursor < end_ms:
+            following = min(cursor + day, end_ms)
+            windows.append((cursor, following))
+            cursor = following
+        return windows or [(start_ms, end_ms)]
+
+    @staticmethod
+    def _raw_key(row):
+        tid = row.get("tid")
+        if tid not in (None, ""):
+            return f"tid:{tid}"
+        delta = row.get("delta")
+        if not isinstance(delta, dict):
+            delta = {}
+        if "closedPnl" in row or row.get("oid") is not None:
+            return "time:{0}:coin:{1}:oid:{2}".format(
+                row.get("time"), row.get("coin"), row.get("oid"))
+        # Funding/ledger hashes are frequently all zeros, so the hash alone
+        # cannot identify a row: include the time and the delta payload too.
+        coin = row.get("coin") or delta.get("coin")
+        kind = delta.get("type") or row.get("type")
+        amount = delta.get("usdc")
+        if amount is None:
+            amount = delta.get("ustd")
+        if amount is None:
+            amount = delta.get("amount")
+        return "hash:{0}:type:{1}:time:{2}:coin:{3}:amount:{4}".format(
+            row.get("hash"), kind, row.get("time"), coin, amount)
+
+    @_serialized
+    def _paged(self, fetch, start_ms, end_ms, page_size=2000, min_window_ms=60000):
+        """Fetch a window, bisecting it when the venue's page cap is reached."""
+        if end_ms <= start_ms:
+            return []
+        rows = list(fetch(start_ms, end_ms) or [])
+        if len(rows) >= page_size and (end_ms - start_ms) > min_window_ms:
+            middle = (start_ms + end_ms) // 2
+            rows = (
+                self._paged(fetch, start_ms, middle, page_size, min_window_ms)
+                + self._paged(fetch, middle, end_ms, page_size, min_window_ms)
+            )
+        deduped = {}
+        for row in rows:
+            deduped.setdefault(self._raw_key(row), row)
+        return sorted(deduped.values(), key=lambda item: _float(item.get("time")))
+
+    def _fills_fetch(self, start_ms, end_ms):
+        return self.info.user_fills_by_time(
+            self.address, start_ms, end_ms, aggregate_by_time=False)
+
+    def _funding_fetch(self, start_ms, end_ms):
+        return self.info.user_funding_history(self.address, start_ms, end_ms)
+
+    def _ledger_fetch(self, start_ms, end_ms):
+        return self.info.user_non_funding_ledger_updates(self.address, start_ms, end_ms)
+
+    @staticmethod
+    def _fill_row(raw):
+        tid = raw.get("tid")
+        if tid is not None:
+            row_id = f"hl:fill:{tid}"
+        else:
+            row_id = "hl:fill:{0}:{1}:{2}:{3}".format(
+                raw.get("hash"), raw.get("oid"), raw.get("time"), raw.get("coin"))
+        oid = raw.get("oid")
+        return {
+            "id": row_id,
+            "symbol": raw.get("coin"),
+            "side": "buy" if str(raw.get("side")).upper() == "B" else "sell",
+            "amount": _float(raw.get("sz")),
+            "price": _float(raw.get("px")),
+            "realizedPnl": _float(raw.get("closedPnl")),
+            "fee": _float(raw.get("fee")),
+            "funding": 0.0,
+            "order_id": str(oid) if oid is not None else None,
+            "source": "hl_fill",
+            "timestamp": _float(raw.get("time")) / 1000.0,
+        }
+
+    @staticmethod
+    def _funding_row(raw):
+        delta = raw.get("delta") or {}
+        coin = raw.get("coin") or delta.get("coin")
+        amount = _float(delta.get("usdc"))
+        # ``hash`` is often all zeros; always append time/coin/amount so each
+        # payment stays distinct (and survives _paged dedupe).
+        identifier = "{0}:{1}:{2}:{3}".format(
+            raw.get("hash"), coin, raw.get("time"), amount)
+        return {
+            "id": f"hl:funding:{identifier}",
+            "symbol": coin,
+            "side": "",
+            "amount": 0.0,
+            "price": 0.0,
+            "realizedPnl": 0.0,
+            "fee": 0.0,
+            "funding": amount,
+            "order_id": None,
+            "source": "hl_funding",
+            "timestamp": _float(raw.get("time")) / 1000.0,
+        }
+
+    @staticmethod
+    def _ledger_type(raw):
+        delta = raw.get("delta") or {}
+        return str(delta.get("type") or raw.get("type") or "")
+
+    @staticmethod
+    def _cash_flow_row(raw):
+        delta = raw.get("delta") or {}
+        amount = delta.get("usdc")
+        if amount is None:
+            amount = delta.get("ustd")
+        if amount is None:
+            amount = delta.get("amount")
+        amount = _float(amount)
+        # Ledger rows carry ``type`` inside ``delta``, not at the top level.
+        kind = str(delta.get("type") or raw.get("type") or "")
+        if kind.lower() == "withdraw":
+            amount = -abs(amount)
+        # Zero hashes are common; time/type/amount keep distinct entries apart.
+        identifier = "{0}:{1}:{2}:{3}".format(
+            raw.get("hash"), kind, raw.get("time"), amount)
+        return {
+            "id": f"hl:ledger:{identifier}",
+            "kind": kind,
+            "amount": amount,
+            "timestamp": _float(raw.get("time")) / 1000.0,
+        }
+
+    @staticmethod
+    def _dedupe_sorted(rows):
+        deduped = {}
+        for row in rows:
+            deduped.setdefault(row["id"], row)
+        return sorted(deduped.values(), key=lambda item: item["timestamp"])
+
+    async def fetch_performance_rows(self, since=None, until=None, lookback_days=30,
+                                     page_size=None):
+        """Return fills and funding as console trade rows (timestamps in seconds)."""
+        start_ms, end_ms, backfill = self._window(since, until, lookback_days)
+        page_size = int(page_size or self.performance_page_size)
+        fills, funding = [], []
+        for win_start, win_end in self._windows(start_ms, end_ms, backfill):
+            raw_fills = await asyncio.to_thread(
+                self._paged, self._fills_fetch, win_start, win_end, page_size)
+            raw_funding = await asyncio.to_thread(
+                self._paged, self._funding_fetch, win_start, win_end, page_size)
+            # Spot fills have no closedPnl; only perp closes/entries carry it.
+            fills.extend(self._fill_row(item) for item in raw_fills
+                         if "closedPnl" in item)
+            funding.extend(self._funding_row(item) for item in raw_funding)
+            if backfill:
+                await asyncio.sleep(0)
+        return self._dedupe_sorted(fills + funding)
+
+    async def fetch_realized_pnl(self, since=None, until=None, lookback_days=30,
+                                 page_size=None):
+        """Compatibility alias: the Console only knows ``fetch_realized_pnl``."""
+        return await self.fetch_performance_rows(
+            since=since, until=until, lookback_days=lookback_days, page_size=page_size)
+
+    async def fetch_cash_flows(self, since=None, until=None, lookback_days=30,
+                               page_size=None, types=None):
+        """Return deposit/withdraw ledger rows (timestamps in seconds)."""
+        allowed = {str(item).lower() for item in (types or self.cash_flow_types)}
+        start_ms, end_ms, backfill = self._window(since, until, lookback_days)
+        page_size = int(page_size or self.performance_page_size)
+        rows = []
+        for win_start, win_end in self._windows(start_ms, end_ms, backfill):
+            raw_rows = await asyncio.to_thread(
+                self._paged, self._ledger_fetch, win_start, win_end, page_size)
+            rows.extend(self._cash_flow_row(item) for item in raw_rows
+                        if self._ledger_type(item).lower() in allowed)
+            if backfill:
+                await asyncio.sleep(0)
+        return self._dedupe_sorted(rows)
+
+    @_serialized
+    def _fetch_order(self, order_id, symbol=None):
+        raw = self.info.query_order_by_oid(self.address, int(order_id))
+        if not isinstance(raw, dict) or raw.get("status") != "order":
+            return None
+        payload = raw.get("order") or {}
+        order = payload.get("order") or {}
+        status = str(payload.get("status") or order.get("status") or "").lower()
+        # HL reports ``sz`` as the unfilled remainder and ``origSz`` as placed.
+        remaining = max(0.0, _float(order.get("sz")))
+        original = _float(order.get("origSz")) or remaining
+        filled = max(0.0, original - remaining)
+        if status == "filled":
+            filled = filled or original
+            remaining = 0.0
+            normalized = "closed"
+        elif status in ("canceled", "cancelled", "expired", "rejected", "margincanceled"):
+            normalized = "canceled"
+        else:
+            normalized = "open"
+        return {
+            "status": normalized,
+            "filled": filled,
+            "remaining": remaining,
+            "average": _float(order.get("avgPx")) or None,
+            "price": _float(order.get("limitPx")) or None,
+        }
+
+    async def fetch_order(self, order_id, symbol=None):
+        return await asyncio.to_thread(self._fetch_order, order_id, symbol)
+
     # -- orders ------------------------------------------------------------
+    @_serialized
     def _ensure_leverage(self, coin, leverage):
         maximum = self._max_leverage.get(coin.upper()) or 0
         effective = min(int(leverage), maximum) if maximum else int(leverage)
@@ -350,6 +627,7 @@ class HyperliquidExchange:
                     "filled": 0.0, "avgPx": 0.0, "resting": True}
         return {"oid": None, "filled": 0.0, "avgPx": 0.0, "resting": False}
 
+    @_serialized
     def _create_order(self, symbol, side, amount, order_type, price, reduce_only):
         coin = self._coin(symbol)
         size = self._round_size(coin, amount)
@@ -404,6 +682,7 @@ class HyperliquidExchange:
         if errors and not all(_order_gone(message) for message in errors):
             raise RuntimeError("; ".join(errors))
 
+    @_serialized
     def _cancel_order(self, order_id, symbol=None):
         coin = self._coin(symbol) if symbol else None
         if not coin:
@@ -418,6 +697,7 @@ class HyperliquidExchange:
     async def cancel_order(self, order_id, symbol=None):
         await asyncio.to_thread(self._cancel_order, order_id, symbol)
 
+    @_serialized
     def _set_protection(self, symbol, side, amount, trigger_price):
         coin = self._coin(symbol)
         trigger = self._round_price(coin, trigger_price)
@@ -436,6 +716,7 @@ class HyperliquidExchange:
     async def cancel_protection(self, order_id, symbol):
         await self.cancel_order(order_id, symbol)
 
+    @_serialized
     def _cancel_protection_orders(self, symbol, keep_id=None):
         coin = self._coin(symbol)
         for order in self._fetch_open_orders():
@@ -453,6 +734,7 @@ class HyperliquidExchange:
     async def cancel_protection_orders(self, symbol, keep_id=None):
         await asyncio.to_thread(self._cancel_protection_orders, symbol, keep_id)
 
+    @_serialized
     def _cancel_all_orders(self):
         canceled = 0
         for order in self._fetch_open_orders():

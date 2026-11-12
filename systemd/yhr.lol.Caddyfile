@@ -1,0 +1,19 @@
+# Documentation copy of the live Caddy routes for the web console.
+# The console itself listens on 127.0.0.1:8766 only; Caddy terminates TLS.
+yhr.lol {
+	handle /api/v1/* {
+		reverse_proxy 127.0.0.1:8766
+	}
+	handle /static/* {
+		reverse_proxy 127.0.0.1:8766
+	}
+	handle /favicon.ico {
+		reverse_proxy 127.0.0.1:8766
+	}
+	handle_path /trade/* {
+		reverse_proxy 127.0.0.1:8766
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8766
+	}
+}

@@ -16,5 +16,12 @@ def diff_positions(leader: str, previous: dict[str, Position], current: dict[str
         target = nv * coefficient
         delta = target - ov * coefficient
         kind = _kind(ov, nv)
-        if kind != "noop": signals.append(Signal(leader, symbol, kind, delta, target, "long" if nv >= 0 else "short", new.mark_price if new else old.mark_price))
+        if kind != "noop":
+            # For a close (or reversal) the new leader size is zero/opposite,
+            # so report the side that is actually being exited.  Otherwise the
+            # notification would label a closed short as a long.
+            side_size = ov if kind in ("close", "close_reverse") else nv
+            signals.append(Signal(leader, symbol, kind, delta, target,
+                                  "long" if side_size >= 0 else "short",
+                                  new.mark_price if new else old.mark_price))
     return signals
