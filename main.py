@@ -38,7 +38,7 @@ async def main(path):
     dry_run = bool(account.get("dry_run", False))
     symbol_map = SymbolMap(c.get("symbol_map"))
     exchange = DryRunExchange(account, symbol_map) if dry_run else CcxtExchange(account, symbol_map)
-    engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')), symbol_map=symbol_map, auto_breakeven=c.get('auto_breakeven'))
+    engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')), symbol_map=symbol_map, auto_breakeven=c.get('auto_breakeven'), stop_out_cooldown=c.get('stop_out_cooldown_seconds', 600))
     engine.config_manager = ConfigManager(path)
     mode = "dry-run" if dry_run else "LIVE"
     log.info("HL copytrade started in %s mode; leaders=%s account=%s", mode, ",".join(active) or "none", account_name)
@@ -130,7 +130,7 @@ async def main(path):
         # Installs predating the entered map have no record of which symbols were
         # actually filled.  Rebuild it from local fills; otherwise a restart after
         # an exchange-native stop looks like a never-filled entry and re-enters.
-        _seed_entered(engine, console.store)
+        await _seed_entered(engine, console.store)
         # WebSocket updates are change-driven and may not send a restart snapshot.
         # Seed the engine from the official REST state so startup sync is evaluated.
         for name, leader_cfg in enabled_hl.items():
@@ -179,7 +179,15 @@ def _hyperliquid_addresses(leaders):
     ]
 
 
-def _seed_entered(engine, store):
+async def _seed_entered(engine, store):
+    """Rebuild ``entered`` from local fills for symbols we still hold.
+
+    A fill history alone cannot tell whether a position is still open: a
+    reversal near the exchange minimum can close it while the stored fill was
+    recorded as a non-reduce entry.  Seeding ``entered`` for a flat account
+    would make reconciliation mark a false stop-out, so verify the live
+    position first (a failed probe keeps the old conservative behaviour).
+    """
     if not engine.leaders:
         return
     names = list(engine.leaders)
@@ -189,6 +197,12 @@ def _seed_entered(engine, store):
         # Fills of a leader since removed from the config must not resurrect
         # entry bookkeeping for a leader that can no longer receive signals.
         if leader not in engine.leaders:
+            continue
+        try:
+            live = await engine.exchange.position_size(symbol)
+        except Exception:
+            live = None
+        if live is not None and abs(live) <= 1e-12:
             continue
         engine.entered.setdefault(f"{leader}:{symbol}", True)
     engine._save_state()

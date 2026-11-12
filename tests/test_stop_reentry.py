@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -32,6 +33,25 @@ class Exchange:
         self.orders.append((symbol, side, amount, reduce_only))
         self.live += amount if side == 'buy' else -amount
         return Order("1", symbol, side, amount, 1, "closed", reduce_only)
+
+
+class RoundingExchange(Exchange):
+    """Simulates the exchange rounding a net flip down to the order step."""
+
+    def __init__(self, live=0):
+        super().__init__(live)
+        self.round_flip = False
+
+    async def create_order(self, symbol, side, amount, order_type, price, reduce_only):
+        self.orders.append((symbol, side, amount, reduce_only))
+        if self.round_flip:
+            self.round_flip = False
+            filled = abs(self.live)
+            self.live = 0.0
+        else:
+            filled = amount
+            self.live += amount if side == 'buy' else -amount
+        return Order("1", symbol, side, filled, 1, "closed", reduce_only)
 
 
 class StopReentryTests(unittest.IsolatedAsyncioTestCase):
@@ -115,6 +135,41 @@ class StopReentryTests(unittest.IsolatedAsyncioTestCase):
             await restarted.process("L", {"S": Position("S", -25, 1)})
             self.assertNotIn("L:S", restarted.stopped)
 
+    async def test_stop_cooldown_expiry_reenters_flat_account(self):
+        engine = self.engine()
+        await self.open_position(engine)
+        engine.exchange.live = 0
+        await engine.process("L", {"S": Position("S", 110, 1)})
+        self.assertEqual(engine.stopped.get("L:S"), "long")
+
+        # Still inside the cooldown: adds stay suppressed.
+        await engine.process("L", {"S": Position("S", 120, 1)})
+        self.assertEqual(engine.exchange.orders, [("S", "buy", 100, False)])
+
+        # The cooldown expires while the leader keeps holding the same side.
+        # A flat account must be re-aligned to the current target instead of
+        # waiting forever for the leader to close.
+        engine.stopped_at["L:S"] = time.time() - engine.stop_out_cooldown - 1
+        await engine.process("L", {"S": Position("S", 130, 1)})
+        self.assertNotIn("L:S", engine.stopped)
+        self.assertEqual(engine.exchange.orders[-1], ("S", "buy", 130, False))
+        self.assertEqual(engine.exchange.live, 130)
+
+    async def test_reversal_rounded_to_flat_releases_entry_bookkeeping(self):
+        exchange = RoundingExchange(live=0)
+        engine = Engine(exchange, {"L": {"total_margin": 100}})
+        await engine.process("L", {"S": Position("S", 100, 1)})
+        self.assertIn("L:S", engine.entered)
+
+        # The leader reverses, but the exchange rounds the net order down to
+        # exactly our old size, so it only closes and leaves us flat.  That is
+        # not a stop-out and must not leave entry bookkeeping behind.
+        exchange.round_flip = True
+        await engine.process("L", {"S": Position("S", -50, 1)})
+        self.assertEqual(exchange.live, 0)
+        self.assertNotIn("L:S", engine.entered)
+        self.assertNotIn("__default__:S", engine.owners)
+
     async def test_reconcile_marks_stop_and_releases_owner(self):
         engine = self.engine()
         await self.open_position(engine)
@@ -165,10 +220,24 @@ class StopReentryTests(unittest.IsolatedAsyncioTestCase):
                 "account": "acct", "leader": "removed", "order_id": "o2", "symbol": "KORU",
                 "side": "buy", "quantity": 1, "price": 10, "reduce_only": False,
             }])
-            engine = Engine(Exchange(live=0), {"A": {"total_margin": 100, "execution_account": "acct"}})
-            _seed_entered(engine, store)
+            engine = Engine(Exchange(live=1), {"A": {"total_margin": 100, "execution_account": "acct"}})
+            await _seed_entered(engine, store)
             self.assertTrue(engine.entered.get("A:XYZ:SKHX"))
             self.assertNotIn("removed:KORU", engine.entered)
+
+    async def test_seed_entered_skips_symbols_we_no_longer_hold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConsoleStore(Path(directory) / "console.sqlite3")
+            store.insert_local_fills([{
+                "account": "acct", "leader": "A", "order_id": "o1", "symbol": "XYZ:SKHX",
+                "side": "buy", "quantity": 1, "price": 10, "reduce_only": False,
+            }])
+            # The last fill was a non-reduce entry but the account is flat now
+            # (e.g. a reversal rounded down to exactly close).  Seeding it
+            # would make reconciliation report a false stop-out.
+            engine = Engine(Exchange(live=0), {"A": {"total_margin": 100, "execution_account": "acct"}})
+            await _seed_entered(engine, store)
+            self.assertNotIn("A:XYZ:SKHX", engine.entered)
 
 
 if __name__ == "__main__":

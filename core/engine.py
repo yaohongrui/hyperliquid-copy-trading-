@@ -11,7 +11,7 @@ log = logging.getLogger(__name__)
 
 class Engine:
     def __init__(self, exchange, leaders, account_state=None, notifier=None, state_store=None,
-                 symbol_map=None, auto_breakeven=None):
+                 symbol_map=None, auto_breakeven=None, stop_out_cooldown=600):
         self.exchange = exchange
         self.leaders = leaders
         self.state = account_state
@@ -31,10 +31,13 @@ class Engine:
         if state_store:
             self.owners = self.runtime_state.get('symbol_owners', {})
         # Symbols where the account was closed out (native stop, liquidation,
-        # manual close) while the leader still held.  Re-entry is suppressed
-        # until the leader goes flat, so an incremental add does not create a
-        # fresh position right after a stop.
+        # manual close) while the leader still held.  Re-entry is suppressed for
+        # a bounded cooldown so an incremental add does not create a fresh
+        # position right after a stop, while a leader that keeps holding the
+        # same side cannot suppress the symbol forever.
         self.stopped = self.runtime_state.get('stopped', {})
+        self.stopped_at = self.runtime_state.get('stopped_at', {})
+        self.stop_out_cooldown = max(0.0, float(stop_out_cooldown or 0))
         # Symbols for which a local opening order actually filled.  A flat
         # account is only a stop-out if we had built a position first; an
         # entry that never filled must keep accumulating normally.
@@ -138,6 +141,8 @@ class Engine:
         for _, store in stores:
             for key in [k for k in store if k.split(':', 1)[0] in removed]:
                 store.pop(key, None)
+        for key in [k for k in self.stopped_at if k.split(':', 1)[0] in removed]:
+            self.stopped_at.pop(key, None)
         log.warning('Dropped state for leaders removed from config: %s',
                     ', '.join(sorted(removed)))
         self._save_state()
@@ -178,6 +183,8 @@ class Engine:
             for store in (self.stopped, self.entered, self.small_order_carry):
                 for key in [k for k in store if k.startswith(prefix)]:
                     store.pop(key, None)
+            for key in [k for k in self.stopped_at if k.startswith(prefix)]:
+                self.stopped_at.pop(key, None)
             # Breakeven is keyed by owner (account:symbol), not by leader.
             for key in [k for k, owner in self.owners.items() if owner == leader]:
                 self.breakeven.pop(key, None)
@@ -198,6 +205,7 @@ class Engine:
         if self.state_store:
             self.runtime_state['symbol_owners'] = self.owners
             self.runtime_state['stopped'] = self.stopped
+            self.runtime_state['stopped_at'] = self.stopped_at
             self.runtime_state['entered'] = self.entered
             self.runtime_state['small_order_carry'] = self.small_order_carry
             self.runtime_state['pending_orders'] = self.pending_orders
@@ -222,14 +230,18 @@ class Engine:
 
     def _mark_stopped(self, leader, symbol, side=None):
         key = f'{leader}:{symbol}'
-        # Remember the leader's side so the suppression can end when the leader
-        # later reverses.  A high-frequency leader may cross zero between two
-        # snapshots, so "leader is flat" is not always observable and a
-        # boolean latch would otherwise block this symbol forever.
+        # Remember the leader's side and when the stop happened.  A high
+        # frequency leader may cross zero between two snapshots, so "leader is
+        # flat" is not always observable; the timestamp bounds the suppression
+        # so the symbol can never stay blocked for as long as the leader holds.
         side = side if side in ('long', 'short') else True
-        if self.stopped.get(key) != side:
-            self.stopped[key] = side
-            self._save_state()
+        self.stopped[key] = side
+        self.stopped_at[key] = time.time()
+        self._save_state()
+
+    def _clear_stopped(self, key):
+        self.stopped_at.pop(key, None)
+        return self.stopped.pop(key, None) is not None
 
     @staticmethod
     def _pending_key(leader, symbol):
@@ -924,7 +936,7 @@ class Engine:
                             if not claimed:
                                 continue
                         if self._leader_holds_same_side(leader, symbol, live):
-                            if self.stopped.pop(f'{leader}:{symbol}', None):
+                            if self._clear_stopped(f'{leader}:{symbol}'):
                                 self._save_state()
                                 log.info('STOP-OUT CLEARED leader=%s symbol=%s: account holds a position again',
                                          leader, symbol)
@@ -1017,29 +1029,47 @@ class Engine:
             ratio = budget / denominator * float(cfg.get('coefficient', 1))
             startup = leader not in self.previous
             startup_symbols = self.startup_pending.get(leader, set())
-            previous = self.previous.get(leader, {})
-            signals = diff_positions(leader, previous, positions, ratio)
-            self.previous_at[leader] = time.time()
+            previous = dict(self.previous.get(leader, {}))
+            now = time.time()
             failed = set()
-            # A stop-out suppression ends when the leader starts a new episode:
-            # it goes flat, or it reverses direction.  A reversal is a close and
-            # reopen even when the flat state itself fell between two snapshots,
-            # so it must clear the suppression too; otherwise a leader that
-            # swings through zero can keep a symbol suppressed forever.
+            # A stop-out suppression never lasts forever.  It ends when the
+            # leader goes flat, reverses direction (a close and reopen even if
+            # the flat state fell between two snapshots), or the cooldown
+            # expires while the leader keeps holding.  On expiry a flat account
+            # is re-aligned to the leader's current target on this same diff
+            # instead of waiting for enough sub-minimum adds to accumulate.
             for key in [k for k in self.stopped if k.startswith(f'{leader}:')]:
                 symbol = key[len(leader) + 1:]
                 position = positions.get(symbol)
                 if position is None or abs(position.size) <= 1e-12:
-                    self.stopped.pop(key, None)
+                    self._clear_stopped(key)
                     self._save_state()
                     continue
                 stopped_side = self.stopped.get(key)
                 current_side = 'long' if position.size > 0 else 'short'
                 if stopped_side in ('long', 'short') and stopped_side != current_side:
-                    self.stopped.pop(key, None)
+                    self._clear_stopped(key)
                     self._save_state()
                     log.info('STOP-OUT CLEARED leader=%s symbol=%s: leader reversed %s->%s',
                              leader, symbol, stopped_side, current_side)
+                    continue
+                at = float(self.stopped_at.get(key) or 0)
+                if at > 0 and now - at < self.stop_out_cooldown:
+                    continue
+                self._clear_stopped(key)
+                self._save_state()
+                log.info('STOP-OUT COOLDOWN EXPIRED leader=%s symbol=%s: resuming after %.0fs',
+                         leader, symbol, max(0.0, now - at))
+                try:
+                    live = await self.exchange.position_size(symbol)
+                except Exception:
+                    live = 0.0
+                if abs(live) <= 1e-12 and previous.get(symbol) is not None:
+                    # Flat account, leader still holds: turn the next diff into
+                    # an open so we re-enter the current target immediately.
+                    previous.pop(symbol, None)
+            signals = diff_positions(leader, previous, positions, ratio)
+            self.previous_at[leader] = now
             if startup:
                 for key in list(self.small_order_carry):
                     if key.startswith(f'{leader}:') and key[len(leader) + 1:] not in positions:
@@ -1076,7 +1106,7 @@ class Engine:
                             # reopen, or a residual left after the stop).  The
                             # suppression only protects a flat account, so
                             # resume following instead of skipping forever.
-                            self.stopped.pop(stopped_key, None)
+                            self._clear_stopped(stopped_key)
                             self._save_state()
                             log.info('STOP-OUT CLEARED leader=%s symbol=%s: account holds a position again',
                                      leader, s.symbol)
@@ -1172,7 +1202,7 @@ class Engine:
                         if abs(delta) <= 1e-12:
                             await self._skip(leader, s, 'account position already matches the reversed target')
                             continue
-                        if self.stopped.pop(stopped_key, None):
+                        if self._clear_stopped(stopped_key):
                             self._save_state()
                             log.info('STOP-OUT CLEARED leader=%s symbol=%s: leader reversed',
                                      leader, s.symbol)
@@ -1252,9 +1282,20 @@ class Engine:
                     if typ == 'limit' and not reduce and order.status == 'open':
                         self._track_pending(leader, s.symbol, order)
                     if order.status == 'closed' and order.amount:
+                        # The amount we actually filled may be rounded down to
+                        # the exchange step.  Near the minimum a reversal can
+                        # shrink to exactly our old size and only close the
+                        # position; recording that as a fresh entry would make
+                        # reconciliation mistake the flat account for a native
+                        # stop and suppress the symbol.
+                        filled = float(order.amount)
+                        resulting = live + (filled if side == 'buy' else -filled)
                         if not reduce:
-                            self.entered[stopped_key] = True
-                            self._save_state()
+                            if abs(resulting) > 1e-12:
+                                self.entered[stopped_key] = True
+                                self._save_state()
+                            else:
+                                await self._release_if_flat(leader, s.symbol, live=resulting)
                         self.fill_events.append({'account': self._account_key(leader), 'leader': leader,
                                                  'order_id': str(order.id), 'symbol': s.symbol,
                                                  'side': side, 'quantity': float(order.amount),

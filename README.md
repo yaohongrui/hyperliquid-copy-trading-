@@ -22,7 +22,7 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 
 ### 跟单核心
 
-- 订阅 HL `allDexsClearinghouseState`，对比前后仓位生成 `open` / `increase` / `decrease` / `close` 信号；反手（`close_reverse`）一律跳过，需要手动处理。
+- 订阅 HL `allDexsClearinghouseState`，对比前后仓位生成 `open` / `increase` / `decrease` / `close` 信号；反手（`close_reverse`）会用一笔净翻仓单把账户换到交易员的新方向。
 - 启动和 WebSocket 每次重连后，都会用 REST 快照补齐基线（HIP-3 的各个 perp dex 也会一起拉取），避免断线期间的平仓事件丢失。
 - 仓位换算：`目标仓位 = 交易员仓位 × (sizing_balance / total_margin × coefficient)`，`sizing_balance` 默认是账户实时权益，也可以用 `fixed_balance_usdt` 固定。
 - 延迟入场：每个交易员可单独开启，开仓信号改为在交易员入场价偏移处挂限价单。
@@ -62,7 +62,7 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 | `increase` | 同方向加仓 | 市价，并合并未成交的小单 carry |
 | `decrease` | 同方向减仓 | reduce-only 市价，数量取 `min(账户持仓, 信号数量)` |
 | `close` | 平仓 | reduce-only 市价，平掉账户该币全部持仓 |
-| `close_reverse` | 反手 | **跳过**，旧仓不动，需要人工处理 |
+| `close_reverse` | 反手 | 市价净翻仓：从当前持仓直接换到交易员新方向的目标仓位 |
 
 ### 仓位换算
 
@@ -120,13 +120,14 @@ delta  = (交易员新仓位 - 交易员旧仓位) × ratio
 ### 止损后抑制再入场
 
 - `entered` 记录该 symbol 是否真的成交过开仓单；`stopped` 记录“我们已离场、但交易员还持有”的状态。
-- 当账户持仓归零、交易员仍持有，且此前确实建过仓（原生止损、爆仓、手动平仓），标记为 `stopped`。
-- `stopped` 期间交易员的 `open` / `increase` 信号全部跳过，避免止损后立刻被加仓信号重新拉回场内。
-- **只要账户重新持有该 symbol（同方向），`stopped` 会立刻清除**：无论是手动补仓、部分减仓后残留，还是 5 秒对账发现的持仓。抑制只保护空仓状态，不会因为漏掉一次“交易员平仓”事件而永久卡死。
-- 交易员平掉该币后 `stopped` 自动清除；下一次开仓会正常复制。
+- 当账户持仓归零、交易员仍持有，且此前确实建过仓（原生止损、爆仓、手动平仓），标记为 `stopped`，同时记录当时的交易员方向和冷却起点。
+- `stopped` 期间交易员的 `open` / `increase` 信号跳过，避免止损后立刻被加仓信号重新拉回场内。
+- **抑制有上限**：交易员平仓或反向时立即清除；否则冷却时间（`stop_out_cooldown_seconds`，默认 600 秒）到期后清除。到期时如果账户仍空仓，会按交易员当前目标仓位重新对齐，而不是等小单慢慢累计。
+- **只要账户重新持有该 symbol（同方向），`stopped` 会立刻清除**：无论是手动补仓、部分减仓后残留，还是 5 秒对账发现的持仓。
+- 反手单在交易所最小步长处可能被截断成“只平旧仓、开不出新仓”。这种情况下引擎会清掉 `entered`，避免对账把空仓误判成原生止损。
 - 5 秒对账也会检测这种情况，所以即使没有新的 WS 信号，手动平仓/手动补仓都能被识别。
 - 修改 leader 的 `execution_account` 后，启动时会把 `symbol_owners`/`protection` 等按账户名拼接的 key 迁移到新账户，避免留下重复 claim。
-- 重启时 `entered` 会从本地成交记录（`local_fills`）恢复，避免重启后把“从未成交的启动补仓”误判成止损。
+- 重启时 `entered` 会从本地成交记录（`local_fills`）恢复，但只恢复当前仍持有的 symbol，避免把已经被平掉的仓误判成止损。
 
 ## 风控
 
@@ -309,6 +310,16 @@ state:
 ```
 
 保存 symbol 所有权、止损抑制状态、已成交标记、小单 carry、单仓止损单 id、账户硬止损基线。每次变动原子写入。
+
+### 止损冷却（stop_out_cooldown_seconds）
+
+```yaml
+stop_out_cooldown_seconds: 600
+```
+
+- 账户被平到空仓、交易员仍持仓时，该币的 `open` / `increase` 会被抑制一段时间，避免止损后立刻被加仓信号拉回场内。
+- 交易员平仓或反向时立即解除抑制；否则冷却到期后若账户仍空仓，会按交易员当前目标仓位重新对齐。
+- 默认 600 秒；设为 0 表示不抑制。
 
 ### console
 
@@ -607,7 +618,8 @@ Caddy 会自动申请和续期证书。参考 `systemd/yhr.lol.Caddyfile`，更�
 | 键 | 内容 |
 | --- | --- |
 | `symbol_owners` | `执行账户:SYMBOL -> 交易员`，symbol 所有权 |
-| `stopped` | `交易员:SYMBOL -> true`，止损后抑制再入场 |
+| `stopped` | `交易员:SYMBOL -> long/short`，止损后抑制再入场及当时的交易员方向 |
+| `stopped_at` | `交易员:SYMBOL -> 时间戳`，抑制冷却起点 |
 | `entered` | `交易员:SYMBOL -> true`，是否真实成交过开仓 |
 | `small_order_carry` | `交易员:SYMBOL -> {side, amount}`，小单累计 |
 | `protection` | `执行账户:SYMBOL -> {id, contracts, trigger}`，单仓止损条件单 |
@@ -667,7 +679,7 @@ tests/                  单元测试
 - **单执行账户**：一个进程只使用第一个启用交易员的 `execution_account` 创建交易所实例。所有启用的交易员应指向同一个账户。
 - **`enabled` 可运行时切换**：`Engine.process` 对禁用的交易员直接返回。禁用不会平掉已有仓位，重新启用会从新的启动快照开始。
 - **同名币共享账户仓位**：所有权按 `execution_account:symbol` 记录，先开仓的交易员拥有该币；其他交易员的同名信号会跳过。
-- **反手不处理**：`close_reverse` 永远跳过，旧仓保持不动，需要手动平仓后再等待下一次开仓信号。
+- **反手按净仓位处理**：`close_reverse` 会把账户从当前持仓翻到交易员的新方向；如果净翻仓量低于交易所最小步长，会先平掉旧仓并清掉 `entered`，后续加仓信号继续按小单累计跟随。
 - **关闭单仓止损不会撤销已存在的条件单**：把 `position_stop_loss.enabled` 改成 `false` 只是不再新建/对账，已经挂在交易所的止损单仍然有效，需要手动撤销或等仓位平掉。
 - **暂停状态不持久化**：重启后 `paused` 恢复为 `false`；账户硬止损的 `locked` 会持久化，且 `process()` 会同时检查 `locked`，因此重启后当日锁定仍然有效。
 - **控制台保存会重写 YAML**：通过控制台修改交易员参数会重新序列化整个 `config.yaml`，注释和手工排版会丢失；`${ENV}` 占位符会保留。
