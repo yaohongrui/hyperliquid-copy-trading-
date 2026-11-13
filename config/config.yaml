@@ -34,7 +34,7 @@ mirror_orders:
   leader_orders_seconds: 10
   dex_probe_seconds: 120
   failure_cooldown_seconds: 30
-  credit_grace_ms: 1200
+  credit_grace_ms: 300
   credit_ttl_seconds: 900
   # An order the leader left resting after filling is an "orphan": it keeps
   # resting while the leader still holds that symbol, and is cancelled when

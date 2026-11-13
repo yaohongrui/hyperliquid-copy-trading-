@@ -71,7 +71,7 @@ class OrderMirror:
         # would exceed Hyperliquid's 1200 weight/min IP budget.
         self.probe_seconds = max(self.orders_seconds,
                                  _float(self.config.get("dex_probe_seconds"), 120.0))
-        self.grace_ms = max(0, int(_float(self.config.get("credit_grace_ms"), 1200)))
+        self.grace_ms = max(0, int(_float(self.config.get("credit_grace_ms"), 300)))
         self.credit_ttl = max(60.0, _float(self.config.get("credit_ttl_seconds"), 900.0))
         self.orphan_ttl = max(1.0, _float(self.config.get("orphan_ttl_seconds"), 300.0))
         raw_orphans = self.config.get("max_orphans", 2)
@@ -362,13 +362,24 @@ class OrderMirror:
             self.credits[key] = (remainder, at)
         return signed
 
-    def has_live_mirror(self, leader, symbol, signed_want):
+    def should_wait_for_fills(self, leader, symbol, signed_want):
+        """True only when a live mirror could be filling right now.
+
+        The leader order must still be in the cached book; once it is gone we
+        already know whether it filled or was cancelled and waiting cannot
+        help.  Resting orphans are excluded: the leader is done with theirs.
+        """
+        if self.grace_ms <= 0:
+            return False
         side = "buy" if signed_want > 0 else "sell"
+        book = self._book(leader)
         for item in self.orders.values():
             if (item.get("leader") == leader
                     and str(item.get("symbol", "")).upper() == symbol.upper()
                     and item.get("side") == side
-                    and float(item.get("filled") or 0) < float(item.get("amount") or 0)):
+                    and not item.get("orphan")
+                    and float(item.get("filled") or 0) < float(item.get("amount") or 0)
+                    and item.get("leader_oid") in book):
                 return True
         return False
 
@@ -430,13 +441,23 @@ class OrderMirror:
         for key in [key for key, at in self._mirrored_oids.items()
                     if at < mirrored_cutoff]:
             self._mirrored_oids.pop(key, None)
-        async with self.engine._lock:
-            for leader in leaders:
-                try:
-                    await self._reconcile_leader(leader)
-                except Exception:
-                    log.warning("Order mirror reconcile failed for %s", leader, exc_info=True)
-            self.engine._save_state()
+        for leader in leaders:
+            try:
+                # Read-only network work happens before taking the lock so a
+                # slow venue call does not delay every leader's market copy.
+                states = await self._fetch_own_states(leader)
+                ratio = (await self.engine.sizing(leader))[0]
+            except Exception:
+                log.warning("Order mirror prepare failed for %s", leader, exc_info=True)
+                continue
+            if ratio <= 0:
+                continue
+            try:
+                async with self.engine._locked(f'mirror sync {leader}'):
+                    await self._reconcile_leader(leader, states, ratio)
+                    self.engine._save_state()
+            except Exception:
+                log.warning("Order mirror reconcile failed for %s", leader, exc_info=True)
 
     async def _refresh_books(self, leaders, force=False):
         now = time.monotonic()
@@ -517,10 +538,13 @@ class OrderMirror:
             return [min(candidates, key=lambda order: order.distance)]
         return picks[:self.max_orders]
 
-    async def _reconcile_leader(self, leader):
-        await self._poll_own_orders(leader)
+    async def _reconcile_leader(self, leader, states, ratio):
+        """Decide and place/cancel while holding ``engine._lock``.
+
+        ``states`` and ``ratio`` were read outside the lock by ``sync``.
+        """
+        await self._poll_own_orders(leader, states)
         book = self._book(leader)
-        ratio = (await self.engine.sizing(leader))[0]
         if ratio <= 0:
             return
         paused = bool(self.engine.paused or self.engine.risk.locked)
@@ -781,8 +805,34 @@ class OrderMirror:
         except Exception:
             log.warning("MIRROR RELEASE failed for %s %s", leader, symbol, exc_info=True)
 
-    async def _poll_own_orders(self, leader):
+    async def _fetch_own_states(self, leader):
+        """Read our mirror order states.  Network only, called outside the lock.
+
+        A key that could not be read is simply absent; ``_poll_own_orders``
+        then leaves that record untouched, exactly like a failed poll used to.
+        """
         exchange = self.engine.exchange
+        fetcher = getattr(exchange, "fetch_order", None)
+        states = {}
+        if fetcher is None:
+            return states
+        for key, item in list(self.orders.items()):
+            if item.get("leader") != leader:
+                continue
+            order_id = item.get("order_id")
+            symbol = item.get("symbol")
+            if not order_id or not symbol:
+                continue
+            try:
+                states[key] = await fetcher(order_id, symbol)
+            except NotImplementedError:
+                continue
+            except Exception:
+                log.warning("MIRROR POLL failed for %s %s", leader, symbol, exc_info=True)
+                continue
+        return states
+
+    async def _poll_own_orders(self, leader, states):
         for key, item in list(self.orders.items()):
             if item.get("leader") != leader or key not in self.orders:
                 continue
@@ -791,16 +841,10 @@ class OrderMirror:
             if not order_id or not symbol:
                 self.orders.pop(key, None)
                 continue
-            fetcher = getattr(exchange, "fetch_order", None)
-            if fetcher is None:
+            if key not in states:
+                # Not fetched this cycle (unsupported or failed); keep it.
                 continue
-            try:
-                state = await fetcher(order_id, symbol)
-            except NotImplementedError:
-                continue
-            except Exception:
-                log.warning("MIRROR POLL failed for %s %s", leader, symbol, exc_info=True)
-                continue
+            state = states[key]
             if state is None:
                 await self._book_missing(item)
                 self.orders.pop(key, None)

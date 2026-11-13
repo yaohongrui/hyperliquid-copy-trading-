@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import time
 from dataclasses import replace
@@ -205,6 +206,25 @@ class Engine:
                 self.mirror.request_sync(force_orders=True)
             self._save_state()
             return True
+
+    @contextlib.asynccontextmanager
+    async def _locked(self, label):
+        """Hold the signal lock and warn when a holder blocks the others.
+
+        The lock serializes order placement/cancellation across leaders and
+        the mirror.  A slow venue call inside it delays every leader's market
+        copy, so record how long the lock was waited for and held.
+        """
+        waited_at = time.monotonic()
+        async with self._lock:
+            held_at = time.monotonic()
+            try:
+                yield
+            finally:
+                held = time.monotonic() - held_at
+                if held > 0.5:
+                    log.warning('LOCK HELD label=%s held=%.0fms waited=%.0fms',
+                                label, held * 1000, (held_at - waited_at) * 1000)
 
     def _account_key(self, leader):
         return str(self.leaders[leader].get('execution_account') or '__default__')
@@ -1116,10 +1136,17 @@ class Engine:
             return signal
         want = signal.delta / ratio
         credit = mirror.consume_credit(leader, signal.symbol, want)
-        if not credit and mirror.has_live_mirror(leader, signal.symbol, signal.delta):
+        if not credit and mirror.should_wait_for_fills(leader, signal.symbol, signal.delta):
             # The position snapshot can arrive before the userFills event that
             # explains it.  Wait briefly instead of placing a duplicate order.
+            # We only wait while a mirror is still live and the leader order is
+            # still resting in the cached book (i.e. it may be filling now).
+            started = time.monotonic()
             await mirror.wait_for_fills(mirror.grace_ms)
+            waited = time.monotonic() - started
+            if waited > 0.5:
+                log.warning('MIRROR GRACE leader=%s symbol=%s waited=%.0fms',
+                            leader, signal.symbol, waited * 1000)
             credit = mirror.consume_credit(leader, signal.symbol, want)
         if not credit:
             return signal
@@ -1142,7 +1169,7 @@ class Engine:
 
     async def process(self, leader, positions, resync=False):
         protect = []
-        async with self._lock:
+        async with self._locked(f'process {leader}'):
             cfg = self.leaders[leader]
             if not cfg.get('enabled', True):
                 return []

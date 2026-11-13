@@ -3,7 +3,7 @@ import unittest
 
 from core.engine import Engine
 from core.mirror import OrderMirror
-from core.models import Order, Position
+from core.models import Order, Position, Signal
 from sources.leader_orders import (
     LeaderFillBook,
     LeaderRestingOrder,
@@ -286,6 +286,39 @@ class MirrorExecutionTests(unittest.IsolatedAsyncioTestCase):
         mirror._book_at["L"] = time.monotonic() + 3600
         await mirror.sync()
         self.assertEqual(mirror.orders, {})
+
+
+class GraceTests(unittest.IsolatedAsyncioTestCase):
+    def test_credit_grace_default_is_300(self):
+        _, mirror = make_engine(MirrorExchange())
+        self.assertEqual(mirror.grace_ms, 300)
+
+    async def test_waits_only_while_the_leader_order_is_still_in_book(self):
+        exchange = MirrorExchange()
+        engine, mirror = make_engine(exchange)
+        mirror._books[("L", "")] = [resting("1", "buy", 95, 10, 100)]
+        mirror._book_at["L"] = time.monotonic() + 3600
+        await mirror.sync()
+        self.assertTrue(mirror.should_wait_for_fills("L", "AAA", 5))
+        mirror._books[("L", "")] = []
+        self.assertFalse(mirror.should_wait_for_fills("L", "AAA", 5))
+        mirror._books[("L", "")] = [resting("1", "buy", 95, 10, 100)]
+        next(iter(mirror.orders.values()))["orphan"] = True
+        self.assertFalse(mirror.should_wait_for_fills("L", "AAA", 5))
+
+    async def test_engine_does_not_wait_without_a_live_leader_order(self):
+        exchange = MirrorExchange()
+        engine, mirror = make_engine(exchange)
+        calls = []
+
+        async def wait(milliseconds):
+            calls.append(milliseconds)
+
+        mirror.wait_for_fills = wait
+        signal = Signal("L", "AAA", "open", 5.0, 5.0, "long", 100.0)
+        covered = await engine._consume_mirror_credit("L", signal, 1.0, False, set())
+        self.assertEqual(calls, [])
+        self.assertIs(covered, signal)
 
 
 class OrphanTests(unittest.IsolatedAsyncioTestCase):
