@@ -104,30 +104,36 @@ delta  = (交易员新仓位 - 交易员旧仓位) × ratio
 - 订阅该交易员的 `userFills`，用来区分 maker/taker 成交，并把刚成交的数量从缓存的挂单里扣掉。
 - 只开启**一个**镜像交易员时，额外订阅 `orderUpdates`，挂单/撤单/成交能在秒级同步；开启多个时该 channel
   不带用户字段、无法归属，退回 10 秒一次的 REST 刷新。
-- **每个交易员最多镜像 2 个单**：离各自标的价格最近的**上方一个 + 下方一个**（严格上下各一个，没有距离阈值）；
-  只有一侧有挂单时只挂一个。价格与交易员完全相同，使用 `Alo`（Post-Only）。
+- **每个交易员最多镜像 `max_orders` 个单（1 或 2，所有币种合计）**：离各自标的价格最近的**上方一个 +
+  下方一个**（严格上下各一个，没有距离阈值）；只有一侧有挂单时只挂一个。价格与交易员完全相同，
+  使用 `Alo`（Post-Only）。
 - 数量 = 交易员该挂单剩余数量 × 该交易员的 `ratio`。`reduceOnly` 挂单也镜像，但数量会 clamp 到账户实际持仓；
   没有对应持仓或方向不符时跳过。
 - 交易员**撤单**：我们也撤。交易员**成交**：我们的单继续挂着，直到成交；如果交易员只成交了一部分就撤掉
   剩余，我们也撤掉剩余。
+- 交易员成交后留下的镜像单是**孤儿单**（“没成交就一直挂着”）。孤儿单在交易员平仓、反向持仓、
+  账户暂停/硬止损，或存活超过 `orphan_ttl_seconds` 后撤销；`reduceOnly` 孤儿不撤。孤儿单不占用
+  `max_orders` 名额，但每个交易员最多保留 `max_orphans` 个，超出时先撤最老的。
 - 交易员成交后，缓存挂单立即扣减，并重新选出该侧最近的下一单补位。
-- 为避免与仓位差分重复下单：maker 开仓成交会记入 credit，`process()` 消费后不再下市价单，但仍会做
-  所有权、`entered` 和止损保护等簿记；taker 成交不记 credit，仍走市价路径。平仓的 maker 成交只有在
-  我们确实镜像了该单时才抑制市价平仓，否则安全优先、直接市价平掉。
+- 为避免与仓位差分重复下单：只有我们**确实镜像过**该挂单（含镜像单刚成交、记录已被轮询清掉的情况）
+  的 maker 成交才记入 credit，`process()` 消费后不再下市价单，但仍会做所有权、`entered` 和止损保护
+  等簿记；未被镜像的 maker 成交和 taker 成交都不记 credit，仍走市价路径。
 - 暂停/硬止损时撤销非 reduce-only 的镜像单；账户被止损抑制（`stopped`）的币不再镜像加仓。
 - `shadow: true` 只打印选中的单，不真实下单，适合上线前观察。
 
 ```yaml
 mirror_orders:
   enabled: true
-  max_orders: 2                 # 每个交易员：上方一个 + 下方一个
+  max_orders: 2                 # 1 或 2，所有币种合计：上方一个 + 下方一个
   post_only: true
   refresh_seconds: 5            # 镜像单状态轮询
   leader_orders_seconds: 10     # 交易员挂单 REST 刷新
   dex_probe_seconds: 120        # 空 HIP-3 dex 的探测间隔
   failure_cooldown_seconds: 30  # 下单失败后的重试冷却
-  credit_grace_ms: 1200         # 成交事件晚于仓位快照时的等待
+  credit_grace_ms: 300          # 成交事件晚于仓位快照时的等待
   credit_ttl_seconds: 900       # 未消费 credit 的过期时间
+  orphan_ttl_seconds: 300       # 孤儿单最长存活时间
+  max_orphans: 2                # 每个交易员最多保留的孤儿单，超出撤最老的
   shadow: false
 ```
 
@@ -257,22 +263,26 @@ mirror_orders:
   leader_orders_seconds: 10
   dex_probe_seconds: 120
   failure_cooldown_seconds: 30
-  credit_grace_ms: 1200
+  credit_grace_ms: 300
   credit_ttl_seconds: 900
+  orphan_ttl_seconds: 300
+  max_orphans: 2
   shadow: false
 ```
 
 | 字段 | 说明 |
 | --- | --- |
 | `enabled` | 总开关；仍需交易员级别 `mirror_orders: true` 才会生效 |
-| `max_orders` | 每个交易员同时存在的镜像单上限，默认 2（上方一个 + 下方一个） |
+| `max_orders` | 每个交易员同时存在的镜像单上限，只能为 1 或 2，**所有币种合计**（1 = 全局最近一个；2 = 上方一个 + 下方一个）。孤儿单不占用名额 |
 | `post_only` | 使用 `Alo`（Add-Liquidity-Only）；穿价会被交易所拒绝 |
 | `refresh_seconds` | 镜像单状态与对账循环间隔 |
 | `leader_orders_seconds` | 交易员挂单 REST 刷新间隔；调低会成倍增加 HL 请求权重 |
 | `dex_probe_seconds` | 没有挂单的 HIP-3 dex 的探测间隔 |
 | `failure_cooldown_seconds` | 下单失败（最小量、穿价、保证金不足）后的重试冷却 |
-| `credit_grace_ms` | 仓位快照早于 `userFills` 时，最多等这么久再决定是否下市价单 |
+| `credit_grace_ms` | 仓位快照早于 `userFills` 时，最多等这么久再决定是否下市价单；仅当镜像单仍在挂且交易员挂单仍在缓存 book 里才等待 |
 | `credit_ttl_seconds` | 未被消费的 maker credit 的过期时间 |
+| `orphan_ttl_seconds` | 交易员已成交、我方仍未成交的孤儿单最长存活时间，到期撤销 |
+| `max_orphans` | 每个交易员最多保留的孤儿单数量；超出时撤销最老的 |
 | `shadow` | 只记录选中的镜像单，不真实下单 |
 
 ### execution_accounts
@@ -399,7 +409,7 @@ leaders:
 | `symbol_blacklist` | 黑名单，匹配 HL 币名（如 `BTC`）或加 `USDT` 后缀（如 `BTCUSDT`） |
 | `late_entry_enabled` | 是否对 `open` 使用延迟限价入场（开启 `mirror_orders` 时无效） |
 | `late_entry_offset_pct` | 限价相对交易员入场价的偏移百分比，非负 |
-| `mirror_orders` | 是否镜像该交易员的限价挂单（Post-Only、同价、上下各一个），默认 `false` |
+| `mirror_orders` | 是否镜像该交易员的限价挂单（Post-Only、同价、最多 1 或 2 个，所有币种合计），默认 `false` |
 | `position_stop_loss.enabled` | 是否启用单仓止损 |
 | `position_stop_loss.max_loss_usdt` | 单仓最大亏损金额（USDT），必须大于 0 |
 
