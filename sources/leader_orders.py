@@ -18,6 +18,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from core.request_stats import record as record_request
+
 from .position_queries import _perp_dexes
 
 INFO_URL = "https://api.hyperliquid.xyz/info"
@@ -86,6 +88,7 @@ class LeaderFill:
 
 
 async def _post(session, payload):
+    record_request(payload.get("type") or "info")
     async with session.post(INFO_URL, json=payload) as response:
         response.raise_for_status()
         return await response.json()

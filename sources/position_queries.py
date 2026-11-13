@@ -3,6 +3,7 @@ import time
 
 import aiohttp
 from core.models import Position
+from core.request_stats import record as record_request
 
 # The dex list only changes when a HIP-3 deployment is added, so a per-process
 # cache keeps the 20-weight ``perpDexs`` probe off the hot path.  The REST
@@ -101,6 +102,7 @@ async def _perp_dexes(session):
         return _perp_dex_cache["values"]
     dexes = [None]
     try:
+        record_request("perpDexs")
         async with session.post("https://api.hyperliquid.xyz/info", json={"type": "perpDexs"}) as response:
             response.raise_for_status()
             for item in await response.json() or []:
@@ -126,6 +128,7 @@ async def _leader_states(session, address):
         payload = {"type": "clearinghouseState", "user": address}
         if dex:
             payload["dex"] = dex
+        record_request("clearinghouseState")
         async with session.post("https://api.hyperliquid.xyz/info", json=payload) as response:
             response.raise_for_status()
             return await response.json()

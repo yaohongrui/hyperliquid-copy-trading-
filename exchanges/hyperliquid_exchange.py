@@ -23,6 +23,7 @@ from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
 from hyperliquid.utils.error import ClientError
 
 from core.models import Order
+from core.request_stats import record as record_request
 from core.symbols import SymbolMap
 from .base import OrderQuantityTooSmall
 
@@ -132,6 +133,7 @@ class HyperliquidExchange:
 
     def _sdk_call(self, fn, *args, **kwargs):
         """Run one synchronous SDK call with a small backoff on rate limits."""
+        record_request(getattr(fn, "__name__", "sdk"))
         delay = 1.0
         for attempt in range(3):
             try:
