@@ -129,6 +129,23 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(order.amount, 0.2)
         self.assertEqual(client.orders[0]["order_type"], {"limit": {"tif": "Gtc"}})
 
+    async def test_post_only_limit_order_uses_alo(self):
+        client = FakeClient(_resting(12))
+        exchange = make_exchange(client)
+
+        order = await exchange.create_order("BTC", "buy", 0.2, "limit", 90, post_only=True)
+
+        self.assertEqual(client.orders[0]["order_type"], {"limit": {"tif": "Alo"}})
+        self.assertEqual(order.status, "open")
+
+    async def test_market_order_with_post_only_raises(self):
+        client = FakeClient()
+        exchange = make_exchange(client)
+
+        with self.assertRaises(ValueError):
+            await exchange.create_order("BTC", "buy", 0.1, post_only=True)
+        self.assertEqual(client.orders, [])
+
     async def test_minimum_order_error_is_accumulated(self):
         client = FakeClient({"status": "err", "response": "Order must have minimum value of $10"})
         exchange = make_exchange(client)

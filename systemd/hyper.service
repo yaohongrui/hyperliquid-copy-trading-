@@ -12,9 +12,8 @@ ExecStart=/home/yhr/hyper/.venv/bin/python /home/yhr/hyper/main.py --config /hom
 Restart=on-failure
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
-# The live deployment keeps a drop-in
-# (copy.service.d/*.conf) that sets Restart=always and OOMScoreAdjust;
-# do not remove it when updating this unit.
+# Restart behavior and OOMScoreAdjust belong in a drop-in
+# (e.g. hyper.service.d/*.conf), not in this unit file.
 
 [Install]
 WantedBy=multi-user.target

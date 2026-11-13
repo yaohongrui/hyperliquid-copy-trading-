@@ -22,7 +22,7 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 
 ### 跟单核心
 
-- 订阅 HL `allDexsClearinghouseState`，对比前后仓位生成 `open` / `increase` / `decrease` / `close` 信号；反手（`close_reverse`）一律跳过，需要手动处理。
+- 订阅 HL `allDexsClearinghouseState`，对比前后仓位生成 `open` / `increase` / `decrease` / `close` 信号；反手（`close_reverse`）按“目标仓位 − 账户实际仓位”下成一笔净额反向单。
 - 启动和 WebSocket 每次重连后，都会用 REST 快照补齐基线（HIP-3 的各个 perp dex 也会一起拉取），避免断线期间的平仓事件丢失。
 - 仓位换算：`目标仓位 = 交易员仓位 × (sizing_balance / total_margin × coefficient)`，`sizing_balance` 默认是账户实时权益，也可以用 `fixed_balance_usdt` 固定。
 - 延迟入场：每个交易员可单独开启，开仓信号改为在交易员入场价偏移处挂限价单。
@@ -64,7 +64,7 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 | `increase` | 同方向加仓 | 市价，并合并未成交的小单 carry |
 | `decrease` | 同方向减仓 | reduce-only 市价，数量取 `min(账户持仓, 信号数量)` |
 | `close` | 平仓 | reduce-only 市价，平掉账户该币全部持仓 |
-| `close_reverse` | 反手 | **跳过**，旧仓不动，需要人工处理 |
+| `close_reverse` | 反手 | 按净额差下一笔反向单（市价），并清除旧的止损/冷却状态 |
 
 ### 仓位换算
 
@@ -86,12 +86,52 @@ delta  = (交易员新仓位 - 交易员旧仓位) × ratio
 - `open`：默认市价；若 `late_entry_enabled: true` 且不是启动补仓，则挂限价单，价格为交易员入场价：
   - 买入：`entry × (1 - late_entry_offset_pct%)`
   - 卖出：`entry × (1 + late_entry_offset_pct%)`
-  - 限价单按 `leader:symbol` 跟踪，默认 60 秒未成交自动撤单（可用 `late_entry_ttl_seconds` 调整）。交易员发出 `decrease` / `close` / `close_reverse` 时也会立即撤掉对应挂单，避免成交后形成无人管理的孤儿仓位。
-  - 进程重启后未成交挂单仍会从 `state.json` 恢复跟踪并继续按 TTL 撤销。
+  - 限价单按 `leader:symbol` 跟踪，**没有 TTL**：一直挂在交易所，直到成交、交易员减仓/平仓/反手、交易员被禁用，或新的开仓信号替换它。
+  - 进程重启后未成交挂单仍会从 `state.json` 恢复跟踪。
+  - 对开启了 `mirror_orders` 的交易员，延迟入场会被忽略：订单类型严格跟随交易员（他市价我们市价，他限价我们镜像限价）。
 - `increase`：始终市价（延迟入场只作用于 `open`）。
 - `decrease` / `close`：reduce-only 市价。
 - 市价单用 IOC 限价单实现（以盘口中间价加/减 `slippage`，默认 5%）；每次非 reduce-only 下单前会把该币杠杆设置为配置值（不超过交易所上限，全仓）。
 - 下单数量按各币的 `szDecimals` 取整，价格按 5 位有效数字及 `6 - szDecimals` 位小数取整。低于交易所最小名义价值（约 $10）时，非减仓单进入小单 carry，减仓单直接跳过。
+
+### 限价单镜像（`mirror_orders`）
+
+高频交易员大量使用 post-only 限价单时，单纯等仓位变化再市价跟单会付很多 taker 手续费。对显式开启
+`mirror_orders: true` 的交易员，额外做以下事情：
+
+- 通过 REST `frontendOpenOrders` 读取该交易员的**普通限价挂单**（`isTrigger=false`、`orderType=Limit`），
+  默认每 10 秒刷新一次；空仓的 HIP-3 dex 每 120 秒探测一次，避免打满 HL 的 1200 weight/min 预算。
+- 订阅该交易员的 `userFills`，用来区分 maker/taker 成交，并把刚成交的数量从缓存的挂单里扣掉。
+- 只开启**一个**镜像交易员时，额外订阅 `orderUpdates`，挂单/撤单/成交能在秒级同步；开启多个时该 channel
+  不带用户字段、无法归属，退回 10 秒一次的 REST 刷新。
+- **每个交易员最多镜像 2 个单**：离各自标的价格最近的**上方一个 + 下方一个**（严格上下各一个，没有距离阈值）；
+  只有一侧有挂单时只挂一个。价格与交易员完全相同，使用 `Alo`（Post-Only）。
+- 数量 = 交易员该挂单剩余数量 × 该交易员的 `ratio`。`reduceOnly` 挂单也镜像，但数量会 clamp 到账户实际持仓；
+  没有对应持仓或方向不符时跳过。
+- 交易员**撤单**：我们也撤。交易员**成交**：我们的单继续挂着，直到成交；如果交易员只成交了一部分就撤掉
+  剩余，我们也撤掉剩余。
+- 交易员成交后，缓存挂单立即扣减，并重新选出该侧最近的下一单补位。
+- 为避免与仓位差分重复下单：maker 开仓成交会记入 credit，`process()` 消费后不再下市价单，但仍会做
+  所有权、`entered` 和止损保护等簿记；taker 成交不记 credit，仍走市价路径。平仓的 maker 成交只有在
+  我们确实镜像了该单时才抑制市价平仓，否则安全优先、直接市价平掉。
+- 暂停/硬止损时撤销非 reduce-only 的镜像单；账户被止损抑制（`stopped`）的币不再镜像加仓。
+- `shadow: true` 只打印选中的单，不真实下单，适合上线前观察。
+
+```yaml
+mirror_orders:
+  enabled: true
+  max_orders: 2                 # 每个交易员：上方一个 + 下方一个
+  post_only: true
+  refresh_seconds: 5            # 镜像单状态轮询
+  leader_orders_seconds: 10     # 交易员挂单 REST 刷新
+  dex_probe_seconds: 120        # 空 HIP-3 dex 的探测间隔
+  failure_cooldown_seconds: 30  # 下单失败后的重试冷却
+  credit_grace_ms: 1200         # 成交事件晚于仓位快照时的等待
+  credit_ttl_seconds: 900       # 未消费 credit 的过期时间
+  shadow: false
+```
+
+交易员级别用 `mirror_orders: true` 单独开启；默认关闭。
 
 ### 启动补仓
 
@@ -206,6 +246,35 @@ hyperliquid:
 
 > WebSocket 订阅的地址来自启用的 `leaders[].address`，不需要额外配置。
 
+### mirror_orders
+
+```yaml
+mirror_orders:
+  enabled: true
+  max_orders: 2
+  post_only: true
+  refresh_seconds: 5
+  leader_orders_seconds: 10
+  dex_probe_seconds: 120
+  failure_cooldown_seconds: 30
+  credit_grace_ms: 1200
+  credit_ttl_seconds: 900
+  shadow: false
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `enabled` | 总开关；仍需交易员级别 `mirror_orders: true` 才会生效 |
+| `max_orders` | 每个交易员同时存在的镜像单上限，默认 2（上方一个 + 下方一个） |
+| `post_only` | 使用 `Alo`（Add-Liquidity-Only）；穿价会被交易所拒绝 |
+| `refresh_seconds` | 镜像单状态与对账循环间隔 |
+| `leader_orders_seconds` | 交易员挂单 REST 刷新间隔；调低会成倍增加 HL 请求权重 |
+| `dex_probe_seconds` | 没有挂单的 HIP-3 dex 的探测间隔 |
+| `failure_cooldown_seconds` | 下单失败（最小量、穿价、保证金不足）后的重试冷却 |
+| `credit_grace_ms` | 仓位快照早于 `userFills` 时，最多等这么久再决定是否下市价单 |
+| `credit_ttl_seconds` | 未被消费的 maker credit 的过期时间 |
+| `shadow` | 只记录选中的镜像单，不真实下单 |
+
 ### execution_accounts
 
 ```yaml
@@ -309,6 +378,7 @@ leaders:
   coefficient: 5
   total_margin: 400000
   enabled: true
+  mirror_orders: false
   symbol_blacklist: []
   late_entry_enabled: true
   late_entry_offset_pct: 0.2
@@ -327,9 +397,9 @@ leaders:
 | `total_margin` | 交易员保证金规模（分母），必须大于 0 |
 | `enabled` | 是否启用；控制台可以在运行中切换，禁用时会撤掉该交易员的挂单 |
 | `symbol_blacklist` | 黑名单，匹配 HL 币名（如 `BTC`）或加 `USDT` 后缀（如 `BTCUSDT`） |
-| `late_entry_enabled` | 是否对 `open` 使用延迟限价入场 |
+| `late_entry_enabled` | 是否对 `open` 使用延迟限价入场（开启 `mirror_orders` 时无效） |
 | `late_entry_offset_pct` | 限价相对交易员入场价的偏移百分比，非负 |
-| `late_entry_ttl_seconds` | 延迟入场限价单的存活时间，默认 60 秒；超时自动撤单 |
+| `mirror_orders` | 是否镜像该交易员的限价挂单（Post-Only、同价、上下各一个），默认 `false` |
 | `position_stop_loss.enabled` | 是否启用单仓止损 |
 | `position_stop_loss.max_loss_usdt` | 单仓最大亏损金额（USDT），必须大于 0 |
 
@@ -433,6 +503,7 @@ leaders:
   coefficient: 5
   total_margin: 400000
   enabled: true
+  mirror_orders: false
   symbol_blacklist: []
   late_entry_enabled: true
   late_entry_offset_pct: 0.2
@@ -689,7 +760,8 @@ CONSOLE.md              控制台与绩效数据说明
 ## 已知限制与注意事项
 
 - **单执行账户**：一个进程只使用第一个启用交易员的 `execution_account` 创建交易所实例。所有启用的交易员应指向同一个账户。
-- **反手不处理**：`close_reverse` 永远跳过，旧仓保持不动，需要手动平仓后再等待下一次开仓信号。
+- **`mirror_orders` 需改 YAML 并重启**：它不在控制台可编辑字段中；改完运行 `validate.py` 再重启。
+- **镜像平仓限价可能不成交**：完全复制模式下，交易员用限价减仓/平仓，我们也挂限价；没成交就会继续暴露。
 - **关闭单仓止损不会撤销已存在的条件单**：把 `position_stop_loss.enabled` 改成 `false` 只是不再新建/对账，已经挂在交易所的止损单仍然有效，需要手动撤销或等仓位平掉。
 - **暂停状态不持久化**：重启后 `paused` 恢复为 `false`；账户硬止损的 `locked` 会持久化，且 `process()` 会同时检查 `locked`，因此重启后当日锁定仍然有效。
 - **控制台保存会重写 YAML**：通过控制台修改交易员参数会重新序列化整个 `config.yaml`，注释和手工排版会丢失；`${ENV}` 占位符会保留。

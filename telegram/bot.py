@@ -358,6 +358,52 @@ class TelegramManager:
         fields.append(("Order ID", entry.get("id")))
         return await self.send(self._event_message(title, fields, reason=reason))
 
+    async def notify_mirror_placed(self, leader, symbol, side, amount, price):
+        """Notify that a leader limit order is now mirrored post-only."""
+        return await self.send(self._event_message("🧷 LIMIT MIRROR PLACED", [
+            ("Account", self.account_name),
+            ("Leader", leader),
+            ("Symbol", symbol),
+            ("Order side", str(side).upper()),
+            ("Quantity", abs(float(amount or 0))),
+            ("Limit price", price),
+            ("Order type", "POST-ONLY"),
+        ], reason=("Mirrors the leader's resting limit order at the same price; "
+                   "it stays until filled or the leader cancels."),
+           reason_label="Note"))
+
+    async def notify_mirror_cancelled(self, leader, symbol, entry, reason):
+        return await self.send(self._event_message("🚫 LIMIT MIRROR CANCELLED", [
+            ("Account", self.account_name),
+            ("Leader", leader),
+            ("Symbol", symbol),
+            ("Order side", str(entry.get("side") or "").upper()),
+            ("Order qty", abs(float(entry.get("amount") or 0))),
+            ("Filled qty", abs(float(entry.get("filled") or 0))),
+            ("Order ID", entry.get("order_id") or entry.get("id")),
+        ], reason=reason))
+
+    async def notify_mirror_filled(self, leader, symbol, entry, filled, price):
+        amount = abs(float(entry.get("amount") or 0))
+        filled = abs(float(filled or 0))
+        full = amount <= 0 or filled >= amount - 1e-12
+        title = "✅ LIMIT MIRROR FILLED" if full else "🟡 LIMIT MIRROR PARTIALLY FILLED"
+        fields = [
+            ("Account", self.account_name),
+            ("Leader", leader),
+            ("Symbol", symbol),
+            ("Order side", str(entry.get("side") or "").upper()),
+            ("Filled qty", filled),
+        ]
+        if not full:
+            fields.append(("Remaining qty", max(0.0, amount - filled)))
+        if price is not None:
+            fields.append(("Avg fill price", price))
+        if entry.get("price") is not None:
+            fields.append(("Limit price", entry.get("price")))
+        fields.append(("Order ID", entry.get("order_id") or entry.get("id")))
+        return await self.send(self._event_message(title, fields))
+
     async def notify_breakeven(self, leader, symbol, profit, trigger):
         return await self.send(self._event_message("🛡️ AUTO BREAKEVEN", [
             ("Account", self.account_name),
@@ -545,6 +591,15 @@ class RoutingNotifier:
 
     async def notify_limit_filled(self, *args, **kwargs):
         return await self._normal_call("notify_limit_filled", *args, **kwargs)
+
+    async def notify_mirror_placed(self, *args, **kwargs):
+        return await self._normal_call("notify_mirror_placed", *args, **kwargs)
+
+    async def notify_mirror_cancelled(self, *args, **kwargs):
+        return await self._normal_call("notify_mirror_cancelled", *args, **kwargs)
+
+    async def notify_mirror_filled(self, *args, **kwargs):
+        return await self._normal_call("notify_mirror_filled", *args, **kwargs)
 
     async def notify_skipped(self, *args, **kwargs):
         return await self._normal_call("notify_skipped", *args, **kwargs)

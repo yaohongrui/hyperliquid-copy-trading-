@@ -697,13 +697,15 @@ class HyperliquidExchange:
         return {"oid": None, "filled": 0.0, "avgPx": 0.0, "resting": False}
 
     @_serialized
-    def _create_order(self, symbol, side, amount, order_type, price, reduce_only):
+    def _create_order(self, symbol, side, amount, order_type, price, reduce_only, post_only=False):
         coin = self._coin(symbol)
         size = self._round_size(coin, amount)
         if size <= 0:
             raise OrderQuantityTooSmall(f"quantity {amount:g} rounds to zero")
         if order_type == "limit" and (price is None or float(price) <= 0):
             raise ValueError("limit price must be positive")
+        if post_only and order_type != "limit":
+            raise ValueError("post_only requires a limit order")
         is_buy = side == "buy"
         leverage = self.config.get("leverage")
         if leverage and not reduce_only:
@@ -711,7 +713,8 @@ class HyperliquidExchange:
         if order_type == "limit":
             limit_px = self._round_price(coin, float(price))
             result = self.client.order(
-                coin, is_buy, size, limit_px, {"limit": {"tif": "Gtc"}}, reduce_only=reduce_only,
+                coin, is_buy, size, limit_px, {"limit": {"tif": "Alo" if post_only else "Gtc"}},
+                reduce_only=reduce_only,
             )
         else:
             mid = self._mark_price(coin)
@@ -729,9 +732,10 @@ class HyperliquidExchange:
             "open" if status["resting"] else "closed", reduce_only,
         )
 
-    async def create_order(self, symbol, side, amount, order_type="market", price=None, reduce_only=False):
+    async def create_order(self, symbol, side, amount, order_type="market", price=None,
+                           reduce_only=False, post_only=False):
         return await asyncio.to_thread(
-            self._create_order, symbol, side, amount, order_type, price, reduce_only,
+            self._create_order, symbol, side, amount, order_type, price, reduce_only, post_only,
         )
 
     @staticmethod

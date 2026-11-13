@@ -13,6 +13,7 @@ data/
 .*.swp
 
 # Python build and test artifacts
+.venv/
 __pycache__/
 *.py[cod]
 *.egg-info/

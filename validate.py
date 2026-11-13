@@ -124,6 +124,29 @@ def _leader_address(leader, label):
     assert _is_address(text), f"{label}: address must be a 42-character 0x address"
 
 
+def _validate_mirror_orders(value):
+    if value is None:
+        return
+    assert isinstance(value, dict), "mirror_orders must be a mapping"
+    for key in ("enabled", "post_only", "shadow"):
+        if key in value:
+            assert isinstance(value[key], bool), f"mirror_orders.{key} must be a boolean"
+    if "max_orders" in value:
+        count = value["max_orders"]
+        assert (isinstance(count, int) and not isinstance(count, bool) and count >= 1), (
+            "mirror_orders.max_orders must be a positive integer"
+        )
+    for key in ("refresh_seconds", "leader_orders_seconds", "dex_probe_seconds",
+                "failure_cooldown_seconds", "credit_ttl_seconds"):
+        if key in value:
+            assert _positive_number(value[key]), f"mirror_orders.{key} must be positive"
+    if "credit_grace_ms" in value:
+        grace = value["credit_grace_ms"]
+        assert _is_number(grace) and grace >= 0, (
+            "mirror_orders.credit_grace_ms must be non-negative"
+        )
+
+
 def _validate_leaders(c, accounts):
     leaders = c.get("leaders") or []
     names = set()
@@ -139,6 +162,11 @@ def _validate_leaders(c, accounts):
         source = str(leader.get("source") or _DEFAULT_SOURCE)
         assert source == _DEFAULT_SOURCE, f"{label}: unknown source {source}"
         _leader_address(leader, label)
+
+        if "mirror_orders" in leader:
+            assert isinstance(leader["mirror_orders"], bool), (
+                f"{label}.mirror_orders must be a boolean"
+            )
 
         account = leader.get("execution_account")
         assert account in accounts, f"unknown execution account: {account}"
@@ -157,6 +185,7 @@ def validate(path):
     assert c.get("execution_accounts") is not None, "execution_accounts is required"
     _validate_execution_accounts(c["execution_accounts"])
     _validate_telegram(c.get("telegram"))
+    _validate_mirror_orders(c.get("mirror_orders"))
     _validate_leaders(c, set(c["execution_accounts"]))
     _validate_auto_breakeven_effective(c)
     return True

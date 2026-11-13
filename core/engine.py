@@ -68,6 +68,10 @@ class Engine:
         # Console consumes these immutable fill events to attribute exchange
         # realized PnL back to the leader that generated the order.
         self.fill_events = []
+        # Optional proactive limit-order mirror (core.mirror.OrderMirror).
+        # Snapshots drive the market path; the mirror handles resting orders
+        # and coordinates with this engine through ``consume_credit``.
+        self.mirror = None
         if state_store:
             self._migrate_owners()
             self._drop_removed_leaders()
@@ -172,6 +176,10 @@ class Engine:
                 self.previous_at.pop(leader, None)
                 if not enabled:
                     await self.cancel_pending_orders(leader=leader, reason='leader disabled')
+                    if self.mirror is not None:
+                        await self.mirror.drop_leader_locked(leader)
+                elif self.mirror is not None:
+                    self.mirror.request_sync(force_orders=True)
             if not address_changed:
                 return False
             # A new address is a new leader episode.  Diffing the first event
@@ -192,6 +200,9 @@ class Engine:
                 self._auto_be_retry_at.pop(key, None)
                 self._auto_be_warned.pop(key, None)
             await self.cancel_pending_orders(leader=leader, reason='leader address changed')
+            if self.mirror is not None:
+                await self.mirror.drop_leader_locked(leader)
+                self.mirror.request_sync(force_orders=True)
             self._save_state()
             return True
 
@@ -212,6 +223,8 @@ class Engine:
             self.runtime_state['breakeven'] = self.breakeven
             self.runtime_state['auto_breakeven_skip'] = self.auto_breakeven_skip
             self.runtime_state['risk'] = self.risk.state()
+            if self.mirror is not None:
+                self.runtime_state['mirror_orders'] = self.mirror.snapshot()
             self.state_store.save(self.runtime_state)
 
     async def _notify(self, method, *args, **kwargs):
@@ -1041,23 +1054,99 @@ class Engine:
             return f'market={current:g}, leader entry={entry:g}, target={target:g}'
         return None
 
+    async def sizing(self, leader):
+        """Return ``(ratio, budget, equity, denominator)`` for a leader.
+
+        Shared with ``core.mirror`` so a mirrored order and a snapshot-driven
+        order scale the leader's size identically.
+        """
+        cfg = self.leaders[leader]
+        denominator = float(cfg['total_margin'])
+        if denominator <= 0:
+            raise ValueError('total_margin must be positive')
+        budget = self.exchange.config.get('fixed_balance_usdt')
+        equity = None
+        if budget is None:
+            equity = await self.exchange.equity()
+            budget = equity
+        else:
+            budget = float(budget)
+        ratio = budget / denominator * float(cfg.get('coefficient', 1))
+        return ratio, float(budget), equity, denominator
+
+    async def _credit_bookkeeping(self, leader, signal, reduce=False):
+        """Keep ownership/entry/protection in sync for a mirrored fill.
+
+        The mirror filled (or the leader did) without the snapshot path placing
+        an order, so the normal bookkeeping below the order call never runs.
+        """
+        symbol = signal.symbol
+        try:
+            if not reduce and f'{leader}:{symbol}' in self.stopped:
+                log.info('MIRROR CREDIT leader=%s symbol=%s ignored: stopped out', leader, symbol)
+                return
+            if not reduce:
+                ok, owner = await self._claim_or_check(leader, symbol)
+                if not ok:
+                    log.info('MIRROR CREDIT leader=%s symbol=%s ignored: owned by %s',
+                             leader, symbol, owner)
+                    return
+            live = await self.exchange.position_size(symbol)
+            if reduce:
+                await self._release_if_flat(leader, symbol, live=live)
+                return
+            if abs(live) > 1e-12:
+                self.entered[f'{leader}:{symbol}'] = True
+                self._save_state()
+                await self._sync_protection(leader, symbol)
+        except Exception:
+            log.warning('MIRROR CREDIT bookkeeping failed for %s %s',
+                        leader, symbol, exc_info=True)
+
+    async def _consume_mirror_credit(self, leader, signal, ratio, startup, startup_symbols):
+        """Apply a mirrored-fill credit to a snapshot signal.
+
+        Returns ``None`` when the mirror already covers the whole delta (the
+        caller must not place an order) or a possibly-resized signal.
+        """
+        mirror = self.mirror
+        if mirror is None or ratio <= 0:
+            return signal
+        if startup or signal.symbol in startup_symbols:
+            return signal
+        want = signal.delta / ratio
+        credit = mirror.consume_credit(leader, signal.symbol, want)
+        if not credit and mirror.has_live_mirror(leader, signal.symbol, signal.delta):
+            # The position snapshot can arrive before the userFills event that
+            # explains it.  Wait briefly instead of placing a duplicate order.
+            await mirror.wait_for_fills(mirror.grace_ms)
+            credit = mirror.consume_credit(leader, signal.symbol, want)
+        if not credit:
+            return signal
+        remaining = want - credit
+        if abs(remaining) <= 1e-12:
+            if signal.kind in ('open', 'increase', 'close_reverse'):
+                # A resting late-entry limit would now be an orphan on top of
+                # the mirrored fill; a stale carry would over-size the next add.
+                await self._cancel_pending(
+                    leader, signal.symbol, 'mirrored fill covers this entry')
+                self._set_carry(leader, signal.symbol)
+            await self._credit_bookkeeping(
+                leader, signal, reduce=signal.kind in ('decrease', 'close'))
+            return None
+        if signal.kind in ('open', 'increase'):
+            return replace(signal, delta=remaining * ratio)
+        # Closes/reversals size from the live position; a partial credit leaves
+        # the normal path to finish whatever is left.
+        return signal
+
     async def process(self, leader, positions, resync=False):
         protect = []
         async with self._lock:
             cfg = self.leaders[leader]
             if not cfg.get('enabled', True):
                 return []
-            denominator = float(cfg['total_margin'])
-            if denominator <= 0:
-                raise ValueError('total_margin must be positive')
-            budget = self.exchange.config.get('fixed_balance_usdt')
-            equity = None
-            if budget is None:
-                equity = await self.exchange.equity()
-                budget = equity
-            else:
-                budget = float(budget)
-            ratio = budget / denominator * float(cfg.get('coefficient', 1))
+            ratio, budget, equity, denominator = await self.sizing(leader)
             startup = leader not in self.previous
             startup_symbols = self.startup_pending.get(leader, set())
             previous = dict(self.previous.get(leader, {}))
@@ -1123,6 +1212,12 @@ class Engine:
                         # The leader is leaving; an unfilled late-entry limit
                         # would otherwise fill later as an orphan position.
                         await self._cancel_pending(leader, s.symbol, f'{s.kind} signal from leader')
+                    covered = await self._consume_mirror_credit(
+                        leader, s, ratio, startup, startup_symbols)
+                    if covered is None:
+                        # A mirrored maker fill already accounts for this delta.
+                        continue
+                    s = covered
                     if s.kind in ('open', 'increase', 'close_reverse') and (self.paused or self.risk.locked):
                         reason = 'new exposure is paused' if self.paused else 'account is hard-stop locked'
                         await self._skip(leader, s, reason)
@@ -1294,6 +1389,16 @@ class Engine:
                     elif not reduce and carry_amount and carry.get('side') != side:
                         self._set_carry(leader, s.symbol)
                     typ = 'limit' if not symbol_startup and cfg.get('late_entry_enabled') and s.kind == 'open' else 'market'
+                    if typ == 'limit' and self.mirror is not None and self.mirror.enabled_for(leader):
+                        # The whole point of mirroring is to follow the
+                        # leader's order type.  A late-entry offset limit would
+                        # turn a leader market order into a resting limit.
+                        if leader not in self.mirror._warned_late_entry:
+                            self.mirror._warned_late_entry.add(leader)
+                            log.warning(
+                                'Ignoring late_entry_enabled for mirror leader=%s; '
+                                'order type follows the leader', leader)
+                        typ = 'market'
                     price = None
                     if typ == 'limit':
                         anchor = positions[s.symbol].entry_price
@@ -1307,6 +1412,10 @@ class Engine:
                         await self._skip(leader, s, f'{reason} ({exc})')
                         continue
                     ordered = True
+                    if self.mirror is not None:
+                        # The snapshot path already acted on this delta; a
+                        # leftover credit must not suppress a future signal.
+                        self.mirror.forget_credit(leader, s.symbol)
                     if not reduce:
                         self._set_carry(leader, s.symbol)
                     log.info('ORDER RESULT leader=%s symbol=%s id=%s status=%s amount=%s', leader, s.symbol, order.id, order.status, order.amount)

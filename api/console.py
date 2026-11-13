@@ -518,7 +518,11 @@ class ConsoleService:
                 # its subscription without waiting for a restart.
                 await self.leader_stream.set_addresses(
                     [_address(item.get("address")) for item in self.engine.leaders.values()
-                     if item.get("enabled", True)]
+                     if item.get("enabled", True)],
+                    ([_address(item.get("address")) for item in self.engine.leaders.values()
+                      if item.get("enabled", True) and item.get("mirror_orders", False)]
+                     if getattr(self.engine, "mirror", None) is not None
+                     and self.engine.mirror.enabled else []),
                 )
         if config.get("enabled", True) and (address_changed or "enabled" in changes):
             # Seed the new baseline immediately so the first diff is against

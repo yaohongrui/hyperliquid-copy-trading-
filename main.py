@@ -6,6 +6,7 @@ from config.loader import load
 from exchanges.dry_run import DryRunExchange
 from exchanges.hyperliquid_exchange import HyperliquidExchange
 from core.engine import Engine
+from core.mirror import OrderMirror
 from core.symbols import SymbolMap
 from sources.position_queries import account_positions, leader_positions, leader_snapshot
 from sources.hyperliquid_ws import HyperliquidWS
@@ -39,15 +40,20 @@ async def main(path):
     symbol_map = SymbolMap(c.get("symbol_map"))
     exchange = DryRunExchange(account, symbol_map) if dry_run else HyperliquidExchange(account, symbol_map)
     engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')), symbol_map=symbol_map, auto_breakeven=c.get('auto_breakeven'), stop_out_cooldown=c.get('stop_out_cooldown_seconds', 600))
+    mirror = OrderMirror(engine, c.get('mirror_orders') or {})
+    engine.mirror = mirror
     engine.config_manager = ConfigManager(path)
     mode = "dry-run" if dry_run else "LIVE"
-    log.info("HL copytrade started in %s mode; leaders=%s account=%s", mode, ",".join(active) or "none", account_name)
+    mirror_leaders = ",".join(mirror.leaders()) if mirror.enabled else "none"
+    log.info("HL copytrade started in %s mode; leaders=%s account=%s mirror=%s",
+             mode, ",".join(active) or "none", account_name, mirror_leaders)
     stop = asyncio.Event()
     telegram = None
     telegram_task = None
     alerts = None
     alerts_task = None
     ws_task = None
+    mirror_task = None
     protection_task = None
     api_runner = None
     exchange_started = False
@@ -125,6 +131,7 @@ async def main(path):
             (c.get("hyperliquid") or {}).get("ws_url", "wss://api.hyperliquid.xyz/ws"),
             _hyperliquid_addresses(enabled_hl),
             (c.get("hyperliquid") or {}).get("reconnect_seconds", 3),
+            _mirror_addresses(enabled_hl) if mirror.enabled else (),
         )
         console = ConsoleService(engine, c, (c.get('console') or {}).get('database', 'data/console.sqlite3'), ws)
         # Installs predating the entered map have no record of which symbols were
@@ -139,10 +146,20 @@ async def main(path):
                 log.info("Initial leader snapshot processed for %s", name)
             except Exception:
                 log.exception("Initial leader snapshot failed for %s", name)
+        # Start the mirror after the position baseline exists, so the fill
+        # floor lines up with the snapshot the engine diffed against.  It also
+        # cancels any mirrored order restored from state, even when the
+        # feature itself is currently disabled.
+        try:
+            await mirror.startup()
+        except Exception:
+            log.exception("Order mirror startup failed")
         ws_task = asyncio.create_task(
-            _consume_leaders(ws, engine, hl_leaders, (c.get("hyperliquid") or {}).get("silence_seconds", 120)),
+            _consume_leaders(ws, engine, hl_leaders, (c.get("hyperliquid") or {}).get("silence_seconds", 120), mirror),
             name="hyperliquid-ws",
         )
+        if mirror.enabled:
+            mirror_task = asyncio.create_task(mirror.run(), name="order-mirror")
         protection_task = asyncio.create_task(
             _reconcile_protections(engine, stop, c.get('protection_reconcile_seconds', 5)),
             name="protection-reconciler")
@@ -151,7 +168,9 @@ async def main(path):
         await web.TCPSite(api_runner, "127.0.0.1", 8766).start()
         await stop.wait()
     finally:
-        tasks = [task for task in (ws_task, protection_task) if task is not None]
+        if mirror_task is not None:
+            mirror.stop()
+        tasks = [task for task in (ws_task, protection_task, mirror_task) if task is not None]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -178,6 +197,15 @@ def _hyperliquid_addresses(leaders):
         _address(cfg.get("address"))
         for cfg in leaders.values()
         if cfg.get("enabled", True)
+    ]
+
+
+def _mirror_addresses(leaders):
+    """Leaders opted into limit-order mirroring (fills + order updates)."""
+    return [
+        _address(cfg.get("address"))
+        for cfg in leaders.values()
+        if cfg.get("enabled", True) and cfg.get("mirror_orders", False)
     ]
 
 
@@ -210,7 +238,7 @@ async def _seed_entered(engine, store):
     engine._save_state()
 
 
-async def _consume_leaders(source, engine, leaders, silence_seconds=120):
+async def _consume_leaders(source, engine, leaders, silence_seconds=120, mirror=None):
     # The subscription is change-driven, so a healthy socket can be quiet for a
     # long time.  The watchdog only surfaces a silence long enough that a dead
     # subscription is more likely than idle leaders; the console's low-rate
@@ -220,10 +248,14 @@ async def _consume_leaders(source, engine, leaders, silence_seconds=120):
     try:
         async for event in source.stream():
             watch["last_event"] = time.monotonic()
-            log.debug("HL event channel=%s", event.get("channel"))
-            if event.get("channel") == "resync":
+            channel = event.get("channel")
+            log.debug("HL event channel=%s", channel)
+            if channel == "resync":
                 # Websocket (re)connected: closes that fired during an outage are
                 # never replayed, so re-seed every leader from a REST snapshot.
+                if mirror is not None:
+                    mirror.clear_credits()
+                    mirror.request_sync(force_orders=True)
                 for name, cfg in leaders.items():
                     if not cfg.get("enabled", True):
                         continue
@@ -232,11 +264,26 @@ async def _consume_leaders(source, engine, leaders, silence_seconds=120):
                     except Exception:
                         log.exception("Leader snapshot resync failed for %s", name)
                 continue
-            if event.get("channel") != "allDexsClearinghouseState":
-                continue
             data = event.get("data") or {}
-            address = str(data.get("user", "")).lower()
             address_map = {_address(item.get("address")).lower(): name for name, item in leaders.items()}
+            if channel == "orderUpdates":
+                # Only subscribed when exactly one leader is mirrored, because
+                # the channel payload carries no user address.
+                mirrored = [name for name, cfg in leaders.items()
+                            if cfg.get("enabled", True) and cfg.get("mirror_orders", False)]
+                if mirror is not None and len(mirrored) == 1:
+                    mirror.on_order_updates(mirrored[0], data)
+                continue
+            if channel == "userFills":
+                # Mirrored leaders only; attribution comes from ``data.user``
+                # (orderUpdates omits the user, so it is not subscribed).
+                leader = address_map.get(str(data.get("user", "")).lower())
+                if leader and mirror is not None:
+                    mirror.on_fills(leader, data.get("fills") or [])
+                continue
+            if channel != "allDexsClearinghouseState":
+                continue
+            address = str(data.get("user", "")).lower()
             leader = address_map.get(address)
             if not leader:
                 log.warning("HL event for unknown leader address %s", address)

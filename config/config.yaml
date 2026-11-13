@@ -21,6 +21,23 @@ stop_out_cooldown_seconds: 600
 # request budget (the dashboard has its own interval).
 protection_reconcile_seconds: 15
 
+# Copy a leader's resting limit orders as post-only orders at the exact same
+# price.  Only leaders with ``mirror_orders: true`` participate; each such
+# leader keeps at most ``max_orders`` live mirrors (default: the nearest order
+# above and the nearest below the mark).  Market/taker fills still follow the
+# normal market path.  ``shadow: true`` logs the selection without placing.
+mirror_orders:
+  enabled: true
+  max_orders: 2
+  post_only: true
+  refresh_seconds: 5
+  leader_orders_seconds: 10
+  dex_probe_seconds: 120
+  failure_cooldown_seconds: 30
+  credit_grace_ms: 1200
+  credit_ttl_seconds: 900
+  shadow: false
+
 console:
   database: data/console.sqlite3
   domain: yhr.lol
@@ -42,6 +59,7 @@ leaders:
   execution_account: hl_primary
   coefficient: 5
   enabled: true
+  mirror_orders: false
   symbol_blacklist: []
   late_entry_enabled: true
   late_entry_offset_pct: 0.2
@@ -55,6 +73,7 @@ leaders:
   execution_account: hl_primary
   coefficient: 0.66
   enabled: true
+  mirror_orders: false
   symbol_blacklist: []
   late_entry_enabled: false
   late_entry_offset_pct: 0.2
@@ -68,6 +87,7 @@ leaders:
   execution_account: hl_primary
   coefficient: 13.14
   enabled: true
+  mirror_orders: false
   symbol_blacklist: []
   late_entry_enabled: false
   late_entry_offset_pct: 0.2
@@ -81,6 +101,7 @@ leaders:
   execution_account: hl_primary
   coefficient: 5
   enabled: false
+  mirror_orders: false
   symbol_blacklist: []
   late_entry_enabled: false
   late_entry_offset_pct: 0.1
