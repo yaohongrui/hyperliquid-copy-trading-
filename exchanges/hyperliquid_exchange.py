@@ -25,7 +25,7 @@ from hyperliquid.utils.error import ClientError
 from core.models import Order
 from core.request_stats import record as record_request
 from core.symbols import SymbolMap
-from .base import OrderQuantityTooSmall
+from .base import OrderGone, OrderQuantityTooSmall
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,8 @@ def _small_order(message):
 
 
 def _order_gone(exc):
+    if isinstance(exc, OrderGone):
+        return True
     message = str(exc).upper()
     return any(token in message for token in _ORDER_GONE_TOKENS)
 
@@ -742,21 +744,38 @@ class HyperliquidExchange:
 
     @staticmethod
     def _check_cancel(result):
-        """Raise when a cancel response reports a non-"already gone" error."""
+        """Raise ``OrderGone`` after a cancel the venue reports as already gone.
+
+        Callers need to distinguish a real cancellation from an order that had
+        already filled (or was already cancelled): the fill still has to be
+        booked.  Previously this silently returned for "already gone", which
+        made the recovery paths in ``Engine._cancel_pending`` and
+        ``OrderMirror._cancel`` unreachable with the live adapter.
+        """
         if not isinstance(result, dict):
             return
         if result.get("status") == "err":
             message = str(result.get("response") or result)
-            if not _order_gone(message):
-                raise RuntimeError(message)
-            return
+            if _order_gone(message):
+                raise OrderGone(message)
+            raise RuntimeError(message)
         response = result.get("response") or {}
         data = response.get("data") if isinstance(response, dict) else None
         statuses = data.get("statuses") if isinstance(data, dict) else None
-        errors = [str(item) for item in statuses or []
-                  if isinstance(item, str) and item.lower() not in ("success", "waitingforfill")]
-        if errors and not all(_order_gone(message) for message in errors):
-            raise RuntimeError("; ".join(errors))
+        errors = []
+        for item in statuses or []:
+            if isinstance(item, dict):
+                if item.get("error"):
+                    errors.append(str(item["error"]))
+            elif isinstance(item, str) and item.lower() not in (
+                    "success", "waitingforfill"):
+                errors.append(item)
+        if not errors:
+            return
+        message = "; ".join(errors)
+        if all(_order_gone(item) for item in errors):
+            raise OrderGone(message)
+        raise RuntimeError(message)
 
     @_serialized
     def _cancel_order(self, order_id, symbol=None):

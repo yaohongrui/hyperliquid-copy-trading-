@@ -5,7 +5,7 @@ import time
 from dataclasses import replace
 from .detector import diff_positions
 from .symbols import SymbolMap
-from exchanges.base import OrderQuantityTooSmall
+from exchanges.base import OrderGone, OrderQuantityTooSmall
 from risk.manager import RiskManager
 
 log = logging.getLogger(__name__)
@@ -282,10 +282,13 @@ class Engine:
 
     @staticmethod
     def _order_gone(exc):
+        if isinstance(exc, OrderGone):
+            return True
         message = str(exc).upper()
         return any(token in message for token in (
             'ORDER_NOT_FOUND', 'ORDER NOT FOUND', 'NOT_FOUND', 'NOT FOUND',
             'UNKNOWN_ORDER', 'UNKNOWN ORDER', 'ALREADY FILLED', 'ALREADY CLOSED',
+            'ALREADY CANCELED', 'ALREADY CANCELLED', 'NEVER PLACED',
             'NOT OPEN', 'DOES NOT EXIST', 'NO SUCH ORDER',
             'INVALID ALGO', 'BEEN COMPLETED',
         ))
@@ -628,8 +631,7 @@ class Engine:
                     # flavors of "order is gone" as an already-completed
                     # cancellation instead of aborting the release with the
                     # owner intact.
-                    message = str(exc).upper()
-                    if type(exc).__name__ != 'OrderNotFound' and 'ORDER_NOT_FOUND' not in message:
+                    if not self._order_gone(exc):
                         log.warning('Failed to cancel protection order %s for %s', old, symbol, exc_info=True)
                 if hasattr(self.exchange, 'cancel_protection_orders'):
                     try:

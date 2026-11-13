@@ -1,7 +1,7 @@
 import unittest
 
 from core.symbols import SymbolMap
-from exchanges.base import OrderQuantityTooSmall
+from exchanges.base import OrderGone, OrderQuantityTooSmall
 from exchanges.hyperliquid_exchange import HyperliquidExchange
 
 
@@ -173,6 +173,30 @@ class OrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(call["reduce_only"])
         self.assertEqual(call["order_type"]["trigger"]["triggerPx"], 90)
         self.assertTrue(call["order_type"]["trigger"]["isMarket"])
+
+
+class CancelResponseTests(unittest.TestCase):
+    def test_already_gone_cancel_raises_order_gone(self):
+        with self.assertRaises(OrderGone):
+            HyperliquidExchange._check_cancel({
+                "status": "ok",
+                "response": {"data": {"statuses": [
+                    "Order was never placed, already canceled, or filled."]}},
+            })
+
+    def test_real_cancel_error_is_not_reported_as_gone(self):
+        with self.assertRaises(RuntimeError) as caught:
+            HyperliquidExchange._check_cancel({
+                "status": "ok",
+                "response": {"data": {"statuses": ["Insufficient margin"]}},
+            })
+        self.assertNotIsInstance(caught.exception, OrderGone)
+
+    def test_successful_cancel_does_not_raise(self):
+        HyperliquidExchange._check_cancel({
+            "status": "ok",
+            "response": {"data": {"statuses": ["success"]}},
+        })
 
 
 if __name__ == "__main__":

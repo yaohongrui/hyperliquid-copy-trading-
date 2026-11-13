@@ -288,6 +288,78 @@ class MirrorExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mirror.orders, {})
 
 
+class StaleStateTests(unittest.IsolatedAsyncioTestCase):
+    def build(self, orders=None, mirror_cfg=None):
+        exchange = MirrorExchange()
+        engine, mirror = make_engine(exchange, mirror_cfg)
+        mirror._books[("L", "")] = list(orders or [])
+        mirror._book_at["L"] = time.monotonic() + 3600
+        return exchange, engine, mirror
+
+    async def test_filled_mirror_is_not_placed_again_from_a_stale_book(self):
+        exchange, engine, mirror = self.build([resting("1", "buy", 95, 10, 100)])
+        await mirror.sync()
+        self.assertEqual(len(exchange.orders), 1)
+        # Our mirror filled, but the cached leader book still lists the order
+        # (missed userFills / REST refresh not due).  It must not be re-placed.
+        exchange.order_states["m1"] = {
+            "status": "closed", "filled": 10.0, "remaining": 0.0,
+            "average": 95.0, "price": 95.0,
+        }
+        await mirror.sync()
+        self.assertEqual(mirror.orders, {})
+        self.assertEqual(len(exchange.orders), 1)
+
+    async def test_partial_fill_keeps_the_matching_resting_size(self):
+        exchange, engine, mirror = self.build([resting("1", "buy", 95, 10, 100)])
+        await mirror.sync()
+        # Leader partly filled (6 still resting) and our mirror filled 4, so
+        # our live resting size (10 - 4) already matches the leader's 6.
+        # The old arithmetic (6 - 4 = 2) shrank it instead.
+        exchange.order_states["m1"] = {
+            "status": "open", "filled": 4.0, "remaining": 6.0,
+            "average": 95.0, "price": 95.0,
+        }
+        mirror._books[("L", "")] = [resting("1", "buy", 95, 6, 100)]
+        await mirror.sync()
+        self.assertEqual(exchange.cancelled, [])
+        self.assertEqual(len(exchange.orders), 1)
+        self.assertEqual(next(iter(mirror.orders.values()))["amount"], 10.0)
+
+
+class StartupPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_state_saved_before_startup_keeps_persisted_mirrors(self):
+        class MemoryStore:
+            def __init__(self, state):
+                self.state = state
+
+            def load(self):
+                return self.state
+
+            def save(self, state):
+                self.state = state
+
+        state = {"mirror_orders": {"L:1": {
+            "leader": "L", "leader_oid": "1", "symbol": "AAA", "side": "buy",
+            "price": 95.0, "amount": 10.0, "order_id": "stale",
+            "reduce_only": False, "filled": 0.0,
+        }}}
+        store = MemoryStore(state)
+        exchange = MirrorExchange()
+        engine = Engine(exchange, {"L": {
+            "total_margin": 100, "coefficient": 1, "enabled": True,
+            "mirror_orders": True, "symbol_blacklist": [], "address": "0xleader",
+        }}, state_store=store)
+        mirror = OrderMirror(engine, {"enabled": False})
+        engine.mirror = mirror
+        # main._seed_entered() saves state before mirror.startup() runs.
+        engine._save_state()
+        self.assertIn("L:1", store.state["mirror_orders"])
+        await mirror.startup()
+        self.assertEqual(exchange.cancelled, ["stale"])
+        self.assertEqual(store.state["mirror_orders"], {})
+
+
 class GoneCancelTests(unittest.IsolatedAsyncioTestCase):
     class GoneOnCancelExchange(MirrorExchange):
         """First poll sees the order open; the cancel then reports it gone and

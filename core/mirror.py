@@ -23,7 +23,7 @@ from dataclasses import replace
 
 import aiohttp
 
-from exchanges.base import OrderQuantityTooSmall
+from exchanges.base import OrderGone, OrderQuantityTooSmall
 from sources.leader_orders import (
     LeaderFillBook,
     LeaderRestingOrder,
@@ -43,6 +43,8 @@ _ORDER_GONE_TOKENS = (
 
 
 def _order_gone(exc):
+    if isinstance(exc, OrderGone):
+        return True
     message = str(exc).upper()
     return any(token in message for token in _ORDER_GONE_TOKENS)
 
@@ -98,6 +100,12 @@ class OrderMirror:
         self._sync_task = None
         self._force_orders = False
         self._stop = False
+        # Until startup() has cancelled the mirrors restored from state,
+        # snapshot() must not overwrite them with the empty live order map:
+        # any _save_state() between construction and startup (startup seeding
+        # calls _save_state) would otherwise lose the orders without ever
+        # cancelling them.
+        self._started = False
         self._failed_at = {}
         self._warned_late_entry = set()
         # leader order ids the venue reported as fully filled via orderUpdates,
@@ -124,6 +132,7 @@ class OrderMirror:
         # Restored mirrors may carry stale prices/sizes; drop them even when
         # the feature was disabled since the last run.
         await self._cancel_persisted()
+        self._started = True
         self.set_floor()
         if not self.enabled:
             return
@@ -626,6 +635,12 @@ class OrderMirror:
             if any(item.get("leader_oid") == order.oid and not item.get("orphan")
                    for item in live):
                 continue
+            if (leader, str(order.oid)) in self._mirrored_oids:
+                # We already mirrored this leader order and our record is gone,
+                # which means it filled.  The cached leader book can lag that
+                # fill (missed userFills, or a REST refresh not due yet); never
+                # place a second copy on top of it.
+                continue
             if now - self._failed_at.get((leader, order.oid), 0.0) < self.failure_cooldown:
                 continue
             placed = await self._place(leader, order, ratio)
@@ -691,10 +706,15 @@ class OrderMirror:
             await self._cancel(item, reason)
 
     async def _sync_item(self, item, order, ratio):
+        # ``order.size`` is the leader's *remaining* open size.  Our filled
+        # quantity corresponds to what the leader already filled, not to a
+        # reduction of its remaining size, so the new resting order must be
+        # the full remaining target.  Compare it with what is actually still
+        # resting on our side (amount minus our own fills).
         target = abs(order.size) * ratio
         filled = float(item.get("filled") or 0.0)
-        remaining = max(0.0, target - filled)
-        current = float(item.get("amount") or 0.0)
+        current = max(0.0, float(item.get("amount") or 0.0) - filled)
+        remaining = max(0.0, target)
         if remaining <= 0:
             await self._cancel(item, "no quantity left to mirror")
             return
@@ -1025,6 +1045,10 @@ class OrderMirror:
 
     # -- persistence -------------------------------------------------------
     def snapshot(self):
+        if not self._started and not self.orders:
+            # Preserve whatever startup has not cancelled yet.  Replacing it
+            # with the empty live map would strand live venue orders.
+            return dict(self.engine.runtime_state.get("mirror_orders") or {})
         keys = ("leader", "leader_oid", "symbol", "side", "price", "amount",
                 "leader_size", "order_id", "reduce_only", "filled", "created_at",
                 "orphan", "orphaned_at")

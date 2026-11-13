@@ -3,6 +3,9 @@ from abc import ABC, abstractmethod
 class OrderQuantityTooSmall(ValueError):
  pass
 
+class OrderGone(RuntimeError):
+ """The venue no longer has the order (filled, cancelled, or unknown)."""
+
 class Exchange(ABC):
  @abstractmethod
  async def create_order(self,symbol,side,amount,order_type='market',price=None,reduce_only=False,post_only=False): ...
