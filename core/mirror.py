@@ -524,7 +524,11 @@ class OrderMirror:
         return None
 
     def _select(self, candidates):
-        """Nearest order above and nearest below the mark, capped per leader."""
+        """Nearest order above and nearest below the mark.
+
+        ``max_orders`` is a total across all symbols: 1 keeps only the single
+        nearest order, 2 keeps one above plus one below.
+        """
         if not candidates:
             return []
         above = [order for order in candidates if order.above]

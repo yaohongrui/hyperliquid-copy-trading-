@@ -185,6 +185,40 @@ class ValidateConfigTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.check(config)
 
+    def test_mirror_orders_valid_shape_passes(self):
+        config = base_config()
+        config["mirror_orders"] = {
+            "enabled": True, "max_orders": 2, "credit_grace_ms": 300,
+            "orphan_ttl_seconds": 300, "max_orphans": 2,
+        }
+        self.assertTrue(self.check(config))
+
+    def test_mirror_orders_max_orders_is_one_or_two(self):
+        for count in (1, 2):
+            config = base_config()
+            config["mirror_orders"] = {"max_orders": count}
+            self.assertTrue(self.check(config))
+        for count in (0, 3, True, "2"):
+            config = base_config()
+            config["mirror_orders"] = {"max_orders": count}
+            with self.assertRaises(AssertionError):
+                self.check(config)
+
+    def test_mirror_orders_orphan_settings_are_validated(self):
+        for value in (0, -1, "300", True):
+            config = base_config()
+            config["mirror_orders"] = {"orphan_ttl_seconds": value}
+            with self.assertRaises(AssertionError):
+                self.check(config)
+        for value in (-1, "2", True):
+            config = base_config()
+            config["mirror_orders"] = {"max_orphans": value}
+            with self.assertRaises(AssertionError):
+                self.check(config)
+        config = base_config()
+        config["mirror_orders"] = {"orphan_ttl_seconds": 300, "max_orphans": 0}
+        self.assertTrue(self.check(config))
+
 
 class ValidateAutoBreakevenTests(unittest.TestCase):
     def config(self, global_value=None, leader_value=None):

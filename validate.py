@@ -133,8 +133,10 @@ def _validate_mirror_orders(value):
             assert isinstance(value[key], bool), f"mirror_orders.{key} must be a boolean"
     if "max_orders" in value:
         count = value["max_orders"]
-        assert (isinstance(count, int) and not isinstance(count, bool) and count >= 1), (
-            "mirror_orders.max_orders must be a positive integer"
+        assert (isinstance(count, int) and not isinstance(count, bool)
+                and count in (1, 2)), (
+            "mirror_orders.max_orders must be 1 or 2 "
+            "(nearest above plus nearest below, across all symbols)"
         )
     for key in ("refresh_seconds", "leader_orders_seconds", "dex_probe_seconds",
                 "failure_cooldown_seconds", "credit_ttl_seconds",
