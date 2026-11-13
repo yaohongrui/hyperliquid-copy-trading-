@@ -288,6 +288,112 @@ class MirrorExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mirror.orders, {})
 
 
+class OrphanTests(unittest.IsolatedAsyncioTestCase):
+    def build(self, orders=None, mirror_cfg=None):
+        exchange = MirrorExchange()
+        engine, mirror = make_engine(exchange, mirror_cfg)
+        mirror._books[("L", "")] = list(orders or [])
+        mirror._book_at["L"] = time.monotonic() + 3600
+        return exchange, engine, mirror
+
+    def fill(self, mirror, oid, side="buy", size=10, start=0):
+        mirror.fills.add("L", [{
+            "coin": "AAA", "side": "B" if side == "buy" else "A",
+            "px": "95", "sz": str(size),
+            "time": int((time.time() + 5) * 1000),
+            "crossed": False, "startPosition": str(start),
+            "oid": oid, "tid": f"t-{oid}",
+        }])
+
+    async def make_orphan(self, exchange, mirror, oid="1", side="buy", size=10):
+        await mirror.sync()
+        self.fill(mirror, oid, side, size)
+        mirror._books[("L", "")] = []
+        await mirror.sync()
+        self.assertTrue(next(iter(mirror.orders.values()))["orphan"])
+
+    async def test_paused_cancels_orphan_mirror(self):
+        exchange, engine, mirror = self.build([resting("1", "buy", 95, 10, 100)])
+        await self.make_orphan(exchange, mirror)
+        engine.paused = True
+        await mirror.sync()
+        self.assertEqual(exchange.cancelled, ["m1"])
+        self.assertEqual(mirror.orders, {})
+
+    async def test_paused_keeps_reduce_only_orphan(self):
+        exchange, engine, mirror = self.build(
+            [resting("1", "sell", 105, 5, 100, reduce_only=True)])
+        exchange.positions["AAA"] = 5
+        await self.make_orphan(exchange, mirror, side="sell", size=5)
+        engine.paused = True
+        await mirror.sync()
+        self.assertEqual(exchange.cancelled, [])
+
+    async def test_leader_flat_cancels_orphan_mirror(self):
+        exchange, engine, mirror = self.build([resting("1", "buy", 95, 10, 100)])
+        await self.make_orphan(exchange, mirror)
+        await engine.process("L", {})  # leader is flat -> orphan is pointless
+        await mirror.sync()
+        self.assertEqual(exchange.cancelled, ["m1"])
+
+    async def test_leader_reversal_cancels_orphan_mirror(self):
+        exchange, engine, mirror = self.build([resting("1", "buy", 95, 10, 100)])
+        await self.make_orphan(exchange, mirror)
+        await engine.process("L", {"AAA": Position("AAA", -5, mark_price=100)})
+        await mirror.sync()
+        self.assertEqual(exchange.cancelled, ["m1"])
+
+    async def test_orphan_ttl_expires_mirror(self):
+        exchange, engine, mirror = self.build([resting("1", "buy", 95, 10, 100)])
+        await self.make_orphan(exchange, mirror)
+        item = next(iter(mirror.orders.values()))
+        item["orphaned_at"] = time.time() - mirror.orphan_ttl - 1
+        await mirror.sync()
+        self.assertEqual(exchange.cancelled, ["m1"])
+
+    async def test_orphans_do_not_consume_slots(self):
+        exchange, engine, mirror = self.build([
+            resting("1", "buy", 95, 10, 100),
+            resting("2", "sell", 105, 10, 100),
+        ])
+        await mirror.sync()
+        self.assertEqual(len(exchange.orders), 2)
+        self.fill(mirror, "1", "buy", 10)
+        self.fill(mirror, "2", "sell", 10)
+        mirror._books[("L", "")] = []
+        await mirror.sync()
+        self.assertEqual(len(mirror.orders), 2)
+        self.assertTrue(all(item.get("orphan") for item in mirror.orders.values()))
+        mirror._books[("L", "")] = [resting("9", "buy", 94, 10, 100)]
+        await mirror.sync()
+        self.assertEqual(len(exchange.orders), 3)
+        self.assertEqual(exchange.orders[-1][:2], ("AAA", "buy"))
+
+    async def test_max_orphans_evicts_the_oldest(self):
+        exchange, engine, mirror = self.build([
+            resting("1", "buy", 95, 10, 100),
+            resting("2", "sell", 105, 10, 100),
+        ])
+        await mirror.sync()
+        self.fill(mirror, "1", "buy", 10)
+        self.fill(mirror, "2", "sell", 10)
+        mirror._books[("L", "")] = []
+        await mirror.sync()
+        items = {item["leader_oid"]: item for item in mirror.orders.values()}
+        items["1"]["orphaned_at"] = time.time() - 10
+        items["2"]["orphaned_at"] = time.time()
+        mirror.max_orphans = 1
+        await mirror.sync()
+        self.assertEqual(exchange.cancelled, ["m1"])
+
+    async def test_reduce_signal_cancels_orphan_mirror(self):
+        exchange, engine, mirror = self.build([resting("1", "buy", 95, 10, 100)])
+        await self.make_orphan(exchange, mirror)
+        engine.previous["L"] = {"AAA": Position("AAA", 5, mark_price=100)}
+        await engine.process("L", {})
+        self.assertIn("m1", exchange.cancelled)
+
+
 class CreditTests(unittest.IsolatedAsyncioTestCase):
     def build(self):
         exchange = MirrorExchange()

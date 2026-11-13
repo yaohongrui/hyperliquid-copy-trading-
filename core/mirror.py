@@ -73,6 +73,9 @@ class OrderMirror:
                                  _float(self.config.get("dex_probe_seconds"), 120.0))
         self.grace_ms = max(0, int(_float(self.config.get("credit_grace_ms"), 1200)))
         self.credit_ttl = max(60.0, _float(self.config.get("credit_ttl_seconds"), 900.0))
+        self.orphan_ttl = max(1.0, _float(self.config.get("orphan_ttl_seconds"), 300.0))
+        raw_orphans = self.config.get("max_orphans", 2)
+        self.max_orphans = max(0, int(2 if raw_orphans is None else raw_orphans))
         self.min_sync_seconds = max(0.25, _float(self.config.get("min_sync_seconds"), 1.0))
         self.failure_cooldown = max(1.0, _float(
             self.config.get("failure_cooldown_seconds"), 30.0))
@@ -541,12 +544,23 @@ class OrderMirror:
             if order is None:
                 fully = self._leader_order_filled(item)
                 if fully:
+                    if paused and not item.get("reduce_only"):
+                        # Blocking new exposure must also drop a resting entry
+                        # whose leader order has already filled.
+                        await self._cancel(item, "new entries are paused")
+                        continue
+                    if item.get("orphan"):
+                        reason = self._orphan_reason(leader, item)
+                        if reason:
+                            await self._cancel(item, reason)
+                            continue
+                        continue
                     # The leader filled; leave our mirror resting until it fills
                     # too ("没成交就一直挂着").
-                    if not item.get("orphan"):
-                        item["orphan"] = True
-                        log.info("MIRROR KEEP leader=%s symbol=%s: leader filled, ours resting",
-                                 leader, item.get("symbol"))
+                    item["orphan"] = True
+                    item["orphaned_at"] = time.time()
+                    log.info("MIRROR KEEP leader=%s symbol=%s: leader filled, ours resting",
+                             leader, item.get("symbol"))
                     continue
                 await self._cancel(item, "leader cancelled the order")
                 continue
@@ -562,8 +576,19 @@ class OrderMirror:
                 continue
             await self._sync_item(item, order, ratio)
 
+        orphans = [item for item in self.orders.values()
+                   if item.get("leader") == leader and item.get("orphan")]
+        if len(orphans) > self.max_orphans:
+            orphans.sort(key=lambda item: float(
+                item.get("orphaned_at") or item.get("created_at") or 0.0))
+            for item in orphans[:len(orphans) - self.max_orphans]:
+                await self._cancel(item, "too many resting orphans")
+
         live = [item for item in self.orders.values() if item.get("leader") == leader]
-        slots = max(0, self.max_orders - len(live))
+        # Orphans are orders the leader already filled; they must not eat the
+        # slots that replenish the next nearest order on either side.
+        active = [item for item in live if not item.get("orphan")]
+        slots = max(0, self.max_orders - len(active))
         if slots <= 0:
             return
         now = time.time()
@@ -602,6 +627,40 @@ class OrderMirror:
             # wrong cancellation.
             return bool(fills)
         return filled >= size - 1e-9
+
+    def _orphan_reason(self, leader, item):
+        """Reason to cancel a resting orphan, or ``None`` to keep it."""
+        if item.get("reduce_only"):
+            return None
+        orphaned_at = float(item.get("orphaned_at") or item.get("created_at") or 0.0)
+        if orphaned_at and time.time() - orphaned_at > self.orphan_ttl:
+            return "orphan expired"
+        # ``previous`` only tells us where the leader stood at its last
+        # snapshot.  Right after an entry fill it still shows the pre-fill
+        # position (often flat), so only trust it once a snapshot newer than
+        # the orphan itself has been processed.
+        seen_at = float(self.engine.previous_at.get(leader) or 0.0)
+        if seen_at <= orphaned_at:
+            return None
+        previous = self.engine.previous.get(leader) or {}
+        position = previous.get(str(item.get("symbol", "")).upper())
+        if position is None or abs(float(getattr(position, "size", 0.0))) <= 1e-12:
+            return "leader is flat"
+        if (float(position.size) > 0) != (item.get("side") == "buy"):
+            return "leader reversed"
+        return None
+
+    async def cancel_orphans(self, leader, symbol, reason):
+        """Cancel this leader+symbol's non-reduce-only resting orphans.
+
+        The caller must hold ``engine._lock`` (``Engine.process`` does).
+        """
+        for item in [item for item in self.orders.values()
+                     if item.get("leader") == leader
+                     and str(item.get("symbol", "")).upper() == symbol.upper()
+                     and item.get("orphan")
+                     and not item.get("reduce_only")]:
+            await self._cancel(item, reason)
 
     async def _sync_item(self, item, order, ratio):
         target = abs(order.size) * ratio
@@ -885,7 +944,8 @@ class OrderMirror:
     # -- persistence -------------------------------------------------------
     def snapshot(self):
         keys = ("leader", "leader_oid", "symbol", "side", "price", "amount",
-                "leader_size", "order_id", "reduce_only", "filled", "created_at", "orphan")
+                "leader_size", "order_id", "reduce_only", "filled", "created_at",
+                "orphan", "orphaned_at")
         return {key: {field: item.get(field) for field in keys}
                 for key, item in self.orders.items()}
 

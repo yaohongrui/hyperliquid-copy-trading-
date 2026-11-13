@@ -137,9 +137,15 @@ def _validate_mirror_orders(value):
             "mirror_orders.max_orders must be a positive integer"
         )
     for key in ("refresh_seconds", "leader_orders_seconds", "dex_probe_seconds",
-                "failure_cooldown_seconds", "credit_ttl_seconds"):
+                "failure_cooldown_seconds", "credit_ttl_seconds",
+                "orphan_ttl_seconds"):
         if key in value:
             assert _positive_number(value[key]), f"mirror_orders.{key} must be positive"
+    if "max_orphans" in value:
+        count = value["max_orphans"]
+        assert (isinstance(count, int) and not isinstance(count, bool) and count >= 0), (
+            "mirror_orders.max_orphans must be a non-negative integer"
+        )
     if "credit_grace_ms" in value:
         grace = value["credit_grace_ms"]
         assert _is_number(grace) and grace >= 0, (

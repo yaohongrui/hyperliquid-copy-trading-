@@ -36,6 +36,12 @@ mirror_orders:
   failure_cooldown_seconds: 30
   credit_grace_ms: 1200
   credit_ttl_seconds: 900
+  # An order the leader left resting after filling is an "orphan": it keeps
+  # resting while the leader still holds that symbol, and is cancelled when
+  # the leader is flat/reversed, on pause, or after this TTL.  At most
+  # ``max_orphans`` may stack up; the oldest is evicted first.
+  orphan_ttl_seconds: 300
+  max_orphans: 2
   shadow: false
 
 console:

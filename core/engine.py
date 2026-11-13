@@ -1212,6 +1212,11 @@ class Engine:
                         # The leader is leaving; an unfilled late-entry limit
                         # would otherwise fill later as an orphan position.
                         await self._cancel_pending(leader, s.symbol, f'{s.kind} signal from leader')
+                        if self.mirror is not None:
+                            # Drop resting entry mirrors right away instead of
+                            # waiting for the next five-second reconcile.
+                            await self.mirror.cancel_orphans(
+                                leader, s.symbol, f'{s.kind} signal from leader')
                     covered = await self._consume_mirror_credit(
                         leader, s, ratio, startup, startup_symbols)
                     if covered is None:
