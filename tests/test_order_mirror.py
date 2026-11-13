@@ -288,6 +288,41 @@ class MirrorExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mirror.orders, {})
 
 
+class GoneCancelTests(unittest.IsolatedAsyncioTestCase):
+    class GoneOnCancelExchange(MirrorExchange):
+        """First poll sees the order open; the cancel then reports it gone and
+        the follow-up fetch shows the partial fill."""
+
+        def __init__(self):
+            super().__init__()
+            self._fetches = 0
+
+        async def fetch_order(self, order_id, symbol=None):
+            self._fetches += 1
+            if self._fetches <= 1:
+                return {"status": "open", "filled": 0.0, "remaining": 10.0,
+                        "average": None, "price": 95.0}
+            return {"status": "closed", "filled": 4.0, "remaining": 0.0,
+                    "average": 95.0, "price": 95.0}
+
+        async def cancel_order(self, order_id, symbol=None):
+            self.cancelled.append(order_id)
+            raise RuntimeError("ORDER_NOT_FOUND")
+
+    async def test_cancel_that_finds_the_order_gone_books_the_fill(self):
+        exchange = self.GoneOnCancelExchange()
+        engine, mirror = make_engine(exchange)
+        mirror._books[("L", "")] = [resting("1", "buy", 95, 10, 100)]
+        mirror._book_at["L"] = time.monotonic() + 3600
+        await mirror.sync()
+        self.assertIn("L:1", mirror.orders)
+        mirror._books[("L", "")] = []  # leader cancelled the order
+        await mirror.sync()
+        self.assertEqual(mirror.orders, {})
+        self.assertEqual(len(engine.fill_events), 1)
+        self.assertEqual(engine.fill_events[0]["quantity"], 4.0)
+
+
 class GraceTests(unittest.IsolatedAsyncioTestCase):
     def test_credit_grace_default_is_300(self):
         _, mirror = make_engine(MirrorExchange())

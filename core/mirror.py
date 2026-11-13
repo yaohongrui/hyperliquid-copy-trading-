@@ -940,20 +940,54 @@ class OrderMirror:
         log.info("MIRROR FILLED leader=%s symbol=%s qty=%.10g price=%g id=%s",
                  leader, symbol, quantity, price, item.get("order_id"))
 
+    async def _book_gone_fill(self, item):
+        """Book a fill the venue reports when a cancel finds the order gone.
+
+        Returns True when it booked a positive quantity.  Deliberately unlike
+        ``_book_missing``: the account may already hold a position, so only the
+        order's own reported fill is booked here.
+        """
+        order_id = item.get("order_id")
+        fetcher = getattr(self.engine.exchange, "fetch_order", None)
+        if not order_id or fetcher is None:
+            return False
+        try:
+            state = await fetcher(order_id, item.get("symbol"))
+        except NotImplementedError:
+            return False
+        except Exception:
+            return False
+        if not state:
+            return False
+        filled = max(0.0, float(state.get("filled") or 0.0))
+        previous = float(item.get("filled") or 0.0)
+        if filled <= previous + 1e-12:
+            return False
+        await self._book_fill(
+            item, filled - previous,
+            float(state.get("average") or item.get("price") or 0.0))
+        item["filled"] = filled
+        return True
+
     async def _cancel(self, item, reason):
         key = self._key(item)
         order_id = item.get("order_id")
         if order_id and not self.shadow:
             try:
                 await self.engine.exchange.cancel_order(order_id, item.get("symbol"))
+                # A cancelled mirror did not fill, so a later leader fill for
+                # this order must go through the normal market path.
+                self._forget_mirrored(item.get("leader"), item.get("leader_oid"))
             except Exception as exc:
                 if not _order_gone(exc):
                     log.warning("Failed to cancel mirror order %s for %s (%s)",
                                 order_id, key, reason, exc_info=True)
                     return False
-            # A cancelled mirror did not fill, so a later leader fill for this
-            # order must go through the normal market path.
-            self._forget_mirrored(item.get("leader"), item.get("leader_oid"))
+                # The order may have filled instead of being cancelled.  Ask
+                # the venue once and book the fill before dropping the record.
+                booked = await self._book_gone_fill(item)
+                if not booked:
+                    self._forget_mirrored(item.get("leader"), item.get("leader_oid"))
         self.orders.pop(key, None)
         if not item.get("reduce_only") and not float(item.get("filled") or 0.0):
             # A cancelled, never-filled entry must not keep the symbol claimed.
