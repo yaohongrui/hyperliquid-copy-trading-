@@ -100,6 +100,11 @@ class OrderMirror:
         # leader order ids the venue reported as fully filled via orderUpdates,
         # used when the userFills push has not arrived yet.
         self._filled_oids = {}
+        # (leader, oid) -> wall time we actually mirrored that leader order.
+        # Kept after our record is popped on fill so a userFills event that
+        # arrives later still credits the mirrored fill instead of placing a
+        # duplicate market order.
+        self._mirrored_oids = {}
 
     # -- configuration -----------------------------------------------------
     def enabled_for(self, leader):
@@ -191,12 +196,12 @@ class OrderMirror:
             if fill.crossed:
                 # Taker fill: the snapshot engine copies it with a market order.
                 continue
-            if fill.is_entry:
-                self._add_credit(leader, fill.symbol, fill.signed_size)
-            elif self._mirrored_oid(leader, fill.oid):
-                # A maker exit is only suppressed when we actually mirrored it;
-                # otherwise the snapshot engine closes with a market order.
-                self._add_credit(leader, fill.symbol, fill.signed_size)
+            if not self._mirrored_oid(leader, fill.oid):
+                # We never had a mirror for this order (not selected, placed
+                # too late, or cancelled).  Crediting it would make the
+                # snapshot engine skip a market order it still has to place.
+                continue
+            self._add_credit(leader, fill.symbol, fill.signed_size)
         self._last_fill_at = time.monotonic()
         self.request_sync()
 
@@ -307,8 +312,24 @@ class OrderMirror:
     def _mirrored_oid(self, leader, oid):
         if not oid:
             return False
-        return any(item.get("leader") == leader and item.get("leader_oid") == oid
-                   for item in self.orders.values())
+        if any(item.get("leader") == leader and item.get("leader_oid") == oid
+               for item in self.orders.values()):
+            return True
+        at = self._mirrored_oids.get((leader, str(oid)))
+        if at is None:
+            return False
+        if time.time() - at > self.credit_ttl:
+            self._mirrored_oids.pop((leader, str(oid)), None)
+            return False
+        return True
+
+    def _remember_mirrored(self, leader, oid):
+        if oid is not None:
+            self._mirrored_oids[(leader, str(oid))] = time.time()
+
+    def _forget_mirrored(self, leader, oid):
+        if oid is not None:
+            self._mirrored_oids.pop((leader, str(oid)), None)
 
     def _add_credit(self, leader, symbol, signed_size):
         if not signed_size:
@@ -402,6 +423,10 @@ class OrderMirror:
             self._failed_at.pop(key, None)
         for key in [key for key, at in self._filled_oids.items() if at < cutoff]:
             self._filled_oids.pop(key, None)
+        mirrored_cutoff = time.time() - self.credit_ttl
+        for key in [key for key, at in self._mirrored_oids.items()
+                    if at < mirrored_cutoff]:
+            self._mirrored_oids.pop(key, None)
         async with self.engine._lock:
             for leader in leaders:
                 try:
@@ -653,6 +678,9 @@ class OrderMirror:
                 await self._release_unused(leader, order.symbol)
             return None
         self._failed_at.pop((leader, order.oid), None)
+        # Remember that this leader order really was mirrored so a maker fill
+        # is credited even if our record is popped by the fill itself.
+        self._remember_mirrored(leader, order.oid)
         key = self._key_for(leader, order.oid)
         if str(placed.status) != "open":
             item = {"leader": leader, "leader_oid": order.oid, "symbol": order.symbol,
@@ -736,6 +764,7 @@ class OrderMirror:
                     float(state.get("average") or item.get("price") or 0.0))
             elif status in ("canceled", "cancelled", "rejected", "expired"):
                 self.orders.pop(key, None)
+                self._forget_mirrored(leader, item.get("leader_oid"))
                 self.engine._save_state()
                 await self.engine._notify(
                     "notify_mirror_cancelled", leader, symbol, item, f"exchange reported {status}")
@@ -815,6 +844,9 @@ class OrderMirror:
                     log.warning("Failed to cancel mirror order %s for %s (%s)",
                                 order_id, key, reason, exc_info=True)
                     return False
+            # A cancelled mirror did not fill, so a later leader fill for this
+            # order must go through the normal market path.
+            self._forget_mirrored(item.get("leader"), item.get("leader_oid"))
         self.orders.pop(key, None)
         if not item.get("reduce_only") and not float(item.get("filled") or 0.0):
             # A cancelled, never-filled entry must not keep the symbol claimed.
@@ -845,6 +877,8 @@ class OrderMirror:
             self.credits.pop(key, None)
         for key in [key for key in self._filled_oids if key[0] == leader]:
             self._filled_oids.pop(key, None)
+        for key in [key for key in self._mirrored_oids if key[0] == leader]:
+            self._mirrored_oids.pop(key, None)
         self._fill_floor[leader] = time.time()
         self.engine._save_state()
 

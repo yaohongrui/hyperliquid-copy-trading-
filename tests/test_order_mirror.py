@@ -294,7 +294,12 @@ class CreditTests(unittest.IsolatedAsyncioTestCase):
         engine, mirror = make_engine(exchange)
         return exchange, engine, mirror
 
-    def feed(self, mirror, side, size, start, crossed=False, oid="1"):
+    def feed(self, mirror, side, size, start, crossed=False, oid="1",
+             mirrored=True):
+        # Go through the production path (on_fills) instead of re-implementing
+        # the credit rules: an entry is only credited when it was mirrored.
+        if mirrored:
+            mirror._remember_mirrored("L", oid)
         raw = {
             "coin": "AAA", "side": "B" if side == "buy" else "A",
             "px": "95", "sz": str(size),
@@ -302,11 +307,9 @@ class CreditTests(unittest.IsolatedAsyncioTestCase):
             "crossed": crossed, "startPosition": str(start),
             "oid": oid, "tid": f"t-{oid}",
         }
-        added = mirror.fills.add("L", [raw])
-        for fill in added:
-            if not fill.crossed and fill.is_entry:
-                mirror._add_credit("L", fill.symbol, fill.signed_size)
-        return added
+        mirror.on_fills("L", [raw])
+        if mirror._sync_task is not None:
+            mirror._sync_task.cancel()
 
     async def test_maker_entry_is_not_reordered_by_snapshot_engine(self):
         exchange, engine, mirror = self.build()
@@ -317,6 +320,28 @@ class CreditTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exchange.orders, [])
         self.assertTrue(engine.entered.get("L:AAA"))
         self.assertEqual(engine.owners.get("__default__:AAA"), "L")
+
+    async def test_unmirrored_maker_entry_uses_market_path(self):
+        exchange, engine, mirror = self.build()
+        await engine.process("L", {})  # startup baseline
+        self.feed(mirror, "buy", 5, start=0, oid="unmirrored", mirrored=False)
+        await engine.process("L", {"AAA": Position("AAA", 5, mark_price=100)})
+        self.assertEqual(exchange.orders,
+                         [("AAA", "buy", 5.0, "market", None, False, False)])
+
+    async def test_mirrored_maker_entry_keeps_resting_mirror(self):
+        exchange, engine, mirror = self.build()
+        mirror._books[("L", "")] = [resting("1", "buy", 95, 5, 100)]
+        mirror._book_at["L"] = time.monotonic() + 3600
+        await mirror.sync()
+        self.assertEqual(len(mirror.orders), 1)
+        await engine.process("L", {})  # startup baseline
+        self.feed(mirror, "buy", 5, start=0)
+        await engine.process("L", {"AAA": Position("AAA", 5, mark_price=100)})
+        # Only the resting post-only mirror remains; no market copy.
+        self.assertEqual(exchange.orders,
+                         [("AAA", "buy", 5.0, "limit", 95.0, False, True)])
+        self.assertIn("L:1", mirror.orders)
 
     async def test_taker_fill_still_uses_market_path(self):
         exchange, engine, mirror = self.build()
@@ -332,7 +357,7 @@ class CreditTests(unittest.IsolatedAsyncioTestCase):
         await engine.process("L", {"AAA": Position("AAA", 5, mark_price=100)})
         self.assertEqual(exchange.positions.get("AAA"), 5)
         exchange.orders.clear()
-        self.feed(mirror, "sell", 5, start=5, oid="exit-1")
+        self.feed(mirror, "sell", 5, start=5, oid="exit-1", mirrored=False)
         await engine.process("L", {})
         self.assertEqual(exchange.orders,
                          [("AAA", "sell", 5.0, "market", None, True, False)])
@@ -365,6 +390,7 @@ class CreditTests(unittest.IsolatedAsyncioTestCase):
                     "time": ms, "crossed": False, "startPosition": str(start),
                     "oid": tid, "tid": tid}
 
+        mirror._remember_mirrored("L", "new")
         mirror.on_fills("L", [
             raw("old", "B", 7, 0, old_ms),
             raw("new", "B", 5, 0, new_ms),
