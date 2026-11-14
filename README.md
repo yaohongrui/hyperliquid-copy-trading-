@@ -30,7 +30,7 @@ Hyperliquid 交易员跟单系统：通过 HL 官方 WebSocket 监控交易员�
 - **小单累计（冰山单）**：下单量低于交易所最小数量/最小名义价值时，先记入 carry，累计够了再一起下；交易员减仓时优先抵消未成交的加仓。
 - **启动补仓**：重启时对比交易员现有仓位和账户实际仓位，只在现价不劣于交易员入场价时补齐；不满足条件则跳过，之后交易员再加仓仍会无条件跟随。
 - **止损后抑制再入场**：账户被原生止损、爆仓或手动平仓后，只要交易员还持有该币，就在冷却窗口内跳过加仓；冷却结束、交易员平仓或反手后恢复跟单。
-- **symbol_map（可选）**：执行和交易员在同一交易所，币名天然一致；`symbol_map` 只保留别名/忽略能力，也可以把某个币标记为完全忽略。
+- **symbol_map（可选）**：交易员数据来自 Hyperliquid，执行在 Gate，因此不同命名的币需要映射；默认按 base asset 自动找 Gate 的 `BASE/USDT:USDT`，也可显式映射或标记为完全忽略。
 
 ### 风控
 
@@ -208,43 +208,45 @@ hyperliquid:
 
 ### execution_accounts
 
+交易员持仓始终从 Hyperliquid 读取；执行交易所由这里的 `exchange` 决定。默认示例是 Gate（ccxt）：
+
 ```yaml
 execution_accounts:
-  hl_primary:
-    exchange: hyperliquid
-    account_address: '0xd38272Da1648a212559a09FB7083097f872A3Dd5'
-    api_private_key: ${HL_API_PRIVATE_KEY}
-    testnet: false
-    leverage: 20
+  gate_primary:
+    exchange: gate
+    api_key: ${GATE_API_KEY}
+    secret_key: ${GATE_SECRET_KEY}
+    settle: usdt
+    margin_mode: crossed
+    leverage: 40
     dry_run: false
-    fixed_balance_usdt: 80
-    request_timeout_seconds: 10
+    fixed_balance_usdt: 60
     hard_stop:
-      max_daily_drawdown_pct: 30
+      max_daily_loss_usdt: 10
 ```
 
 | 字段 | 说明 |
 | --- | --- |
-| `exchange` | 固定 `hyperliquid`，其他值会被 `validate.py` 拒绝 |
-| `account_address` | 42 位 `0x` 主账户地址；API 钱包只负责签名，仓位和权益属于这里 |
-| `api_private_key` | API 钱包私钥（签名用），只放 `lead.env` 或环境变量 |
-| `testnet` | `true` 连测试网；默认主网（含全部 HIP-3 perp dex） |
-| `leverage` | 下单前设置的目标杠杆，必须为正；不超过该币上限。只影响保证金，不改变仓位大小 |
+| `exchange` | `gate`（ccxt，USDT 永续）或 `hyperliquid`（原生适配器）；其他值会被 `validate.py` 拒绝 |
+| `api_key` / `secret_key` | Gate API 凭据，只放 `lead.env` 或环境变量 |
+| `settle` / `margin_mode` | Gate 结算币种与保证金模式（`crossed` 走 `cross_leverage_limit`） |
+| `leverage` | 下单前设置的目标杠杆，必须为正；适配器会用该合约的交易所上限做 `min()` 夹取 |
 | `dry_run` | `true` 时使用内存模拟交易所，不连真实账户 |
 | `fixed_balance_usdt` | 固定跟单预算，必须为正；不填则使用账户实时权益 |
-| `request_timeout_seconds` | Hyperliquid REST 请求超时，默认 10 秒 |
 | `hard_stop.max_daily_loss_usdt` | 当日亏损达到该 USDT 数触发硬止损 |
-| `hard_stop.max_daily_drawdown_pct` | 当日回撤达到该百分比触发硬止损 |
+| `hard_stop.max_daily_drawdown_pct` | 当日回撤达到该百分比触发硬止损（账户接近 0 余额时不要用） |
 
-> **一个进程实际只交易一个执行账户。** `main.py` 用第一个启用交易员的 `execution_account` 创建唯一的交易所实例；所有启用的交易员都应该指向同一个账户。给不同交易员配不同账户不会自动切换下单账户。
+Hyperliquid 账户字段（`account_address`、`api_private_key`、`testnet`、`request_timeout_seconds`）只在 `exchange: hyperliquid` 时使用；`account_address` 是主账户地址，API 钱包只负责签名。
+
+> **一个进程实际只交易一个执行账户。** `main.py` 用第一个启用交易员的 `execution_account` 创建唯一的交易所实例；所有启用的交易员都应该指向同一个账户。
 
 `validate.py` 的规则：
 
-- 每个账户必须 `exchange: hyperliquid`。
+- 每个账户必须是 `hyperliquid`、`gate` 或 `binance`。
 - `leverage` 必须为正数；`fixed_balance_usdt` 如果配置也必须为正数。
 - `hard_stop` 如果配置必须是 mapping。
-- `account_address` 如果配置必须是 42 位 `0x` 十六进制地址。
-- 非 `dry_run` 账户必须解析出 `api_private_key`（未被展开的 `${...}` 占位符视为缺失），并且必须有合法 `account_address`。
+- `hyperliquid` 账户的 `account_address` 如果配置必须是 42 位 `0x` 地址。
+- 非 `dry_run` 的 Gate 账户必须解析出 `api_key` 和 `secret_key`；非 `dry_run` 的 Hyperliquid 账户必须解析出 `api_private_key` 和合法 `account_address`（未展开的 `${...}` 占位符视为缺失）。
 
 ### stop_out_cooldown_seconds
 
@@ -305,7 +307,7 @@ leaders:
 - name: A
   address: '0x15ba...'
   source: hyperliquid
-  execution_account: hl_primary
+  execution_account: gate_primary
   coefficient: 5
   total_margin: 400000
   enabled: true
@@ -373,20 +375,25 @@ telegram:
 
 ### symbol_map（可选）
 
-执行和交易员在同一交易所，币名已经一致，通常**不需要配置**。保留该字段只用于别名和忽略：
+交易员数据来自 Hyperliquid，执行在 Gate，所以默认会把 HL 币名按 base asset 映射到 Gate 的 `BASE/USDT:USDT`：
+
+- `ZEC` → `ZEC/USDT:USDT`
+- `XYZ:SNDK`（HIP-3 命名空间）→ `SNDK/USDT:USDT`
+- `XYZ:SKHX` 这类 Gate 没有的币会报 “No USDT perpetual market”，需要显式映射或标记忽略。
 
 ```yaml
 symbol_map:
-  'XYZ:OLD': skip              # 完全忽略
+  'XYZ:SNDK': SNDK/USDT:USDT   # 显式映射（大小写不敏感）
+  'XYZ:SKHX': skip             # Gate 没有，完全忽略
   'XYZ:DEAD': null             # 同上
 ```
 
 规则：
 
-- 键是 HL 币名，大小写不敏感；值可以是同名币种或 `skip`。
+- 键是 HL 币名，大小写不敏感；值是 Gate 的统一永续符号、裸 base（`SNDK`）、Gate 原生符号（`SNDK_USDT`），或 `skip`。
 - 值为 `skip`、`ignore`、`none`、`null`、空字符串或空值都表示忽略该币：所有信号都不执行，carry 会被清空。
 - HIP-3 名称包含冒号，YAML 中**必须加引号**，例如 `'XYZ:AMD'`；不加引号会被解析成键值对。
-- 不再做跨交易所标的映射；映射到未知币种会在启动时报错。
+- 映射目标必须是 Gate 的 USDT 永续；映射到不存在的币种会在启动时 `validate_symbol_map()` 报错。
 - 只支持配置文件修改，运行中修改需要重启进程。
 
 ### 完整示例
@@ -397,17 +404,20 @@ hyperliquid:
   reconnect_seconds: 3
 
 execution_accounts:
-  hl_primary:
-    exchange: hyperliquid
-    account_address: '0x0000000000000000000000000000000000000000'
-    api_private_key: ${HL_API_PRIVATE_KEY}
-    testnet: false
-    leverage: 20
+  gate_primary:
+    exchange: gate
+    api_key: ${GATE_API_KEY}
+    secret_key: ${GATE_SECRET_KEY}
+    settle: usdt
+    margin_mode: crossed
+    leverage: 40
     dry_run: false
-    fixed_balance_usdt: 80
-    request_timeout_seconds: 10
+    fixed_balance_usdt: 60
     hard_stop:
-      max_daily_drawdown_pct: 30
+      max_daily_loss_usdt: 10
+
+symbol_map:
+  'XYZ:SKHX': skip
 
 stop_out_cooldown_seconds: 600
 
@@ -429,7 +439,7 @@ leaders:
 - name: A
   address: '0x0000000000000000000000000000000000000000'
   source: hyperliquid
-  execution_account: hl_primary
+  execution_account: gate_primary
   coefficient: 5
   total_margin: 400000
   enabled: true
@@ -467,7 +477,7 @@ python main.py --config config/config.yaml
 
 - 默认配置路径是 `config/config.yaml`，可以用 `--config` 指定。
 - 日志输出到 stdout，级别 INFO；下单结果、跳过原因、启动参数、硬止损都会记录。
-- 实盘启动顺序：加载配置 → 创建 Hyperliquid 客户端（发现默认 dex + 所有 HIP-3 dex）→ 校验 `symbol_map` → 拉取账户仓位（失败则退出）→ 处理各交易员 REST 快照 → 启动 WebSocket 和低速率 REST 兜底 → 启动 Web 控制台（`127.0.0.1:8766`）和 5 秒对账任务。
+- 实盘启动顺序：加载配置 → 按 `exchange` 创建执行客户端（Gate 走 ccxt，加载市场）→ 校验 `symbol_map`（逐个解析 Gate 永续）→ 拉取账户仓位（失败则退出）→ 处理各交易员 REST 快照 → 启动 WebSocket 和低速率 REST 兜底 → 启动 Web 控制台（`127.0.0.1:8766`）和 15 秒对账任务。
 - `dry_run: true` 时使用内存模拟交易所：市价单立即成交、限价单保持挂单、权益取 `fixed_balance_usdt`（未配置则为 0），不会连接真实账户，也不会创建交易所原生止损单。适合验证配置和跟单流程，但不能验证交易所连通性。
 
 ### systemd
@@ -705,4 +715,4 @@ CONSOLE.md              控制台与绩效数据说明
 pytest tests/
 ```
 
-`pyproject.toml` 已配置 `pythonpath = ["."]`，不需要额外设置。测试覆盖：symbol_map 解析、Hyperliquid 适配器（数量/价格取整、订单解析、HIP-3 多 dex）、Performance 映射与分页、信号跳过、启动补仓、小单累计、止损后抑制再入场、风控基线、控制台绩效归因。
+`pyproject.toml` 已配置 `pythonpath = ["."]`，不需要额外设置。测试覆盖：symbol_map 解析、Gate 适配器（张数换算、IOC、保护单、权益/持仓）、Hyperliquid 适配器（数量/价格取整、订单解析、HIP-3 多 dex）、Performance 映射与分页、信号跳过、启动补仓、小单累计、止损后抑制再入场、风控基线、控制台绩效归因。

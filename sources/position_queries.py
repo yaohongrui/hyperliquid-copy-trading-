@@ -218,6 +218,77 @@ def _hyperliquid_open_orders(info, address, dexes):
     return rows
 
 
+def _ccxt_client(config, exchange_type):
+    """Build a short-lived ccxt client for a Gate/Binance execution account."""
+    import ccxt.async_support as ccxt
+
+    if exchange_type == "gate":
+        cls = ccxt.gate
+        secret = config.get("secret_key")
+    elif exchange_type == "binance":
+        cls = ccxt.binanceusdm
+        secret = config.get("api_secret")
+    else:
+        raise ValueError(f"unsupported exchange {exchange_type}")
+    return cls({
+        "apiKey": config.get("api_key"),
+        "secret": secret,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "swap",
+            "fetchOpenOrders": {"warnWithoutSymbol": False},
+        },
+    })
+
+
+async def _ccxt_account_lines(config, exchange_type, symbol_map=None):
+    """Positions/orders report for a ccxt execution account (Gate)."""
+    exchange = _ccxt_client(config, exchange_type)
+    try:
+        positions = await exchange.fetch_positions()
+        orders = await exchange.fetch_open_orders()
+    finally:
+        await exchange.close()
+    lines = []
+    open_positions = [p for p in positions if _number(p.get("contracts"))]
+    if not open_positions:
+        lines.append("  No open positions")
+    rows = []
+    for position in open_positions:
+        contracts = _number(position.get("contracts"))
+        contract_size = (_number(position.get("contractSize"))
+                         or _number((position.get("info") or {}).get("contractSize")) or 1.0)
+        size = contracts * contract_size
+        entry = _number(position.get("entryPrice"))
+        mark = _number(position.get("markPrice"))
+        pnl = _number(position.get("unrealizedPnl"))
+        notional = _field(position, "notional", "positionValue")
+        margin = _field(position, "initialMargin", "marginUsed", "collateral")
+        leverage = _leverage(position) or (notional / margin if margin else 1.0)
+        direction = str(position.get("side") or ("long" if size > 0 else "short")).upper()
+        rows.append((_display(position.get("symbol", "?"), symbol_map), direction,
+                     f"{_roi(pnl, size, entry, leverage, notional, margin):g}%", _fmt(pnl), _fmt(entry),
+                     _fmt(mark), _fmt(abs(size))))
+    if rows:
+        lines.append(_table(rows, include_leverage=False))
+    lines.append("  Open orders")
+    if not orders:
+        lines.append("    No open orders")
+    for order in orders:
+        info = order.get('info') or {}
+        reduce_only = order.get('reduceOnly')
+        if reduce_only is None:
+            reduce_only = info.get('reduceOnly', info.get('reduce_only', False))
+        lines.append(
+            f"    {_display(order.get('symbol', '?'), symbol_map)} {str(order.get('side') or '?').upper()} "
+            f"{_number(order.get('amount') or order.get('remaining')):g} @ "
+            f"{_number(order.get('triggerPrice') or order.get('stopPrice') or order.get('price')):g} | "
+            f"{str((info.get('orderType') or order.get('type')) or '?').upper()} "
+            f"| reduce-only {bool(reduce_only)} | id {order.get('id', '?')}"
+        )
+    return lines
+
+
 async def account_positions(accounts, leaders, symbol_map=None):
     names = {item.get("execution_account") for item in leaders.values()}
     lines = []
@@ -225,9 +296,13 @@ async def account_positions(accounts, leaders, symbol_map=None):
         config = accounts.get(name)
         if not config:
             continue
-        exchange_type = config.get("exchange")
+        exchange_type = str(config.get("exchange") or "").lower()
         if exchange_type != "hyperliquid":
-            lines.append(f"{name}: unsupported exchange {exchange_type}")
+            lines.append(f"{name} ({exchange_type or 'unknown'})")
+            try:
+                lines.extend(await _ccxt_account_lines(config, exchange_type, symbol_map))
+            except Exception as exc:
+                lines.append(f"  query failed ({exc})")
             continue
         try:
             info, address, dexes = await asyncio.to_thread(_hyperliquid_info, config)

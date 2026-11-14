@@ -19,11 +19,18 @@ restrictions before exposing it.
 API keys, exchange selection, and manual orders are intentionally unavailable
 from the web UI.
 
-## Data sources (Hyperliquid SDK)
+## Data sources
 
-All performance data comes from the official `hyperliquid-python-sdk`; every
-call runs through `asyncio.to_thread` so the console does not block the
-engine's event loop.
+Performance data comes from the execution adapter. With `exchange: gate` the
+console calls `CcxtExchange.fetch_realized_pnl()` (Gate's futures account book;
+`trades.source = ledger`, ids `ledger:<CONTRACT>:<ORDER_ID>`) and
+`fetch_cash_flows()` (deposits, withdrawals, funding). The incremental
+watermark is unfiltered for ccxt accounts (`CcxtExchange.trade_sources = None`)
+instead of the Hyperliquid-only `hl_fill`/`hl_funding` sources.
+
+With `exchange: hyperliquid` every call goes through the official
+`hyperliquid-python-sdk`; every call runs through `asyncio.to_thread` so the
+console does not block the engine's event loop.
 
 | Source | SDK call | Stored as |
 | --- | --- | --- |

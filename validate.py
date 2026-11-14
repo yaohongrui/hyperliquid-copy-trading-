@@ -80,16 +80,31 @@ def _validate_auto_breakeven_effective(c):
             )
 
 
+def _validate_symbol_map(value):
+    """Validate the optional Hyperliquid-symbol -> venue-instrument table."""
+    if value is None:
+        return
+    assert isinstance(value, dict), "symbol_map must be a mapping"
+    for key, target in value.items():
+        assert isinstance(key, str) and key.strip(), "symbol_map keys must be non-empty strings"
+        assert target is None or isinstance(target, str), f"symbol_map[{key!r}] must be a string or null"
+
+
+def _secret_text(value):
+    return str(value or "").strip()
+
+
 def _validate_execution_accounts(accounts):
-    """Validate the Hyperliquid-only execution accounts."""
+    """Validate execution accounts: native Hyperliquid or a ccxt venue (Gate)."""
     assert isinstance(accounts, dict) and accounts, (
         "execution_accounts must be a non-empty mapping"
     )
     for name, account in accounts.items():
         label = f"execution_accounts.{name}"
         assert isinstance(account, dict), f"{label} must be a mapping"
-        assert account.get("exchange") == "hyperliquid", (
-            f"{label}.exchange must be 'hyperliquid'"
+        venue = str(account.get("exchange") or "").lower()
+        assert venue in ("hyperliquid", "gate", "binance"), (
+            f"{label}.exchange must be 'hyperliquid', 'gate' or 'binance'"
         )
         assert _positive_number(account.get("leverage")), (
             f"{label}.leverage must be positive"
@@ -103,18 +118,32 @@ def _validate_execution_accounts(accounts):
         if hard_stop is not None:
             assert isinstance(hard_stop, dict), f"{label}.hard_stop must be a mapping"
 
-        address = _address_text(account.get("account_address"))
-        if address:
-            assert _is_address(address), (
-                f"{label}.account_address must be a 42-character 0x address"
-            )
+        if venue == "hyperliquid":
+            address = _address_text(account.get("account_address"))
+            if address:
+                assert _is_address(address), (
+                    f"{label}.account_address must be a 42-character 0x address"
+                )
+            if not account.get("dry_run", False):
+                key = _secret_text(account.get("api_private_key"))
+                assert key and not _PLACEHOLDER.search(key), (
+                    f"{label}.api_private_key is required when dry_run is false"
+                )
+                assert address and _is_address(address), (
+                    f"{label}.account_address is required when dry_run is false"
+                )
+            continue
+
+        # ccxt venues (Gate): API key + secret, no account address needed.
         if not account.get("dry_run", False):
-            key = str(account.get("api_private_key") or "").strip()
-            assert key and not _PLACEHOLDER.search(key), (
-                f"{label}.api_private_key is required when dry_run is false"
+            api_key = _secret_text(account.get("api_key"))
+            secret = _secret_text(
+                account.get("secret_key") or account.get("api_secret"))
+            assert api_key and not _PLACEHOLDER.search(api_key), (
+                f"{label}.api_key is required when dry_run is false"
             )
-            assert address and _is_address(address), (
-                f"{label}.account_address is required when dry_run is false"
+            assert secret and not _PLACEHOLDER.search(secret), (
+                f"{label}.secret_key is required when dry_run is false"
             )
 
 
@@ -156,6 +185,7 @@ def validate(path):
     assert c.get("leaders") is not None, "leaders is required"
     assert c.get("execution_accounts") is not None, "execution_accounts is required"
     _validate_execution_accounts(c["execution_accounts"])
+    _validate_symbol_map(c.get("symbol_map"))
     _validate_telegram(c.get("telegram"))
     _validate_leaders(c, set(c["execution_accounts"]))
     _validate_auto_breakeven_effective(c)

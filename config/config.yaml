@@ -3,23 +3,32 @@ hyperliquid:
   reconnect_seconds: 3
 
 execution_accounts:
-  hl_primary:
-    exchange: hyperliquid
-    # The API wallet signs; positions and equity belong to this main account.
-    account_address: '0xd38272Da1648a212559a09FB7083097f872A3Dd5'
-    api_private_key: ${HL_API_PRIVATE_KEY}
-    testnet: false
-    leverage: 20
+  gate_primary:
+    # Leaders are still read from Hyperliquid; orders go to Gate (USDT perp).
+    exchange: gate
+    api_key: ${GATE_API_KEY}
+    secret_key: ${GATE_SECRET_KEY}
+    settle: usdt
+    margin_mode: crossed
+    # The adapter clamps this to each contract's venue maximum.
+    leverage: 40
     dry_run: false
     hard_stop:
-      max_daily_drawdown_pct: 30
-    fixed_balance_usdt: 80
-    request_timeout_seconds: 10
+      # An empty Gate account makes a percentage drawdown meaningless
+      # (baseline ~= 0), so the guard uses an absolute loss until funded.
+      max_daily_loss_usdt: 10
+    fixed_balance_usdt: 60
 
 stop_out_cooldown_seconds: 600
-# HIP-3 accounts read every dex from REST; keep reconciliation below the
-# request budget (the dashboard has its own interval).
+# Hyperliquid leader reads share one IP request budget; keep reconciliation
+# below it (the dashboard has its own interval).
 protection_reconcile_seconds: 15
+
+# Optional Hyperliquid name -> Gate instrument overrides.  HIP-3 names such as
+# ``XYZ:SNDK`` fall back to the base asset (SNDK/USDT:USDT); add an explicit
+# mapping when Gate lists a different instrument, or ``skip`` when it does not
+# list the coin at all.
+symbol_map: {}
 
 console:
   database: data/console.sqlite3
@@ -39,7 +48,7 @@ leaders:
 - name: A
   address: '0x15baf1cefcced43e971da85b7b4de5a0391f7b29'
   source: hyperliquid
-  execution_account: hl_primary
+  execution_account: gate_primary
   coefficient: 5
   enabled: true
   symbol_blacklist: []
@@ -52,9 +61,9 @@ leaders:
 - name: B
   address: '0xf929122994e177079c924631ba13fb280f5cd1f9'
   source: hyperliquid
-  execution_account: hl_primary
+  execution_account: gate_primary
   coefficient: 0.66
-  enabled: true
+  enabled: false
   symbol_blacklist: []
   late_entry_enabled: false
   late_entry_offset_pct: 0.2
@@ -65,8 +74,8 @@ leaders:
 - name: C
   address: '0x09bc1cf4d9f0b59e1425a8fde4d4b1f7d3c9410d'
   source: hyperliquid
-  execution_account: hl_primary
-  coefficient: 13.14
+  execution_account: gate_primary
+  coefficient: 8
   enabled: true
   symbol_blacklist: []
   late_entry_enabled: false
@@ -78,7 +87,7 @@ leaders:
 - name: D
   address: '0xbd6867df6ebfff36a40fbfc9383ae830eeb0a18f'
   source: hyperliquid
-  execution_account: hl_primary
+  execution_account: gate_primary
   coefficient: 5
   enabled: false
   symbol_blacklist: []

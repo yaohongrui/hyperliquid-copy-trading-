@@ -75,6 +75,26 @@ def base_config():
     }
 
 
+def gate_config():
+    """A Gate execution account: leaders still come from Hyperliquid."""
+    config = copy.deepcopy(base_config())
+    config["execution_accounts"] = {
+        "gate_primary": {
+            "exchange": "gate",
+            "api_key": f"${{{_KEY_ENV}}}",
+            "secret_key": f"${{{_KEY_ENV}}}",
+            "settle": "usdt",
+            "margin_mode": "crossed",
+            "leverage": 40,
+            "dry_run": False,
+            "hard_stop": {"max_daily_loss_usdt": 10},
+            "fixed_balance_usdt": 60,
+        }
+    }
+    config["leaders"][0]["execution_account"] = "gate_primary"
+    return config
+
+
 class ValidateConfigTests(unittest.TestCase):
     def setUp(self):
         os.environ.pop(_MISSING_ENV, None)
@@ -96,9 +116,33 @@ class ValidateConfigTests(unittest.TestCase):
 
     def test_non_hyperliquid_exchange_is_rejected(self):
         config = base_config()
-        config["execution_accounts"]["hl_primary"]["exchange"] = "gate"
+        config["execution_accounts"]["hl_primary"]["exchange"] = "kraken"
         with self.assertRaises(AssertionError):
             self.check(config)
+
+    def test_gate_execution_account_is_accepted(self):
+        self.assertTrue(self.check(gate_config()))
+
+    def test_gate_account_requires_api_key_and_secret(self):
+        for field in ("api_key", "secret_key"):
+            config = gate_config()
+            del config["execution_accounts"]["gate_primary"][field]
+            with self.subTest(field=field):
+                with self.assertRaises(AssertionError):
+                    self.check(config)
+
+    def test_gate_account_does_not_require_an_address(self):
+        config = gate_config()
+        self.assertNotIn("account_address", config["execution_accounts"]["gate_primary"])
+        self.assertTrue(self.check(config))
+
+    def test_gate_dry_run_may_omit_keys(self):
+        config = gate_config()
+        account = config["execution_accounts"]["gate_primary"]
+        account["dry_run"] = True
+        del account["api_key"]
+        del account["secret_key"]
+        self.assertTrue(self.check(config))
 
     def test_runtime_account_requires_private_key(self):
         config = base_config()

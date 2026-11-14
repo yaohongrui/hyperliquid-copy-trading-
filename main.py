@@ -4,6 +4,7 @@ from aiohttp import web
 from api.app import create_app
 from config.loader import load
 from exchanges.dry_run import DryRunExchange
+from exchanges.ccxt_exchange import CcxtExchange
 from exchanges.hyperliquid_exchange import HyperliquidExchange
 from core.engine import Engine
 from core.symbols import SymbolMap
@@ -37,11 +38,19 @@ async def main(path):
         raise RuntimeError("No execution account is configured for a leader")
     dry_run = bool(account.get("dry_run", False))
     symbol_map = SymbolMap(c.get("symbol_map"))
-    exchange = DryRunExchange(account, symbol_map) if dry_run else HyperliquidExchange(account, symbol_map)
+    venue = str(account.get("exchange") or "").lower()
+    if dry_run:
+        exchange = DryRunExchange(account, symbol_map)
+    elif venue == "hyperliquid":
+        exchange = HyperliquidExchange(account, symbol_map)
+    else:
+        # Gate (or another ccxt venue): leaders still come from Hyperliquid.
+        exchange = CcxtExchange(account, symbol_map)
     engine = Engine(exchange, leaders, state_store=StateStore((c.get('state') or {}).get('path', 'data/state.json')), symbol_map=symbol_map, auto_breakeven=c.get('auto_breakeven'), stop_out_cooldown=c.get('stop_out_cooldown_seconds', 600))
     engine.config_manager = ConfigManager(path)
     mode = "dry-run" if dry_run else "LIVE"
-    log.info("HL copytrade started in %s mode; leaders=%s account=%s", mode, ",".join(active) or "none", account_name)
+    log.info("Copy-trade started in %s mode; leaders=%s account=%s venue=%s",
+             mode, ",".join(active) or "none", account_name, venue or "unknown")
     stop = asyncio.Event()
     telegram = None
     telegram_task = None
@@ -169,7 +178,7 @@ async def main(path):
             await asyncio.gather(alerts_task, return_exceptions=True)
         if api_runner:
             await api_runner.cleanup()
-        log.info("HL copytrade stopped")
+        log.info("Copy-trade stopped")
 
 
 def _hyperliquid_addresses(leaders):

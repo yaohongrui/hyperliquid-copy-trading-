@@ -805,8 +805,12 @@ class ConsoleService:
             if equity is not None:
                 await asyncio.to_thread(self.store.snapshot, account, equity, unrealized)
             now = time.time()
+            # Venues tag their performance rows differently; a ccxt account
+            # (Gate) reports ``trade_sources = None`` so the watermark covers
+            # every source instead of only Hyperliquid's.
+            trade_sources = getattr(exchange, "trade_sources", ("hl_fill", "hl_funding"))
             trades_watermark = await asyncio.to_thread(
-                self.store.latest_timestamp, account, "trades", ("hl_fill", "hl_funding"))
+                self.store.latest_timestamp, account, "trades", trade_sources)
             flows_watermark = await asyncio.to_thread(
                 self.store.latest_timestamp, account, "cash_flows")
             if hasattr(exchange, "fetch_realized_pnl"):
