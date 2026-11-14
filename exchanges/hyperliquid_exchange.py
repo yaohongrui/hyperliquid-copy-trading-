@@ -627,8 +627,17 @@ class HyperliquidExchange:
     @_serialized
     def _fetch_order(self, order_id, symbol=None):
         raw = self.info.query_order_by_oid(self.address, int(order_id))
-        if not isinstance(raw, dict) or raw.get("status") != "order":
+        if not isinstance(raw, dict):
+            raise RuntimeError(f"unexpected Hyperliquid order status response: {raw!r}")
+        query_status = str(raw.get("status") or "").lower()
+        if query_status == "unknownoid":
+            # The venue genuinely no longer knows this order id.
             return None
+        if query_status != "order":
+            # A throttled or malformed reply must not look like a vanished
+            # order: the caller would forget a still-resting mirror and, in
+            # the worst case, book a phantom fill against the live position.
+            raise RuntimeError(f"Hyperliquid order status query failed: {raw!r}")
         payload = raw.get("order") or {}
         order = payload.get("order") or {}
         status = str(payload.get("status") or order.get("status") or "").lower()

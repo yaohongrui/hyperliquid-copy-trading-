@@ -870,9 +870,22 @@ class OrderMirror:
                 continue
             state = states[key]
             if state is None:
-                await self._book_missing(item)
+                # The venue stopped reporting this order id: it was filled or
+                # cancelled while the cache could not see it.  Without a
+                # reported fill quantity, never book the account's live
+                # position as this order's fill -- that position may belong to
+                # the snapshot path, and booking it invents a fill.  Keep the
+                # ``_mirrored_oids`` ledger so a real ``userFills`` event can
+                # still credit a maker fill.
                 self.orders.pop(key, None)
                 self.engine._save_state()
+                log.warning("MIRROR GONE leader=%s symbol=%s id=%s: venue stopped reporting the order",
+                            leader, symbol, order_id)
+                if item.get("reduce_only"):
+                    try:
+                        await self.engine._release_if_flat(leader, symbol)
+                    except Exception:
+                        log.warning("MIRROR RELEASE failed for %s %s", leader, symbol, exc_info=True)
                 continue
             status = str(state.get("status") or "").lower()
             filled = max(0.0, float(state.get("filled") or 0.0))
@@ -895,27 +908,6 @@ class OrderMirror:
                 self.engine._save_state()
                 await self.engine._notify(
                     "notify_mirror_cancelled", leader, symbol, item, f"exchange reported {status}")
-
-    async def _book_missing(self, item):
-        """Handle an order the venue no longer knows about (filled or cancelled)."""
-        leader = item.get("leader")
-        symbol = item.get("symbol")
-        reduce_only = bool(item.get("reduce_only"))
-        if reduce_only:
-            try:
-                await self.engine._release_if_flat(leader, symbol)
-            except Exception:
-                log.warning("MIRROR RELEASE failed for %s %s", leader, symbol, exc_info=True)
-            return
-        try:
-            live = await self.engine.exchange.position_size(symbol)
-        except Exception:
-            return
-        if abs(live) <= 1e-12:
-            return
-        log.info("MIRROR RECOVERED leader=%s symbol=%s: order gone but position exists",
-                 leader, symbol)
-        await self._book_fill(item, abs(live), float(item.get("price") or 0.0))
 
     async def _book_fill(self, item, quantity, price):
         quantity = max(0.0, float(quantity or 0.0))

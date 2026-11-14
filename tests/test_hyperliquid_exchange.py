@@ -8,6 +8,10 @@ from exchanges.hyperliquid_exchange import HyperliquidExchange
 class FakeInfo:
     coin_to_asset = {"BTC": 0, "xyz:TSLA": 110000}
     asset_to_sz_decimals = {0: 5, 110000: 4}
+    order_status = {"status": "unknownOid"}
+
+    def query_order_by_oid(self, user, oid):
+        return self.order_status
 
     def user_state(self, address, dex=""):
         if dex == "xyz":
@@ -72,6 +76,33 @@ def make_exchange(client=None, config=None):
     exchange._leverage_set = {}
     exchange.symbol_map = SymbolMap()
     return exchange
+
+
+class OrderStatusQueryTests(unittest.TestCase):
+    def test_unknown_oid_returns_none(self):
+        exchange = make_exchange()
+        exchange.info.order_status = {"status": "unknownOid"}
+        self.assertIsNone(exchange._fetch_order("123"))
+
+    def test_query_error_raises_instead_of_reporting_a_vanished_order(self):
+        # A throttled/errored reply must not look like a cancelled order: the
+        # order mirror would drop tracking of a still-resting order.
+        exchange = make_exchange()
+        exchange.info.order_status = {"status": "err", "response": "rate limited"}
+        with self.assertRaises(RuntimeError):
+            exchange._fetch_order("123")
+
+    def test_open_order_is_normalized(self):
+        exchange = make_exchange()
+        exchange.info.order_status = {"status": "order", "order": {
+            "status": "open",
+            "order": {"sz": "3", "origSz": "10", "limitPx": "95", "avgPx": "0"},
+        }}
+        state = exchange._fetch_order("123")
+        self.assertEqual(state["status"], "open")
+        self.assertEqual(state["filled"], 7.0)
+        self.assertEqual(state["remaining"], 3.0)
+        self.assertEqual(state["price"], 95.0)
 
 
 class RoundingTests(unittest.TestCase):

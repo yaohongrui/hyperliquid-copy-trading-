@@ -261,9 +261,16 @@ class OrderQueryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(filled["average"], 50.0)
         self.assertEqual(canceled["status"], "canceled")
 
-    async def test_unknown_order_returns_none(self):
-        exchange = make_exchange(FakeInfo(orders={}))
+    async def test_unknown_oid_returns_none(self):
+        info = FakeInfo(orders={123: {"status": "unknownOid"}})
+        exchange = make_exchange(info)
         self.assertIsNone(await exchange.fetch_order(123))
+
+    async def test_empty_status_reply_raises_instead_of_looking_missing(self):
+        # A ``null`` body (throttled/errored request) is not an unknown order.
+        exchange = make_exchange(FakeInfo(orders={}))
+        with self.assertRaises(RuntimeError):
+            await exchange.fetch_order(123)
 
 
 class LookbackTests(unittest.IsolatedAsyncioTestCase):

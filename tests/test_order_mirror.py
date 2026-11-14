@@ -395,6 +395,39 @@ class GoneCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.fill_events[0]["quantity"], 4.0)
 
 
+class VanishedOrderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_vanished_mirror_is_dropped_without_booking_a_position_fill(self):
+        # Regression: a status query that answers "unknown order" used to book
+        # the account's whole live position as this mirror's fill, inventing a
+        # fill and dropping tracking of a still-resting order.
+        exchange = MirrorExchange()
+        engine, mirror = make_engine(exchange)
+        exchange.positions["AAA"] = 5.0
+        mirror._books[("L", "")] = [resting("1", "buy", 95, 10, 100)]
+        mirror._book_at["L"] = time.monotonic() + 3600
+        await mirror.sync()
+        self.assertIn("L:1", mirror.orders)
+
+        exchange.order_states.clear()  # venue stops reporting our order id
+        await mirror.sync()
+
+        self.assertEqual(engine.fill_events, [])
+
+    async def test_failed_status_query_keeps_tracking_the_order(self):
+        class BrokenStatusExchange(MirrorExchange):
+            async def fetch_order(self, order_id, symbol=None):
+                raise RuntimeError("rate limited")
+
+        exchange = BrokenStatusExchange()
+        engine, mirror = make_engine(exchange)
+        mirror._books[("L", "")] = [resting("1", "buy", 95, 10, 100)]
+        mirror._book_at["L"] = time.monotonic() + 3600
+        await mirror.sync()
+
+        self.assertIn("L:1", mirror.orders)
+        self.assertEqual(engine.fill_events, [])
+
+
 class GraceTests(unittest.IsolatedAsyncioTestCase):
     def test_credit_grace_default_is_300(self):
         _, mirror = make_engine(MirrorExchange())
