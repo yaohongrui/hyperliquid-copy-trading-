@@ -840,6 +840,7 @@ class OrderMirror:
         states = {}
         if fetcher is None:
             return states
+        unknown = []
         for key, item in list(self.orders.items()):
             if item.get("leader") != leader:
                 continue
@@ -848,12 +849,46 @@ class OrderMirror:
             if not order_id or not symbol:
                 continue
             try:
-                states[key] = await fetcher(order_id, symbol)
+                state = await fetcher(order_id, symbol)
             except NotImplementedError:
                 continue
             except Exception:
                 log.warning("MIRROR POLL failed for %s %s", leader, symbol, exc_info=True)
                 continue
+            if state is None:
+                unknown.append((key, item))
+            else:
+                states[key] = state
+        if not unknown:
+            return states
+        # ``orderStatus`` can answer ``unknownOid`` while an order is still
+        # resting (indexing lag after placement) or right as it fills.  Only
+        # trust that answer when the open-orders snapshot agrees the id is
+        # gone; otherwise we would stop tracking a live order and leak it.
+        open_ids = None
+        lister = getattr(exchange, "fetch_open_orders", None)
+        if lister is not None:
+            try:
+                open_ids = {str(row.get("id")) for row in await lister()}
+            except Exception:
+                log.warning("MIRROR POLL open orders failed for %s", leader, exc_info=True)
+                open_ids = None
+        for key, item in unknown:
+            if open_ids is None:
+                # Cannot verify: keep the record instead of dropping it.
+                continue
+            if str(item.get("order_id")) in open_ids:
+                amount = float(item.get("amount") or 0.0)
+                filled = float(item.get("filled") or 0.0)
+                states[key] = {
+                    "status": "open",
+                    "filled": filled,
+                    "remaining": max(0.0, amount - filled),
+                    "average": None,
+                    "price": item.get("price"),
+                }
+            else:
+                states[key] = None
         return states
 
     async def _poll_own_orders(self, leader, states):

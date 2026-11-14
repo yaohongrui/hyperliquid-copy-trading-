@@ -63,6 +63,9 @@ class MirrorExchange:
     async def fetch_order(self, order_id, symbol=None):
         return self.order_states.get(order_id)
 
+    async def fetch_open_orders(self):
+        return [{"id": oid} for oid in self.order_states]
+
     async def set_protection(self, *args, **kwargs):
         self.protection.append(args)
         return "stop-1"
@@ -411,6 +414,25 @@ class VanishedOrderTests(unittest.IsolatedAsyncioTestCase):
         exchange.order_states.clear()  # venue stops reporting our order id
         await mirror.sync()
 
+        self.assertEqual(engine.fill_events, [])
+
+    async def test_unknown_oid_keeps_tracking_while_the_order_still_shows_open(self):
+        # ``orderStatus`` may answer unknownOid during an indexing lag; the
+        # open-orders snapshot is the tie-breaker, so the record stays.
+        class LaggyStatusExchange(MirrorExchange):
+            async def fetch_order(self, order_id, symbol=None):
+                return None
+
+        exchange = LaggyStatusExchange()
+        engine, mirror = make_engine(exchange)
+        mirror._books[("L", "")] = [resting("1", "buy", 95, 10, 100)]
+        mirror._book_at["L"] = time.monotonic() + 3600
+        await mirror.sync()
+        self.assertIn("L:1", mirror.orders)
+
+        await mirror.sync()  # status query lies, open-orders says it is live
+
+        self.assertIn("L:1", mirror.orders)
         self.assertEqual(engine.fill_events, [])
 
     async def test_failed_status_query_keeps_tracking_the_order(self):
